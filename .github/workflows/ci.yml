@@ -1,0 +1,40 @@
+# CI gate for cachette.
+# Lint job is the acceptance gate for plan task 2; task 36 extends this file
+# (keep jobs composable: one concern per job, shared env at the top).
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+      - name: rustfmt --check
+        run: cargo fmt --check
+      - name: clippy -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test

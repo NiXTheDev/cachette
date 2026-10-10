@@ -1,0 +1,12 @@
+# rustfmt configuration — cachette
+# Enforced by CI: `cargo fmt --check` (see .github/workflows/ci.yml).
+
+max_width = 100
+
+# Nightly-only option. Kept at the TOP LEVEL (not under a `[unstable]` table —
+# rustfmt's config parser rejects an `unstable` key as "Unknown configuration
+# option"). On stable rustfmt this prints a stderr warning but does NOT affect
+# the exit code, so `cargo fmt --check` still exits 0; on nightly it is honored
+# once `unstable_features = true` is set there. Decision recorded in
+# .omo/notepads/cachette/learnings.md.
+imports_granularity = "Item"
