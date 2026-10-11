@@ -1203,6 +1203,280 @@ mod storage_fs {
         );
     }
 
+    #[tokio::test]
+    async fn put_stages_a_part_and_finalize_renames_it_to_a_hashed_blob() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let id = entry_id("k");
+        let part = dir.path().join("parts").join(format!("{id}.part"));
+        let blob = dir.path().join("blobs").join(format!("{id}.blob"));
+
+        storage
+            .put_stream("k", bytes(b"staged"))
+            .await
+            .expect("put");
+        assert!(part.exists(), "put stages parts/{id}.part");
+        assert!(!blob.exists(), "no blob before finalize");
+        assert_eq!(std::fs::read(&part).expect("read part"), b"staged");
+        assert_eq!(id.len(), 64, "entry id is hex SHA-256");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            std::fs::read_dir(dir.path().join("tmp"))
+                .expect("read tmp")
+                .next()
+                .is_none(),
+            "scratch is empty once the atomic write completes"
+        );
+
+        storage.finalize("k").await.expect("finalize");
+        assert!(!part.exists(), "part renamed away by finalize");
+        assert_eq!(std::fs::read(&blob).expect("read blob"), b"staged");
+        assert_eq!(storage.used_bytes().await.expect("used"), 6);
+    }
+
+    #[tokio::test]
+    async fn keys_with_path_metacharacters_stay_inside_the_data_root() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let keys = ["../evil", "nested/dir/key", "ünïcödé-☃", "..", "a\\b"];
+        for key in keys {
+            storage
+                .put_stream(key, bytes(key.as_bytes()))
+                .await
+                .expect("put");
+            storage.finalize(key).await.expect("finalize");
+        }
+        for key in keys {
+            let stat = storage.stat(key).await.expect("stat").expect("key visible");
+            assert_eq!(stat.size, key.len() as u64);
+            let body = read_all(storage.get_range(key, 0..stat.size).await.expect("get")).await;
+            assert_eq!(body, key.as_bytes(), "round-trip for {key:?}");
+        }
+        // Every blob file is a bare 64-hex name: keys never became path
+        // segments, so no metacharacter could escape the data root.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("blobs"))
+            .expect("read blobs")
+            .map(|entry| {
+                entry
+                    .expect("dirent")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), keys.len());
+        for name in names {
+            let stem = name.strip_suffix(".blob").expect("blob suffix");
+            assert_eq!(stem.len(), 64);
+            assert!(stem.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_a_put_stream_future_leaves_no_staged_or_visible_state() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        /// Stream that never yields bytes: aborting the put must cancel it
+        /// before anything reaches the filesystem (trait cancel-safety).
+        struct PendingStream;
+
+        impl AsyncRead for PendingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let dir = TestDir::new();
+        let storage = Arc::new(FsStorage::open(dir.path()).expect("open"));
+        let put = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move {
+                let stream: ByteStream<'static> = Box::pin(PendingStream);
+                storage.put_stream("k", stream).await
+            }
+        });
+        put.abort();
+        let join = put.await.expect_err("aborted before completion");
+        assert!(join.is_cancelled());
+
+        assert_eq!(storage.stat("k").await.expect("stat"), None);
+        assert!(storage.list().await.expect("list").is_empty());
+        assert_eq!(storage.used_bytes().await.expect("used"), 0);
+        assert!(
+            std::fs::read_dir(dir.path().join("parts"))
+                .expect("read parts")
+                .next()
+                .is_none(),
+            "cancelled put stages no part file"
+        );
+        assert!(
+            std::fs::read_dir(dir.path().join("blobs"))
+                .expect("read blobs")
+                .next()
+                .is_none(),
+            "cancelled put writes no blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_both_blob_and_part_when_a_reput_is_staged() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let id = entry_id("k");
+        storage.put_stream("k", bytes(b"v1")).await.expect("put v1");
+        storage.finalize("k").await.expect("finalize v1");
+        storage
+            .put_stream("k", bytes(b"v2"))
+            .await
+            .expect("stage v2");
+
+        let part = dir.path().join("parts").join(format!("{id}.part"));
+        let blob = dir.path().join("blobs").join(format!("{id}.blob"));
+        assert!(part.exists() && blob.exists(), "reput leaves both files");
+
+        storage.delete("k").await.expect("delete");
+        assert!(!part.exists(), "staged part removed");
+        assert!(!blob.exists(), "visible blob removed");
+        assert_eq!(storage.used_bytes().await.expect("used"), 0);
+        assert_eq!(storage.stat("k").await.expect("stat"), None);
+    }
+
+    #[tokio::test]
+    async fn rebooted_part_is_replaced_by_a_new_put_before_finalize() {
+        let dir = TestDir::new();
+        {
+            let storage = FsStorage::open(dir.path()).expect("open");
+            storage
+                .put_stream("k", bytes(b"abandoned"))
+                .await
+                .expect("put");
+        }
+        // Crash-before-commit left the old part; a retried upload replaces
+        // it wholesale so finalize commits only the new bytes.
+        let storage = FsStorage::open(dir.path()).expect("reopen");
+        storage
+            .put_stream("k", bytes(b"fresh"))
+            .await
+            .expect("replace part");
+        let part = dir
+            .path()
+            .join("parts")
+            .join(format!("{}.part", entry_id("k")));
+        assert_eq!(std::fs::read(&part).expect("read part"), b"fresh");
+
+        storage.finalize("k").await.expect("finalize");
+        let body = read_all(storage.get_range("k", 0..5).await.expect("get")).await;
+        assert_eq!(body, b"fresh");
+        assert_eq!(
+            storage
+                .stat("k")
+                .await
+                .expect("stat")
+                .expect("visible")
+                .size,
+            5
+        );
+        assert_eq!(storage.used_bytes().await.expect("used"), 5);
+    }
+
+    #[tokio::test]
+    async fn reservation_row_dies_at_boot_but_its_part_still_finalizes() {
+        let dir = TestDir::new();
+        {
+            let storage = FsStorage::open(dir.path()).expect("open");
+            storage
+                .seed_reservation("res", b"reserved", i64::MAX as u64)
+                .await
+                .expect("seed");
+        }
+        let part = dir
+            .path()
+            .join("parts")
+            .join(format!("{}.part", entry_id("res")));
+        assert!(part.exists(), "seeded part on disk");
+
+        // Boot reconciliation drops the row (no blob backing it) but keeps
+        // the part, which still carries a complete payload.
+        let storage = FsStorage::open(dir.path()).expect("reopen");
+        assert_eq!(storage.stat("res").await.expect("stat"), None);
+        assert!(storage.list().await.expect("list").is_empty());
+        assert_eq!(storage.used_bytes().await.expect("used"), 0);
+        assert!(part.exists(), "part retained across reboot");
+
+        storage
+            .finalize("res")
+            .await
+            .expect("finalize after reboot");
+        let body = read_all(storage.get_range("res", 0..8).await.expect("get")).await;
+        assert_eq!(body, b"reserved");
+        assert_eq!(storage.used_bytes().await.expect("used"), 8);
+    }
+
+    #[tokio::test]
+    async fn reboots_preserve_mixed_staged_and_visible_state_with_accounting() {
+        let dir = TestDir::new();
+        {
+            let storage = FsStorage::open(dir.path()).expect("open");
+            storage
+                .put_stream("keep", bytes(b"kept"))
+                .await
+                .expect("put");
+            storage.finalize("keep").await.expect("finalize");
+            storage
+                .put_stream("later", bytes(b"pending"))
+                .await
+                .expect("stage later");
+        }
+
+        let storage = FsStorage::open(dir.path()).expect("reopen");
+        let body = read_all(storage.get_range("keep", 0..4).await.expect("get")).await;
+        assert_eq!(body, b"kept");
+        assert_eq!(storage.used_bytes().await.expect("used"), 4);
+        assert_eq!(storage.stat("later").await.expect("stat"), None);
+
+        storage.finalize("later").await.expect("finalize later");
+        let listed = storage.list().await.expect("list");
+        let keys: Vec<&str> = listed.iter().map(|entry| entry.key.as_str()).collect();
+        assert_eq!(keys, ["keep", "later"]);
+        assert_eq!(storage.used_bytes().await.expect("used"), 11);
+        drop(storage);
+
+        let storage = FsStorage::open(dir.path()).expect("second reopen");
+        assert_eq!(storage.list().await.expect("list").len(), 2);
+        assert_eq!(storage.used_bytes().await.expect("used"), 11);
+    }
+
+    #[tokio::test]
+    async fn binary_payload_windows_round_trip_byte_exact() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let data: Vec<u8> = (0_u8..=255).collect();
+        storage.put_stream("bin", bytes(&data)).await.expect("put");
+        storage.finalize("bin").await.expect("finalize");
+
+        for (start, end) in [(0, 256), (0, 1), (128, 129), (128, 256), (255, 256)] {
+            let window = read_all(storage.get_range("bin", start..end).await.expect("range")).await;
+            assert_eq!(window, data[start as usize..end as usize], "{start}..{end}");
+        }
+        assert_eq!(
+            storage
+                .stat("bin")
+                .await
+                .expect("stat")
+                .expect("visible")
+                .size,
+            256
+        );
+        assert_eq!(storage.used_bytes().await.expect("used"), 256);
+    }
+
     /// Plan task 9 QA scenario: a 64 MiB save produces exactly one blob file
     /// of exact size and accounting survives reboot.
     #[tokio::test]
