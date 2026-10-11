@@ -994,6 +994,215 @@ mod storage_fs {
         assert_eq!(storage.used_bytes().await.expect("used"), 8);
     }
 
+    #[tokio::test]
+    async fn list_sorts_by_key_and_stat_matches_accounting_for_many_entries() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        // Insert out of list order: `list` must return key-sorted metadata.
+        for (key, payload) in [("c-key", "ccc"), ("a-key", "a"), ("b-key", "bb")] {
+            storage
+                .put_stream(key, bytes(payload.as_bytes()))
+                .await
+                .expect("put");
+            storage.finalize(key).await.expect("finalize");
+        }
+
+        let listed = storage.list().await.expect("list");
+        let keys: Vec<&str> = listed.iter().map(|entry| entry.key.as_str()).collect();
+        assert_eq!(keys, ["a-key", "b-key", "c-key"], "list is key-sorted");
+
+        let mut sum = 0_u64;
+        for entry in &listed {
+            sum += entry.size;
+            let found = storage
+                .stat(&entry.key)
+                .await
+                .expect("stat")
+                .expect("listed entry stat-able");
+            assert_eq!(&found, entry, "stat agrees with list");
+            let body = read_all(
+                storage
+                    .get_range(&entry.key, 0..entry.size)
+                    .await
+                    .expect("get"),
+            )
+            .await;
+            assert_eq!(body.len() as u64, entry.size, "full read matches size");
+        }
+        assert_eq!(sum, 6);
+        assert_eq!(
+            storage.used_bytes().await.expect("used"),
+            sum,
+            "accounting equals the sum of listed sizes"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_range_boundaries_clamp_end_and_reject_start_past_size() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        storage
+            .put_stream("k", bytes(b"0123456789"))
+            .await
+            .expect("put");
+        storage.finalize("k").await.expect("finalize");
+
+        // start == size is an empty read at EOF, not an error.
+        let at_eof = read_all(storage.get_range("k", 10..10).await.expect("at eof")).await;
+        assert!(at_eof.is_empty());
+        let clamped = read_all(storage.get_range("k", 10..99).await.expect("clamp")).await;
+        assert!(clamped.is_empty(), "end clamps to size, leaving nothing");
+        let tail = read_all(storage.get_range("k", 5..u64::MAX).await.expect("huge end")).await;
+        assert_eq!(tail, b"56789");
+
+        // start strictly past size errors even when the range is empty.
+        let err = storage
+            .get_range("k", 11..11)
+            .await
+            .err()
+            .expect("empty range past end");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn boot_reconciliation_corrects_accounting_drift() {
+        let dir = TestDir::new();
+        {
+            let storage = FsStorage::open(dir.path()).expect("open");
+            for (key, payload) in [("a", "aaaaa"), ("b", "bbbbbb")] {
+                storage
+                    .put_stream(key, bytes(payload.as_bytes()))
+                    .await
+                    .expect("put");
+                storage.finalize(key).await.expect("finalize");
+            }
+            assert_eq!(storage.used_bytes().await.expect("used"), 11);
+        }
+        // Corrupt the index directly: the stale total an unclean shutdown
+        // could leave behind.
+        {
+            let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("open db");
+            conn.execute("UPDATE accounting SET used_bytes = 99999", [])
+                .expect("plant drift");
+        }
+
+        let storage = FsStorage::open(dir.path()).expect("reopen");
+        assert_eq!(
+            storage.used_bytes().await.expect("used"),
+            11,
+            "accounting recomputed from surviving rows at boot"
+        );
+        assert_eq!(
+            storage.list().await.expect("list").len(),
+            2,
+            "entries untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_between_blob_rename_and_index_commit_is_invisible_and_sweepable() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        storage
+            .put_stream("keep", bytes(b"keep"))
+            .await
+            .expect("put");
+        storage.finalize("keep").await.expect("finalize");
+
+        // Simulate the crash window after the B5 blob rename but before the
+        // index commit: blob file present, no row, no part.
+        let orphan = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.blob", entry_id("ghost")));
+        std::fs::write(&orphan, b"half committed").expect("plant orphan");
+        drop(storage);
+
+        let storage = FsStorage::open(dir.path()).expect("reopen");
+        assert_eq!(
+            storage.stat("ghost").await.expect("stat"),
+            None,
+            "rowless blob is never visible"
+        );
+        let err = storage
+            .get_range("ghost", 0..1)
+            .await
+            .err()
+            .expect("unreadable");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            orphan.exists(),
+            "boot reconciliation leaves orphans for the reaper"
+        );
+        assert_eq!(storage.used_bytes().await.expect("used"), 4);
+
+        // The orphan sweeper clears it; indexed blobs are never touched.
+        let swept = storage.sweep_orphan_blobs(u64::MAX).await.expect("sweep");
+        assert_eq!(swept, 1);
+        assert!(!orphan.exists(), "rowless blob swept");
+        assert_eq!(storage.used_bytes().await.expect("used"), 4);
+        let stat = storage
+            .stat("keep")
+            .await
+            .expect("stat")
+            .expect("indexed entry kept");
+        assert_eq!(stat.size, 4);
+        // Idempotent: nothing left to sweep.
+        let again = storage.sweep_orphan_blobs(u64::MAX).await.expect("resweep");
+        assert_eq!(again, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_put_and_finalize_on_one_key_settle_on_one_visible_version() {
+        let dir = TestDir::new();
+        let storage = Arc::new(FsStorage::open(dir.path()).expect("open"));
+        let mut handles = Vec::new();
+        for i in 0..6_usize {
+            let storage = Arc::clone(&storage);
+            handles.push(tokio::spawn(async move {
+                let payload = vec![b'x'; i + 1];
+                storage
+                    .put_stream("hot-key", bytes(&payload))
+                    .await
+                    .expect("put");
+                storage.finalize("hot-key").await.expect("finalize");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("join");
+        }
+
+        // Whichever contender landed last commits as one atomic version:
+        // a whole payload of one size, never an interleaved mix.
+        let stat = storage
+            .stat("hot-key")
+            .await
+            .expect("stat")
+            .expect("one contender's version is visible");
+        assert!(
+            (1..=6).contains(&stat.size),
+            "size is one contender's payload: {}",
+            stat.size
+        );
+        assert_eq!(
+            storage.used_bytes().await.expect("used"),
+            stat.size,
+            "accounting matches the surviving version"
+        );
+        let body = read_all(
+            storage
+                .get_range("hot-key", 0..stat.size)
+                .await
+                .expect("get"),
+        )
+        .await;
+        assert_eq!(
+            body,
+            vec![b'x'; stat.size as usize],
+            "whole payload readable"
+        );
+    }
+
     /// Plan task 9 QA scenario: a 64 MiB save produces exactly one blob file
     /// of exact size and accounting survives reboot.
     #[tokio::test]
