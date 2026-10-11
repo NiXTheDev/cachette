@@ -32,6 +32,7 @@ use tokio::sync::RwLock;
 
 use crate::config::KeyCase;
 
+pub mod eviction;
 pub mod fs;
 
 /// Boxed future used by [`StorageBackend`] so the trait stays

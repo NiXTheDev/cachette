@@ -125,10 +125,139 @@ impl FsStorage {
         .await
     }
 
+    /// Reservation TTL reaper (plan task 11 / M4): delete staged
+    /// reservation rows whose `reservation_expires_at` has passed and the
+    /// staged parts backing them. Rows without an expiry are left alone.
+    /// Returns the number of reservations reaped.
+    pub async fn reap_expired_reservations(&self, now_unix: u64) -> io::Result<u64> {
+        let _gate = self.gate.write().await;
+        let conn = Arc::clone(&self.conn);
+        let parts = self.root.join("parts");
+        blocking(move || {
+            let mut conn = lock(&conn)?;
+            let tx = conn.transaction().map_err(sql)?;
+            let expired: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM entries WHERE complete = 0 \
+                         AND reservation_expires_at IS NOT NULL \
+                         AND reservation_expires_at <= ?1",
+                    )
+                    .map_err(sql)?;
+                let rows = stmt
+                    .query_map(params![now_unix], |row| row.get::<_, String>(0))
+                    .map_err(sql)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
+            };
+            for id in &expired {
+                tx.execute("DELETE FROM entries WHERE id = ?1", [&id])
+                    .map_err(sql)?;
+            }
+            tx.commit().map_err(sql)?;
+            // Files last (B5 convention): a crash in between leaves rowless
+            // parts for the boot sweep, never a dangling row.
+            for id in &expired {
+                let _ = std::fs::remove_file(parts.join(format!("{id}.part")));
+                let _ = std::fs::remove_dir_all(parts.join(id));
+            }
+            tracing::debug!(reaped = expired.len(), "expired reservations reaped");
+            Ok(expired.len() as u64)
+        })
+        .await
+    }
+
+    /// Reservation TTL reaper (plan task 11): delete blob files with no
+    /// index row that are older than `older_than_unix` — rowless leftovers
+    /// of a crash between the B5 blob rename and the index commit. Recent
+    /// orphans are kept: they may belong to a finalize still in flight.
+    /// Returns the number of blobs swept.
+    pub async fn sweep_orphan_blobs(&self, older_than_unix: u64) -> io::Result<u64> {
+        let _gate = self.gate.write().await;
+        let conn = Arc::clone(&self.conn);
+        let blobs = self.root.join("blobs");
+        blocking(move || {
+            let known: std::collections::HashSet<String> = {
+                let conn = lock(&conn)?;
+                let mut stmt = conn.prepare("SELECT id FROM entries").map_err(sql)?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sql)?;
+                rows.collect::<Result<_, _>>().map_err(sql)?
+            };
+            let cutoff = i64::try_from(older_than_unix).unwrap_or(i64::MAX);
+            let mut swept = 0_u64;
+            let read = match std::fs::read_dir(&blobs) {
+                Ok(read) => read,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+                Err(err) => return Err(err),
+            };
+            for dirent in read.flatten() {
+                let Some(name) = dirent.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(id) = name.strip_suffix(".blob") else {
+                    continue;
+                };
+                if known.contains(id) {
+                    continue;
+                }
+                match modified_unix(&dirent.path()) {
+                    Ok(mtime) if mtime <= cutoff => {}
+                    _ => continue,
+                }
+                if std::fs::remove_file(dirent.path()).is_ok() {
+                    swept += 1;
+                }
+            }
+            tracing::debug!(swept, "rowless blobs swept");
+            Ok(swept)
+        })
+        .await
+    }
+
+    /// Task-11 test seam: plant a staged reservation row plus its part
+    /// file — the state an abandoned reserve-then-PATCH upload leaves
+    /// behind. Never counts toward `accounting` (only complete rows do).
+    #[cfg(test)]
+    pub(crate) async fn seed_reservation(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expires_at: u64,
+    ) -> io::Result<()> {
+        let id = entry_id(key);
+        let tmp = self.tmp_path(&id);
+        let part = self.part_path(&id);
+        let conn = Arc::clone(&self.conn);
+        let key = key.to_owned();
+        let bytes = bytes.to_vec();
+        let _gate = self.gate.write().await;
+        blocking(move || {
+            write_atomic(&tmp, &part, &bytes)?;
+            let created_at = unix_now();
+            let size = i64::try_from(bytes.len())
+                .map_err(|_| io::Error::other("reservation exceeds SQLite integer range"))?;
+            let expires_at = i64::try_from(expires_at)
+                .map_err(|_| io::Error::other("expiry exceeds SQLite integer range"))?;
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO entries \
+                     (id, key, version, size, created_at, accessed_at, complete, \
+                      reservation_expires_at) \
+                 VALUES (?1, ?2, '', ?3, ?4, ?4, 0, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     complete = 0, reservation_expires_at = excluded.reservation_expires_at",
+                params![id, key, size, created_at, expires_at],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+
     fn blob_path(&self, id: &str) -> PathBuf {
         self.root.join("blobs").join(format!("{id}.blob"))
     }
-
     fn part_path(&self, id: &str) -> PathBuf {
         self.root.join("parts").join(format!("{id}.part"))
     }

@@ -25,3 +25,4 @@ base64 = "=0.22"
 url = "=2.5.8"
 thiserror = "=2"
 tower-http = { version = "=0.6", features = ["trace", "catch-panic"] }
+fs2 = "=0.4.3"
