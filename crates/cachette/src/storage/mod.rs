@@ -1,8 +1,9 @@
 //! Storage abstraction (plan task 8).
 //!
 //! [`StorageBackend`] is the object-safe seam between the HTTP layers and
-//! whatever holds the bytes: the node-local FS backend (plan task 9) or the
-//! in-memory double ([`MemoryStorage`]) used by unit and handler tests.
+//! whatever holds the bytes: the node-local FS backend ([`fs::FsStorage`],
+//! plan task 9) or the in-memory double ([`MemoryStorage`]) used by unit and
+//! handler tests.
 //!
 //! Semantics (plan m4 + B5):
 //! - `put_stream` stages bytes under an opaque key; nothing is visible to
@@ -28,6 +29,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::RwLock;
 
 use crate::config::KeyCase;
+
+pub mod fs;
 
 /// Boxed future used by [`StorageBackend`] so the trait stays
 /// dyn-compatible (`Arc<dyn StorageBackend>`) without an `async-trait`
@@ -301,11 +304,11 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn not_found(key: &str) -> io::Error {
+pub(crate) fn not_found(key: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no such key: {key}"))
 }
 
-fn invalid_range(msg: &str) -> io::Error {
+pub(crate) fn invalid_range(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_owned())
 }
 
