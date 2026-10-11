@@ -13,8 +13,10 @@
 //! - Dropping the future returned by `put_stream` cancels the put with no
 //!   partial visibility (cancel-safe).
 //! - Keys are opaque strings — no POSIX coupling. Callers apply
-//!   [`normalize_key`] with the configured [`KeyCase`] before reserving or
-//!   looking up; storage itself is case-agnostic.
+//!   [`normalize_key`] with the configured [`KeyCase`] before reserving;
+//!   storage itself is case-agnostic. Restore-time selection (plan task 10)
+//!   lives in [`lookup`], which folds the request keys itself and enforces
+//!   exact-then-ordered-prefix semantics.
 //! - Multipart/ETag helpers are intentionally omitted (plan m4); they can
 //!   be layered on later without changing this trait.
 
@@ -110,6 +112,71 @@ pub fn normalize_key(key: &str, case: KeyCase) -> String {
         KeyCase::Lower => key.to_ascii_lowercase(),
         KeyCase::Preserve => key.to_owned(),
     }
+}
+
+/// Ordered exact-then-prefix lookup over candidate entries (plan task 10).
+///
+/// Semantics (GitHub `restore-keys` ordering, Metis criterion 3):
+/// 1. Normalize every requested key with `case` via [`normalize_key`] — the
+///    same fold the reserve path applies to stored keys (M11).
+/// 2. Exact phase: the newest entry whose key equals the FIRST requested key
+///    and whose `version` equals `version` wins outright (exact beats prefix).
+/// 3. Prefix phase (only after an exact miss): walk the requested keys in
+///    sent order; the FIRST key with any prefix match wins — ordered
+///    first-hit, not longest-prefix-maximal and not a union across keys.
+///    Within that key's matched set the newest entry wins (`created_at`
+///    DESC, `key` DESC as the deterministic stand-in for the plan's
+///    `id DESC` tie-break: rows are unique per key).
+/// 4. Nothing matched — or `keys` was empty — is a miss (`None`; the route
+///    layer maps that to 204).
+///
+/// Matching is plain [`str::starts_with`] equality: no fuzzy or regex
+/// patterns, and in [`KeyCase::Preserve`] a differently-cased query misses
+/// on purpose. `version` filters both phases byte-exactly and is never
+/// normalized regardless of `case`. Callers pass finalized entries; staged
+/// rows are excluded by the backend queries feeding this function.
+#[must_use]
+pub fn lookup<'a, K: AsRef<str>>(
+    entries: &'a [Entry],
+    keys: &[K],
+    version: &Version,
+    case: KeyCase,
+) -> Option<&'a Entry> {
+    let normalized: Vec<String> = keys
+        .iter()
+        .map(|key| normalize_key(key.as_ref(), case))
+        .collect();
+    let first = normalized.first()?;
+
+    if let Some(hit) = newest(
+        entries
+            .iter()
+            .filter(|e| e.key == first.as_str() && e.version == version.as_str()),
+    ) {
+        return Some(hit);
+    }
+
+    for key in &normalized {
+        if let Some(hit) = newest(
+            entries
+                .iter()
+                .filter(|e| e.key.starts_with(key.as_str()) && e.version == version.as_str()),
+        ) {
+            return Some(hit);
+        }
+    }
+
+    None
+}
+
+/// Newest entry in `candidates`: `created_at` DESC, then `key` DESC as a
+/// deterministic tie-break for equal timestamps (see [`lookup`]).
+fn newest<'a>(candidates: impl Iterator<Item = &'a Entry>) -> Option<&'a Entry> {
+    candidates.max_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.key.cmp(&b.key))
+    })
 }
 
 /// Node-local cache storage (plan task 8 / m4).
@@ -502,5 +569,154 @@ mod trait_contract {
         assert_eq!(normalize_key("MiXeD-Key", KeyCase::Preserve), "MiXeD-Key");
         // Non-ASCII bytes are untouched by the Lower rule (ASCII-only).
         assert_eq!(normalize_key("ÄBC", KeyCase::Lower), "Äbc");
+    }
+}
+
+#[cfg(test)]
+mod lookup {
+    use super::*;
+
+    fn entry(key: &str, version: &str, created_at: u64) -> Entry {
+        Entry {
+            key: key.to_owned(),
+            version: version.to_owned(),
+            size: 1,
+            created_at,
+            accessed_at: created_at,
+            complete: true,
+        }
+    }
+
+    fn fixture() -> Vec<Entry> {
+        vec![
+            entry("nginx-src-1.30.5-extra", "2", 100),
+            entry("nginx-src-1.30", "2", 200),
+            entry("nginx-src-1.30.5", "2", 300),
+        ]
+    }
+
+    #[test]
+    fn criterion_a_exact_first_key_beats_prefix() {
+        let entries = fixture();
+        let keys = ["nginx-src-1.30.5", "nginx-src-1.30"];
+        let hit = lookup(&entries, &keys, &Version::from("2"), KeyCase::Lower)
+            .expect("exact hit on the first key");
+        assert_eq!(hit.key, "nginx-src-1.30.5");
+        assert_eq!(hit.created_at, 300);
+    }
+
+    #[test]
+    fn exact_first_key_wins_over_newer_prefix_sibling() {
+        let entries = vec![
+            entry("nginx-src-1.30", "2", 100),
+            entry("nginx-src-1.30.5", "2", 200),
+        ];
+        let keys = ["nginx-src-1.30"];
+        let hit = lookup(&entries, &keys, &Version::from("2"), KeyCase::Lower)
+            .expect("exact hit on the first key");
+        assert_eq!(hit.key, "nginx-src-1.30");
+        assert_eq!(hit.created_at, 100);
+    }
+
+    #[test]
+    fn criterion_b_no_exact_first_restore_key_prefix_wins_newest() {
+        let entries = fixture();
+        let keys = ["nginx-src-1.30.4", "nginx-src-1.30"];
+        let hit = lookup(&entries, &keys, &Version::from("2"), KeyCase::Lower)
+            .expect("first restore key prefix hit");
+        assert_eq!(hit.key, "nginx-src-1.30.5");
+        assert_eq!(hit.created_at, 300);
+    }
+
+    #[test]
+    fn criterion_c_ordered_first_hit_beats_longer_second_key() {
+        let entries = fixture();
+        let keys = ["nginx-src", "nginx-src-1.30.5-extra"];
+        let hit = lookup(&entries, &keys, &Version::from("2"), KeyCase::Lower)
+            .expect("prefix hit on the first key");
+        assert_eq!(hit.key, "nginx-src-1.30.5");
+        assert_eq!(hit.created_at, 300);
+    }
+
+    #[test]
+    fn criterion_d_version_mismatch_misses_every_key_list() {
+        let entries = fixture();
+        let lists: [&[&str]; 3] = [
+            &["nginx-src-1.30.5", "nginx-src-1.30"],
+            &["nginx-src-1.30.4", "nginx-src-1.30"],
+            &["nginx-src", "nginx-src-1.30.5-extra"],
+        ];
+        for keys in lists {
+            assert!(
+                lookup(&entries, keys, &Version::from("9"), KeyCase::Lower).is_none(),
+                "version 9 must miss for {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_folds_query_but_preserve_misses_on_case_mismatch() {
+        let entries = fixture();
+        let folded = lookup(
+            &entries,
+            &["NGINX-SRC-1.30.5"],
+            &Version::from("2"),
+            KeyCase::Lower,
+        )
+        .expect("Lower folds the query key");
+        assert_eq!(folded.key, "nginx-src-1.30.5");
+        assert!(
+            lookup(
+                &entries,
+                &["NGINX-SRC-1.30.5"],
+                &Version::from("2"),
+                KeyCase::Preserve,
+            )
+            .is_none(),
+            "same key different case must miss in Preserve mode"
+        );
+        let folded_restore = lookup(
+            &entries,
+            &["NGINX-SRC"],
+            &Version::from("2"),
+            KeyCase::Lower,
+        )
+        .expect("Lower folds restore keys too");
+        assert_eq!(folded_restore.key, "nginx-src-1.30.5");
+    }
+
+    #[test]
+    fn non_ascii_case_uses_ascii_only_lowercasing() {
+        let entries = vec![entry("Äbc", "2", 100)];
+        let hit = lookup(&entries, &["ÄBC"], &Version::from("2"), KeyCase::Lower)
+            .expect("Lower folds only the ASCII letters of the query");
+        assert_eq!(hit.key, "Äbc");
+        assert!(
+            lookup(&entries, &["ÄBC"], &Version::from("2"), KeyCase::Preserve).is_none(),
+            "Preserve compares bytes; ÄBC must not match Äbc"
+        );
+    }
+
+    #[test]
+    fn empty_key_list_is_a_miss() {
+        let entries = fixture();
+        let keys: [&str; 0] = [];
+        assert!(
+            lookup(&entries, &keys, &Version::from("2"), KeyCase::Lower).is_none(),
+            "empty keys must miss"
+        );
+    }
+
+    #[test]
+    fn version_is_never_case_folded_by_key_case() {
+        let entries = vec![entry("k", "V2", 100)];
+        assert!(
+            lookup(&entries, &["k"], &Version::from("v2"), KeyCase::Lower).is_none(),
+            "version compares byte-exactly even under Lower"
+        );
+        assert!(
+            lookup(&entries, &["k"], &Version::from("V2"), KeyCase::Lower).is_some(),
+            "byte-exact version match"
+        );
     }
 }
