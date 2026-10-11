@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::env::apply as apply_env;
-use crate::config::validate::split_host_port;
+pub(crate) use crate::config::validate::split_host_port;
 
 mod env;
 mod error;
@@ -50,6 +50,17 @@ impl Config {
             }
             Some(_) => Ok(()),
         }
+    }
+
+    /// Identity directory: resolved `cluster.cert_path`, defaulting to
+    /// `<storage.fs.path>/identity` when unset (M6; also covers
+    /// `Config::default`, which bypasses `resolve`).
+    #[must_use]
+    pub fn cert_path(&self) -> PathBuf {
+        self.cluster
+            .cert_path
+            .clone()
+            .unwrap_or_else(|| self.storage.fs.path.join("identity"))
     }
 }
 
@@ -337,6 +348,17 @@ mod tests {
         let message = out_of_range.to_string();
         assert!(message.contains("storage"), "{message}");
         assert!(message.contains("min_free"), "{message}");
+    }
+
+    #[test]
+    fn cert_path_defaults_to_storage_identity_and_honours_override() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.cert_path(),
+            PathBuf::from("/var/lib/cachette/identity")
+        );
+        config.cluster.cert_path = Some(PathBuf::from("/srv/ident"));
+        assert_eq!(config.cert_path(), PathBuf::from("/srv/ident"));
     }
 
     #[test]

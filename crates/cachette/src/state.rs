@@ -10,8 +10,8 @@ use crate::storage::StorageBackend;
 pub struct AppState {
     /// Crate version (`CARGO_PKG_VERSION`), surfaced by `/health`.
     pub version: &'static str,
-    /// Node identity — hostname placeholder until the Ed25519 fingerprint
-    /// arrives in plan task 13.
+    /// Node identity — replaced with the Ed25519 fingerprint during startup
+    /// (plan task 13); the hostname placeholder applies only before then.
     pub node_id: String,
     /// `--config <path>` placeholder; config loading lands in plan task 5.
     pub config_path: Option<PathBuf>,
@@ -38,8 +38,8 @@ impl Default for AppState {
 }
 
 /// Placeholder node id: the host name — `COMPUTERNAME` on Windows, `HOSTNAME`
-/// on Unix-likes — falling back to `"local"`. Plan task 13 replaces this with
-/// the certificate fingerprint.
+/// on Unix-likes — falling back to `"local"`. `serve()` overwrites it with the
+/// certificate fingerprint (plan task 13).
 fn default_node_id() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))

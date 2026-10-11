@@ -1,7 +1,8 @@
 use std::error::Error;
 
-use cachette::cli::Cli;
+use cachette::cli::{Cli, Command};
 use cachette::config::{self, Config};
+use cachette::identity::Identity;
 use cachette::logging::{self};
 use cachette::routes;
 use cachette::state::AppState;
@@ -21,6 +22,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         match config::render_masked(&config) {
             Ok(rendered) => {
                 println!("{rendered}");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("cachette: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if matches!(cli.command, Some(Command::Identity)) {
+        let result = Identity::load_or_generate(
+            &config.cert_path(),
+            config.cluster.node_id.as_deref(),
+            config.cluster.advertise_addr.as_deref(),
+        );
+        match result {
+            Ok(identity) => {
+                println!("fingerprint: {}", identity.fingerprint());
+                println!("cert_path: {}", identity.cert_path().display());
                 std::process::exit(0);
             }
             Err(err) => {
@@ -55,6 +74,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let mut state = AppState::new();
     state.config_path = cli.config;
+    // First boot mints the Ed25519 identity at `cluster.cert_path`; later
+    // boots reuse it, so the fingerprint survives restarts and storage wipes
+    // (plan task 13). It also becomes the `/health` node_id.
+    let identity = Identity::load_or_generate(
+        &config.cert_path(),
+        config.cluster.node_id.as_deref(),
+        config.cluster.advertise_addr.as_deref(),
+    )?;
+    tracing::info!(
+        fingerprint = identity.fingerprint(),
+        cert_path = %identity.cert_path().display(),
+        "node identity ready"
+    );
+    state.node_id = identity.fingerprint().to_owned();
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
     let app = routes::router(state).layer(TraceLayer::new_for_http());
