@@ -194,6 +194,8 @@ fn mask_string(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const SECRET: &str = "0123456789abcdef";
@@ -273,5 +275,91 @@ mod tests {
             .to_string();
         assert!(bare.contains("min_free"));
         assert!(bare.contains("abc"));
+    }
+
+    #[test]
+    fn print_config_masks_every_secret_field_but_keeps_structure() {
+        let jwt_secret = "jwt-secret-value";
+        let tokens = ["token-one", "token-two"];
+        let mut config = Config::default();
+        config.auth.secret = Some(SECRET.to_owned());
+        config.auth.tokens = tokens.iter().map(|token| (*token).to_owned()).collect();
+        config.v2.jwt_secret = Some(jwt_secret.to_owned());
+        config.server.listen = String::from("127.0.0.1:9000");
+
+        let rendered = render_masked(&config).expect("renders");
+        assert!(!rendered.contains(SECRET), "auth.secret leaked: {rendered}");
+        for token in tokens {
+            assert!(!rendered.contains(token), "{token} leaked: {rendered}");
+        }
+        assert!(
+            !rendered.contains(jwt_secret),
+            "v2.jwt_secret leaked: {rendered}"
+        );
+
+        let parsed: Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(parsed["auth"]["secret"], "***");
+        assert_eq!(parsed["auth"]["tokens"], json!(["***", "***"]));
+        assert_eq!(parsed["v2"]["jwt_secret"], "***");
+        assert_eq!(parsed["server"]["listen"], "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn unknown_keys_in_sections_and_unknown_sections_are_rejected() {
+        let in_section =
+            from_sources(Some("[auth]\nunknown = 1\n"), &[]).expect_err("deny_unknown_fields");
+        let message = in_section.to_string();
+        assert!(message.contains("auth"), "{message}");
+        assert!(message.contains("unknown"), "{message}");
+
+        let top_level = from_sources(Some("[nope]\nx = 1\n"), &[]).expect_err("unknown section");
+        assert!(
+            matches!(&top_level, ConfigError::UnknownKey(key) if key == "nope"),
+            "unexpected error: {top_level:?}"
+        );
+    }
+
+    #[test]
+    fn min_free_accepts_every_spec_form_from_toml_and_rejects_bad_ones() {
+        let percent =
+            from_sources(Some("[storage.fs]\nmin_free = \"20%\"\n"), &[]).expect("percent form");
+        assert_eq!(percent.storage.fs.min_free, MinFree::Percent(20.0));
+
+        let bytes =
+            from_sources(Some("[storage.fs]\nmin_free = \"2GB\"\n"), &[]).expect("bytesize form");
+        assert_eq!(
+            bytes.storage.fs.min_free,
+            MinFree::Bytes(2 * 1024 * 1024 * 1024)
+        );
+
+        let out_of_range = from_sources(Some("[storage.fs]\nmin_free = 1.5\n"), &[])
+            .expect_err("fraction out of range");
+        let message = out_of_range.to_string();
+        assert!(message.contains("storage"), "{message}");
+        assert!(message.contains("min_free"), "{message}");
+    }
+
+    #[test]
+    fn example_fixture_parses_cleanly_and_matches_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("cachette.example.toml");
+        let text = std::fs::read_to_string(&path).expect("cachette.example.toml exists");
+        let config = from_sources(Some(&text), &[]).expect("example parses cleanly");
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.storage.fs.min_free, MinFree::Fraction(0.2));
+        assert_eq!(
+            config.auth.secret.as_deref(),
+            Some("CHANGE_ME_MIN_16_CHARS")
+        );
+        assert_eq!(
+            config.v2.jwt_secret.as_deref(),
+            Some("CHANGE_ME_MIN_16_CHARS")
+        );
+        assert_eq!(config.cache.reservation_ttl_seconds, 3600);
+        config.require_auth_secret().expect("fixture secret serves");
+        let rendered = render_masked(&config).expect("example renders masked");
+        assert!(!rendered.contains("CHANGE_ME_MIN_16_CHARS"));
     }
 }

@@ -185,3 +185,132 @@ fn coerce(kind: Kind, name: &str, raw: &str) -> Result<Value, ConfigError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn apply_one(name: &str, raw: &str) -> Result<Value, ConfigError> {
+        let mut doc = Value::Object(serde_json::Map::new());
+        apply(&mut doc, &[(name, raw)])?;
+        Ok(doc)
+    }
+
+    #[test]
+    fn unknown_variables_are_rejected_and_named() {
+        let sectioned = apply_one("CACHETTE__NOPE__BAD", "1").expect_err("unknown section");
+        assert!(
+            matches!(
+                &sectioned,
+                ConfigError::UnknownEnvVar(var) if var == "CACHETTE__NOPE__BAD"
+            ),
+            "unexpected error: {sectioned:?}"
+        );
+        assert!(sectioned.to_string().contains("CACHETTE__NOPE__BAD"));
+
+        let bare = apply_one("CACHETTE__NOPE", "1").expect_err("unknown key");
+        assert!(
+            matches!(&bare, ConfigError::UnknownEnvVar(var) if var == "CACHETTE__NOPE"),
+            "unexpected error: {bare:?}"
+        );
+
+        let dotted = apply_one("CACHETTE__FS__PATH", "/tmp").expect_err("no such section");
+        assert!(
+            matches!(&dotted, ConfigError::UnknownEnvVar(var) if var == "CACHETTE__FS__PATH"),
+            "unexpected error: {dotted:?}"
+        );
+    }
+
+    #[test]
+    fn full_names_match_ignoring_case_and_unprefixed_vars_are_skipped() {
+        let full = apply_one("CACHETTE__SERVER__LISTEN", "127.0.0.1:9000").expect("applies");
+        assert_eq!(full["server"]["listen"], "127.0.0.1:9000");
+
+        let lower = apply_one("cachette__server__listen", "127.0.0.1:9001").expect("applies");
+        assert_eq!(lower["server"]["listen"], "127.0.0.1:9001");
+
+        let mut doc = Value::Object(serde_json::Map::new());
+        apply(&mut doc, &[("PATH", "/bin"), ("LANG", "C")]).expect("non-prefixed vars are skipped");
+        assert_eq!(doc, json!({}));
+    }
+
+    #[test]
+    fn bare_unique_key_prefix_matches_its_section() {
+        let listen = apply_one("CACHETTE__LISTEN", "127.0.0.1:9002").expect("applies");
+        assert_eq!(listen["server"]["listen"], "127.0.0.1:9002");
+
+        let enabled = apply_one("CACHETTE__ENABLED", "true").expect("applies");
+        assert_eq!(enabled["cluster"]["enabled"], json!(true));
+    }
+
+    #[test]
+    fn array_values_are_comma_split_trimmed_and_empty_free() {
+        let doc = apply_one("CACHETTE__AUTH__TOKENS", "a, b ,,c ,").expect("applies");
+        assert_eq!(doc["auth"]["tokens"], json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn map_values_parse_as_json_string_objects() {
+        let doc = apply_one(
+            "CACHETTE__CLUSTER__SEED_FINGERPRINTS",
+            "{\"p1\":\"aa\",\"p2\":\"bb\"}",
+        )
+        .expect("applies");
+        assert_eq!(
+            doc["cluster"]["seed_fingerprints"],
+            json!({"p1": "aa", "p2": "bb"})
+        );
+
+        let err = apply_one("CACHETTE__CLUSTER__SEED_FINGERPRINTS", "not-json")
+            .expect_err("rejects non-JSON");
+        assert!(
+            matches!(
+                &err,
+                ConfigError::InvalidEnvValue { var, .. }
+                    if var == "CACHETTE__CLUSTER__SEED_FINGERPRINTS"
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("CACHETTE__CLUSTER__SEED_FINGERPRINTS")
+        );
+    }
+
+    #[test]
+    fn scalar_coercions_cover_bool_u64_and_min_free() {
+        let off = apply_one("CACHETTE__CLUSTER__ENABLED", "false").expect("applies");
+        assert_eq!(off["cluster"]["enabled"], json!(false));
+        let bad_bool = apply_one("CACHETTE__CLUSTER__ENABLED", "yes").expect_err("rejects");
+        assert!(
+            matches!(
+                &bad_bool,
+                ConfigError::InvalidEnvValue { var, .. } if var == "CACHETTE__CLUSTER__ENABLED"
+            ),
+            "unexpected error: {bad_bool:?}"
+        );
+        assert!(bad_bool.to_string().contains("CACHETTE__CLUSTER__ENABLED"));
+
+        let size = apply_one("CACHETTE__CACHE__MAX_SIZE", "1234").expect("applies");
+        assert_eq!(size["cache"]["max_size"], json!(1234));
+        let bad_u64 = apply_one("CACHETTE__CACHE__MAX_SIZE", "big").expect_err("rejects");
+        assert!(
+            matches!(
+                &bad_u64,
+                ConfigError::InvalidEnvValue { var, .. } if var == "CACHETTE__CACHE__MAX_SIZE"
+            ),
+            "unexpected error: {bad_u64:?}"
+        );
+
+        // MinFree: a plain number stays a number, other forms stay strings
+        // for `MinFree` to re-parse during section deserialization.
+        let fraction = apply_one("CACHETTE__STORAGE__FS__MIN_FREE", "0.5").expect("applies");
+        assert_eq!(fraction["storage"]["fs"]["min_free"], json!(0.5));
+        let percent = apply_one("CACHETTE__STORAGE__FS__MIN_FREE", "20%").expect("applies");
+        assert_eq!(percent["storage"]["fs"]["min_free"], json!("20%"));
+        let bytes = apply_one("CACHETTE__STORAGE__FS__MIN_FREE", "2GiB").expect("applies");
+        assert_eq!(bytes["storage"]["fs"]["min_free"], json!("2GiB"));
+    }
+}
