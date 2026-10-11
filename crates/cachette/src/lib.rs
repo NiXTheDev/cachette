@@ -5,6 +5,7 @@
 //! shared types directly; the binary in `main.rs` wires them to a listener.
 
 pub mod cli;
+pub mod config;
 pub mod error;
 pub mod logging;
 pub mod routes;

@@ -8,8 +8,10 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Cli {
-    /// Path to a TOML config file; parsed but unused until config loading
-    /// lands in plan task 5.
+    /// Path to a TOML config file (default: cachette.toml if present).
     #[arg(long, value_name = "path")]
     pub config: Option<PathBuf>,
+    /// Print the resolved configuration (secrets masked) and exit.
+    #[arg(long)]
+    pub print_config: bool,
 }
