@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::auth::{AuthPolicy, TokenStore};
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
 
@@ -21,6 +22,12 @@ pub struct AppState {
     /// Cluster peer-certificate pins (plan task 14 / B2). Seeded from
     /// `[cluster] seed_fingerprints`; gates `/_internal/peers/*`.
     pub peers: Arc<PeerPins>,
+    /// Dynamic bearer-token store (plan task 15): sqlite-backed register/
+    /// revoke, shared with the storage backend's database file.
+    pub tokens: Arc<TokenStore>,
+    /// Auth policy snapshot (plan task 15): per-request mode resolution for
+    /// the v1 artifactcache routes plus the admin register/revoke gate.
+    pub auth: Arc<AuthPolicy>,
 }
 
 impl AppState {
@@ -33,6 +40,8 @@ impl AppState {
             config_path: None,
             storage: None,
             peers: Arc::new(PeerPins::default()),
+            tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
+            auth: Arc::new(AuthPolicy::default()),
         }
     }
 }

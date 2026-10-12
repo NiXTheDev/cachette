@@ -2,8 +2,12 @@
 //!
 //! `/_internal/peers/*` (plan task 14) is the first pin-gated route group:
 //! every request there must carry a peer certificate whose SPKI fingerprint is
-//! pinned. Public routes and the 404 fallback never require a client cert.
-//! Storage/auth/v1/v2 routes are added by later plan tasks.
+//! pinned. `/_internal/register` + `/_internal/revoke` (plan task 15) are the
+//! admin token routes: `Authorization: Bearer <auth.secret>`, or loopback-only
+//! when `[cluster] enabled` is false. The `/_apis/artifactcache/*` group is
+//! auth-gated by a path-scoped layer (plan task 15); its handlers land in
+//! plan task 18. Public routes and the 404 fallback never require a client
+//! cert.
 
 mod health;
 
@@ -11,18 +15,20 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::Uri;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+use crate::auth;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::tls::{PeerCert, PeerPins};
 
-/// Build the application router: `GET /health`, the pin-gated peer group, and
-/// a JSON 404 fallback.
+/// Build the application router: `GET /health`, the pin-gated peer group, the
+/// admin token routes, the auth-gated artifactcache prefix, and a JSON 404
+/// fallback.
 pub fn router(state: AppState) -> Router {
     let peer_routes = Router::new()
         .route("/_internal/peers/hello", post(peer_hello))
@@ -30,16 +36,92 @@ pub fn router(state: AppState) -> Router {
             state.peers.clone(),
             require_pinned_peer,
         ));
+    let admin_routes = Router::new()
+        .route("/_internal/register", post(register_token))
+        .route("/_internal/revoke", post(revoke_token));
     Router::new()
         .route("/health", get(health::health))
         .merge(peer_routes)
-        .with_state(state)
+        .merge(admin_routes)
+        .with_state(state.clone())
         .fallback(fallback_404)
+        .layer(middleware::from_fn_with_state(state, auth::require_auth))
 }
 
 /// Minimal cluster hello (plan task 28 expands it): reports the responding node.
 async fn peer_hello(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"node_id": state.node_id, "accepted": true}))
+}
+
+/// Query parameter for the admin token routes: `?token=<token>`.
+#[derive(serde::Deserialize)]
+struct TokenParams {
+    token: Option<String>,
+}
+
+/// `POST /_internal/register?token=<token>` — mint a dynamic bearer token.
+/// Idempotent: re-registering an existing token is a no-op.
+async fn register_token(
+    State(state): State<AppState>,
+    Query(params): Query<TokenParams>,
+    request: Request,
+) -> Response {
+    if !admin_authorized(&state, &request) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let Some(token) = params.token.filter(|token| !token.is_empty()) else {
+        return ApiError::BadRequest(String::from("token query parameter is required"))
+            .into_response();
+    };
+    match state.tokens.register(&token).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "token register failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+/// `POST /_internal/revoke?token=<token>` — revoke a dynamic bearer token.
+/// Revoking an unknown token is a no-op.
+async fn revoke_token(
+    State(state): State<AppState>,
+    Query(params): Query<TokenParams>,
+    request: Request,
+) -> Response {
+    if !admin_authorized(&state, &request) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let Some(token) = params.token.filter(|token| !token.is_empty()) else {
+        return ApiError::BadRequest(String::from("token query parameter is required"))
+            .into_response();
+    };
+    match state.tokens.revoke(&token).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "token revoke failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+/// Admin gate for the token routes: `Authorization: Bearer <auth.secret>`, or
+/// loopback-only when `[cluster] enabled` is false (standalone node).
+fn admin_authorized(state: &AppState, request: &Request) -> bool {
+    let secret_ok = match (
+        state.auth.secret.as_deref(),
+        auth::bearer_token(request.headers()),
+    ) {
+        (Some(secret), Some(token)) => auth::constant_time_eq(token.as_bytes(), secret.as_bytes()),
+        _ => false,
+    };
+    if secret_ok {
+        return true;
+    }
+    match request.extensions().get::<ConnectInfo<PeerCert>>() {
+        Some(ConnectInfo(peer)) => !state.auth.cluster_enabled && peer.remote.ip().is_loopback(),
+        None => false,
+    }
 }
 
 /// Pin gate for `/_internal/peers/*`.

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
+use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::{Cli, Command};
 use cachette::config::{self, Config};
 use cachette::identity::Identity;
@@ -96,6 +97,12 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.cluster.seed_fingerprints,
         config.cluster.enabled,
     ));
+    // Auth (plan task 15): sqlite-backed dynamic token store sharing the
+    // storage database file, plus the per-request auth policy snapshot.
+    state.tokens = Arc::new(TokenStore::open(
+        &config.storage.fs.path.join("cachette.sqlite3"),
+    )?);
+    state.auth = Arc::new(AuthPolicy::from_config(&config));
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
     let app = routes::router(state).layer(TraceLayer::new_for_http());
