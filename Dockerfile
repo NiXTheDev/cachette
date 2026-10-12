@@ -23,8 +23,9 @@
 # Entrypoint / command / port:
 #   ENTRYPOINT ["/usr/local/bin/cachette"]
 #   CMD        ["--config", "/etc/cachette/cachette.toml"]
-#   EXPOSE     8080   # [server] listen = "0.0.0.0:8080" (TLS when the mounted
-#                     # config sets tls_cert/tls_key)
+#   EXPOSE     8080   # [server] listen = "0.0.0.0:8080" - always TLS
+#                     # (self-signed Ed25519 identity cert when the mounted
+#                     # config sets no tls_cert/tls_key)
 #   docker run --rm cachette:local            -> cachette --config /etc/cachette/cachette.toml
 #   docker run --rm cachette:local --version  -> cachette 0.1.0   (replaces CMD)
 #

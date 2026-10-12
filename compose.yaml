@@ -9,16 +9,20 @@
 # Quick start:
 #   docker compose build            # builds cachette:local from ./Dockerfile
 #   docker compose up -d
-#   docker compose logs -f          # wait for: cachette listening on http://0.0.0.0:8080
-#   curl http://127.0.0.1:8080/health
+#   docker compose logs -f          # wait for: cachette listening on https://0.0.0.0:8080
+#   curl -k https://127.0.0.1:8080/health
+#     (Windows Schannel curl cannot complete the handshake against this
+#     listener - it requests a client cert and errors SEC_E_ILLEGAL_MESSAGE;
+#     use `openssl s_client -connect 127.0.0.1:8080` or node instead)
 #   docker compose down
 #
 # Notes:
 #   * Image is scratch-based (musl static, non-root uid 65532): no shell inside,
 #     therefore no in-container healthcheck - readiness = the log line above.
-#   * Port 8080 is [server] listen = "0.0.0.0:8080"; it becomes the TLS port
-#     once the mounted config sets tls_cert/tls_key (see the commented tls
-#     volume below) - the published port does not change.
+#   * Port 8080 is [server] listen = "0.0.0.0:8080"; the listener is ALWAYS
+#     TLS - a self-signed Ed25519 identity cert when the mounted config sets
+#     no tls_cert/tls_key (see the commented tls volume below to supply your
+#     own) - the published port does not change.
 #   * Auth secret must be >= 16 chars; the default below is demo-only. Set
 #     CACHETTE_AUTH_SECRET in the environment to override. The same secret is
 #     shared by both nodes in the cluster demo.
@@ -34,7 +38,8 @@ services:
     build:
       context: .
     ports:
-      # [server] listen = "0.0.0.0:8080" (plain HTTP, TLS when certs configured)
+      # [server] listen = "0.0.0.0:8080" (always TLS; self-signed identity
+      # cert unless tls_cert/tls_key are set in the config)
       - "8080:8080"
     environment:
       # Serving requires an auth secret >= 16 chars (override in real use):
