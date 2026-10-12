@@ -11,7 +11,9 @@
 
 pub mod bearer;
 pub mod hmac;
+pub mod jwt;
 pub mod tokens;
+pub mod urls;
 
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
@@ -22,7 +24,9 @@ use crate::config::{AuthMode, Config};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+pub use jwt::{JwtClaims, JwtError};
 pub use tokens::TokenStore;
+pub use urls::{SignedUrl, UrlError};
 
 /// Path prefix guarded by [`require_auth`]; plan task 18 owns the handlers.
 pub const ARTIFACTCACHE_PREFIX: &str = "/_apis/artifactcache";
