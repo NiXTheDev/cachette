@@ -6,10 +6,12 @@
 //! admin token routes: `Authorization: Bearer <auth.secret>`, or loopback-only
 //! when `[cluster] enabled` is false. The `/_apis/artifactcache/*` group is
 //! auth-gated by a path-scoped layer (plan task 15) and served by the v1
-//! handlers in [`v1`] (plan task 18). Public routes and the 404/405 fallbacks
-//! never require a client cert.
+//! handlers in [`v1`] (plan task 18). The Twirp v2 group (`/twirp/...`, plan
+//! task 23) is served by [`twirp`], which enforces its own bearer/JWT policy.
+//! Public routes and the 404/405 fallbacks never require a client cert.
 
 mod health;
+mod twirp;
 mod v1;
 
 use std::sync::Arc;
@@ -52,11 +54,16 @@ pub fn router(state: AppState) -> Router {
             "/_apis/artifactcache/artifacts/{cacheId}",
             get(v1::download),
         );
+    let twirp_routes = Router::new().route(
+        "/twirp/github.actions.results.api.v1.CacheService/{method}",
+        post(twirp::dispatch),
+    );
     Router::new()
         .route("/health", get(health::health))
         .merge(peer_routes)
         .merge(admin_routes)
         .merge(v1_routes)
+        .merge(twirp_routes)
         .with_state(state.clone())
         .fallback(fallback_404)
         .method_not_allowed_fallback(fallback_405)
