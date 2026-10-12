@@ -16,6 +16,7 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 rustls = "=0.23"
 rustls-pemfile = "=2.2.0"
+tokio-rustls = "=0.26"
 rcgen = "=0.13"
 rusqlite = { version = "=0.32", features = ["bundled"] }
 mdns-sd = "=0.21.5"

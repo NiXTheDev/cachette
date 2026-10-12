@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::storage::StorageBackend;
+use crate::tls::PeerPins;
 
 /// State threaded through every route handler.
 #[derive(Clone)]
@@ -17,16 +18,21 @@ pub struct AppState {
     pub config_path: Option<PathBuf>,
     /// Storage handle; `None` until a backend is constructed (plan tasks 8-9).
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// Cluster peer-certificate pins (plan task 14 / B2). Seeded from
+    /// `[cluster] seed_fingerprints`; gates `/_internal/peers/*`.
+    pub peers: Arc<PeerPins>,
 }
 
 impl AppState {
-    /// Fresh state: no config path, no storage backend, hostname node id.
+    /// Fresh state: no config path, no storage backend, hostname node id, and
+    /// an empty pin store (no seeded peers, TOFU off).
     pub fn new() -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             node_id: default_node_id(),
             config_path: None,
             storage: None,
+            peers: Arc::new(PeerPins::default()),
         }
     }
 }

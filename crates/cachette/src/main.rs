@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::sync::Arc;
 
 use cachette::cli::{Cli, Command};
 use cachette::config::{self, Config};
@@ -6,6 +7,7 @@ use cachette::identity::Identity;
 use cachette::logging::{self};
 use cachette::routes;
 use cachette::state::AppState;
+use cachette::tls::{self, PeerPins};
 use clap::Parser;
 use tower_http::trace::TraceLayer;
 
@@ -88,15 +90,28 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         "node identity ready"
     );
     state.node_id = identity.fingerprint().to_owned();
+    // Peer pin store (plan task 14 / B2): seeded fingerprints are always
+    // trusted; TOFU admission follows `[cluster] enabled`.
+    state.peers = Arc::new(PeerPins::new(
+        &config.cluster.seed_fingerprints,
+        config.cluster.enabled,
+    ));
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
     let app = routes::router(state).layer(TraceLayer::new_for_http());
-    let listener = tokio::net::TcpListener::bind(config.server.listen.as_str()).await?;
+    // Single TLS listener (plan task 14 / B1): every route is served over
+    // HTTPS; client certs are optional at the TLS layer and gated per-route.
+    let tls_config = tls::server_config(&config.server, &identity)?;
+    let listener = tls::bind(config.server.listen.as_str(), tls_config).await?;
     // Unconditional stdout line: the readiness gate for scripts (it must
     // appear even when `RUST_LOG` silences the tracing subscriber).
     let listen = &config.server.listen;
-    println!("cachette listening on http://{listen}");
+    println!("cachette listening on https://{listen}");
     tracing::info!(%listen, "listener ready");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<tls::PeerCert>(),
+    )
+    .await?;
     Ok(())
 }
