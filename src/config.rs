@@ -363,10 +363,7 @@ mod tests {
 
     #[test]
     fn example_fixture_parses_cleanly_and_matches_defaults() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("cachette.example.toml");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cachette.example.toml");
         let text = std::fs::read_to_string(&path).expect("cachette.example.toml exists");
         let config = from_sources(Some(&text), &[]).expect("example parses cleanly");
         assert_eq!(config.server.listen, "0.0.0.0:8080");

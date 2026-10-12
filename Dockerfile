@@ -51,7 +51,7 @@ RUN if [ -n "$CARGO_MIRROR" ]; then \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+COPY src ./src
 COPY cachette.example.toml ./cachette.example.toml
 
 # Cache mounts keep the ~190-crate dependency build cached across local
