@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::{Cli, Command};
@@ -8,6 +9,9 @@ use cachette::identity::Identity;
 use cachette::logging::{self};
 use cachette::routes;
 use cachette::state::AppState;
+use cachette::storage::StorageBackend;
+use cachette::storage::eviction::Reaper;
+use cachette::storage::fs::FsStorage;
 use cachette::tls::{self, PeerPins};
 use clap::Parser;
 use tower_http::trace::TraceLayer;
@@ -103,6 +107,29 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.auth = Arc::new(AuthPolicy::from_config(&config));
+
+    // Storage + reaper (plan task 34). One `FsStorage` is constructed here and
+    // shared by the routes, the periodic sweep, and the shutdown flush. Its
+    // single-writer `gate` (an `RwLock`) serialises sweeps against writes:
+    // `sweep_orphan_blobs`/`reap_expired_reservations` take `gate.write()`,
+    // exactly like `put_stream`/`finalize`/`delete`. That is what guarantees a
+    // sweep never deletes a blob a download is reading and shutdown never
+    // interrupts a parts-write mid-rename — both wait for the same lock.
+    let storage = Arc::new(FsStorage::open(&config.storage.fs.path)?);
+    let backend: Arc<dyn StorageBackend> = storage.clone();
+    state.storage = Some(backend);
+    let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
+    // Startup sweep, before the listener binds: rowless blobs older than the
+    // 1h grace and reservations whose TTL has passed (plan task 34).
+    match reaper.sweep_once(&storage).await {
+        Ok(report) => tracing::info!(
+            reservations = report.reservations_reaped,
+            orphans = report.orphan_blobs_swept,
+            "startup sweep complete"
+        ),
+        Err(err) => tracing::warn!(error = %err, "startup sweep failed"),
+    }
+
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
     let app = routes::router(state).layer(TraceLayer::new_for_http());
@@ -115,10 +142,185 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let listen = &config.server.listen;
     println!("cachette listening on https://{listen}");
     tracing::info!(%listen, "listener ready");
-    axum::serve(
+
+    // Periodic sweep (plan task 34): `reservation_ttl / 4` (>= 1s), the cadence
+    // the reaper documents. The first tick is immediate and skipped — the
+    // startup sweep already ran.
+    let sweep_storage = storage.clone();
+    let sweep_interval = reaper.interval();
+    let sweep_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sweep_interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match reaper.sweep_once(&sweep_storage).await {
+                Ok(report) if report.reservations_reaped > 0 || report.orphan_blobs_swept > 0 => {
+                    tracing::info!(
+                        reservations = report.reservations_reaped,
+                        orphans = report.orphan_blobs_swept,
+                        "periodic sweep reclaimed storage"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "periodic sweep failed"),
+            }
+        }
+    });
+
+    // Shutdown (plan task 34): SIGINT (Ctrl+C on Windows and POSIX), SIGTERM
+    // (POSIX), or the documented test-only trigger. The first signal starts a
+    // graceful drain; a second aborts with exit 1.
+    let (shutdown_notify, mut signals) = shutdown::listen();
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<tls::PeerCert>(),
     )
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown_notify.notified().await;
+        tracing::info!("shutdown: draining in-flight transfers (10s grace)");
+    });
+    let mut serve = Box::pin(serve.into_future());
+
+    // `biased` + serve-first: if the server has already finished draining when
+    // a signal lands, the serve branch wins and the future is never polled
+    // again (re-polling a completed future would panic).
+    tokio::select! {
+        biased;
+        result = &mut serve => {
+            result?;
+        }
+        _ = signals.recv() => {
+            // Drain: `with_graceful_shutdown` has stopped accepting new
+            // connections; wait for in-flight transfers, bounded by the grace
+            // window, racing a second signal.
+            tokio::select! {
+                biased;
+                result = &mut serve => {
+                    result?;
+                }
+                () = tokio::time::sleep(shutdown::DRAIN_GRACE) => {
+                    tracing::warn!("shutdown: grace window elapsed; exiting with transfers in flight");
+                }
+                Some(()) = signals.recv() => {
+                    tracing::error!("shutdown: second signal received; exiting immediately");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    // Flush: stop the periodic sweep, run one final reap (commits the WAL),
+    // then drop the storage handle. SQLite runs in WAL mode with
+    // `synchronous=NORMAL`, so the committed final sweep is durable.
+    sweep_task.abort();
+    match reaper.sweep_once(&storage).await {
+        Ok(report) => tracing::info!(
+            reservations = report.reservations_reaped,
+            orphans = report.orphan_blobs_swept,
+            "shutdown: final sweep complete"
+        ),
+        Err(err) => tracing::warn!(error = %err, "shutdown: final sweep failed"),
+    }
+    drop(serve);
+    drop(storage);
+    tracing::info!("shutdown: complete");
     Ok(())
+}
+
+/// Graceful-shutdown plumbing (plan task 34).
+///
+/// Production path: the first SIGINT (Ctrl+C on Windows and POSIX) or SIGTERM
+/// (POSIX only) starts a drain — the listener stops accepting new connections,
+/// in-flight transfers get [`DRAIN_GRACE`] to finish, SQLite is flushed, and
+/// the process exits 0. A second signal during the drain exits 1 immediately.
+///
+/// Test-only trigger: when `CACHETTE_TEST_SHUTDOWN_AFTER_MS` is set to a
+/// millisecond count, the same drain path fires once after that delay. It
+/// exists because delivering a Windows console Ctrl+C to a child process needs
+/// `GenerateConsoleCtrlEvent` against a shared console process group, which is
+/// impractical in CI; the variable is read only here, is never part of the
+/// default config, and is never set by the server itself. The real signal
+/// handlers below stay wired in production.
+mod shutdown {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{Notify, mpsc};
+
+    /// Grace window for in-flight transfers before the process exits anyway.
+    pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+    /// Test-only trigger (see module docs): milliseconds after startup.
+    const TEST_TRIGGER_ENV: &str = "CACHETTE_TEST_SHUTDOWN_AFTER_MS";
+
+    /// Start listening for shutdown signals. Returns the [`Notify`] the
+    /// graceful-shutdown future awaits and a channel that yields one token per
+    /// delivered signal (first token = begin drain, second = abort).
+    pub fn listen() -> (Arc<Notify>, mpsc::Receiver<()>) {
+        let notify = Arc::new(Notify::new());
+        let (tx, rx) = mpsc::channel(4);
+        let task_notify = notify.clone();
+        tokio::spawn(async move {
+            let mut term = make_term();
+            let mut test_pending = test_trigger_delay();
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate(&mut term) => {}
+                    _ = test_trigger(&mut test_pending) => {}
+                }
+                task_notify.notify_one();
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (notify, rx)
+    }
+
+    /// SIGTERM stream on POSIX; a never-resolving placeholder elsewhere.
+    #[cfg(unix)]
+    type TermStream = Option<tokio::signal::unix::Signal>;
+    #[cfg(not(unix))]
+    struct TermStream;
+
+    #[cfg(unix)]
+    fn make_term() -> TermStream {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()
+    }
+
+    #[cfg(not(unix))]
+    fn make_term() -> TermStream {
+        TermStream
+    }
+
+    #[cfg(unix)]
+    async fn terminate(term: &mut TermStream) {
+        match term {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn terminate(_term: &mut TermStream) {
+        std::future::pending::<()>().await
+    }
+
+    fn test_trigger_delay() -> Option<Duration> {
+        std::env::var(TEST_TRIGGER_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    }
+
+    /// One-shot test trigger: sleeps `delay` once, then never resolves again.
+    async fn test_trigger(pending: &mut Option<Duration>) {
+        match pending.take() {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
