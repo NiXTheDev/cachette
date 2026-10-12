@@ -5,11 +5,12 @@
 //! pinned. `/_internal/register` + `/_internal/revoke` (plan task 15) are the
 //! admin token routes: `Authorization: Bearer <auth.secret>`, or loopback-only
 //! when `[cluster] enabled` is false. The `/_apis/artifactcache/*` group is
-//! auth-gated by a path-scoped layer (plan task 15); its handlers land in
-//! plan task 18. Public routes and the 404 fallback never require a client
-//! cert.
+//! auth-gated by a path-scoped layer (plan task 15) and served by the v1
+//! handlers in [`v1`] (plan task 18). Public routes and the 404/405 fallbacks
+//! never require a client cert.
 
 mod health;
+mod v1;
 
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::Uri;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 
 use crate::auth;
 use crate::error::ApiError;
@@ -27,8 +28,8 @@ use crate::state::AppState;
 use crate::tls::{PeerCert, PeerPins};
 
 /// Build the application router: `GET /health`, the pin-gated peer group, the
-/// admin token routes, the auth-gated artifactcache prefix, and a JSON 404
-/// fallback.
+/// admin token routes, the auth-gated v1 artifactcache routes, and JSON
+/// 404/405 fallbacks.
 pub fn router(state: AppState) -> Router {
     let peer_routes = Router::new()
         .route("/_internal/peers/hello", post(peer_hello))
@@ -39,12 +40,26 @@ pub fn router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/_internal/register", post(register_token))
         .route("/_internal/revoke", post(revoke_token));
+    let v1_routes = Router::new()
+        .route("/_apis/artifactcache/cache", get(v1::find))
+        .route("/_apis/artifactcache/caches", post(v1::reserve))
+        .route("/_apis/artifactcache/caches/clean", post(v1::clean))
+        .route(
+            "/_apis/artifactcache/caches/{cacheId}",
+            patch(v1::patch_chunk).post(v1::commit),
+        )
+        .route(
+            "/_apis/artifactcache/artifacts/{cacheId}",
+            get(v1::download),
+        );
     Router::new()
         .route("/health", get(health::health))
         .merge(peer_routes)
         .merge(admin_routes)
+        .merge(v1_routes)
         .with_state(state.clone())
         .fallback(fallback_404)
+        .method_not_allowed_fallback(fallback_405)
         .layer(middleware::from_fn_with_state(state, auth::require_auth))
 }
 
@@ -154,4 +169,10 @@ async fn fallback_404(uri: Uri) -> Response {
     } else {
         err.into_response()
     }
+}
+
+/// 405 fallback: `{"error":"method not allowed"}` when a registered path is
+/// hit with an unsupported method (axum's default 405 has an empty body).
+async fn fallback_405() -> Response {
+    ApiError::MethodNotAllowed.into_response()
 }
