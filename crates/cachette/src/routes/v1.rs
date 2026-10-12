@@ -8,9 +8,11 @@
 //!   prefix lookup ([`crate::storage::lookup`]) over finalized entries, with a
 //!   signed `archiveLocation` on a hit ([`crate::auth::urls::mint`], task 16)
 //!   and an **empty** 204 on a miss.
-//! - `POST /_apis/artifactcache/caches` — reserve: stages an empty reservation
-//!   under a fresh 32-hex `cacheId` and reports `{cacheId, cacheSize}`. Real
-//!   capacity accounting lands in task 19.
+//! - `POST /_apis/artifactcache/caches` — reserve: rejects a duplicate finalized
+//!   `(key, version)` with 409, stages an expiry-stamped reservation under a
+//!   fresh 32-hex `cacheId`, and reports `cacheSize = max(0, max_size -
+//!   used_bytes)`. Version siblings live behind the artifact-key primary index
+//!   (tasks 30/31).
 //! - `PATCH /_apis/artifactcache/caches/{cacheId}` — accepts a chunk and
 //!   returns 204. The parts/resume machinery lands in task 20.
 //! - `POST /_apis/artifactcache/caches/{cacheId}` `{size}` — accepts the commit
@@ -31,7 +33,6 @@
 //!   `server.external_url` (main.rs is task-34-owned), so a later task must
 //!   prefix the absolute host when the value becomes available.
 
-use std::io::Cursor;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,19 +44,15 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::auth::{self, urls};
-use crate::config::KeyCase;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::{ByteStream, Entry, StorageBackend, Version, lookup, normalize_key};
+use crate::storage::eviction::Capacity;
+use crate::storage::{Entry, StorageBackend, Version, lookup, normalize_key};
 
 /// Signed-URL TTL for `archiveLocation` (seconds). Mirrors
 /// `config.v1.signed_url_ttl_seconds` (`V1Config::default()`); wiring the live
 /// config into `AppState` is a later task (main.rs is task-34-owned).
 const SIGNED_URL_TTL_SECONDS: u64 = 900;
-
-/// Cache-key fold applied before reserve/find matching (M11). Mirrors
-/// `config.cache.key_case` (`CacheConfig::default()` = lower).
-const KEY_CASE: KeyCase = KeyCase::Lower;
 
 /// HMAC secret fallback when `auth.secret` is unset (tests / `--print-config`
 /// boots without a secret). Production always serves with a real secret.
@@ -135,7 +132,7 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         })
         .collect();
     let marker = Version::from(version);
-    match lookup(&candidates, &keys, &marker, KEY_CASE) {
+    match lookup(&candidates, &keys, &marker, state.cache.key_case) {
         Some(entry) => {
             let cache_key = entry.key.clone();
             let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
@@ -161,8 +158,9 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
 
 /// `POST /_apis/artifactcache/caches` — reserve a new entry.
 ///
-/// 200 `{"cacheId":"<32-hex>","cacheSize":0}` for a fresh reservation; 409 with
-/// the GitHub duplicate body when a finalized entry already holds the key.
+/// 200 `{"cacheId":"<32-hex>","cacheSize":<n>}` where
+/// `cacheSize = max(0, cache.max_size - used_bytes)`; 409 with the GitHub
+/// duplicate body when a finalized entry already holds `(key, version)`.
 pub async fn reserve(
     State(state): State<AppState>,
     Json(request): Json<ReserveRequest>,
@@ -171,7 +169,9 @@ pub async fn reserve(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let key = normalize_key(&request.key, KEY_CASE);
+    let key = normalize_key(&request.key, state.cache.key_case);
+    // A complete entry holding the exact key is a duplicate (409); an
+    // incomplete reservation (or nothing) falls through to a fresh 200.
     match storage.stat(&key).await {
         Ok(Some(_)) => return duplicate_response(&request.key),
         Ok(None) => {}
@@ -180,14 +180,43 @@ pub async fn reserve(
             return ApiError::Internal.into_response();
         }
     }
-    let cache_id = generate_cache_id(&request.key, &request.version);
-    // Stage an (empty) reservation under the fresh id: it stays invisible to
-    // find/download until task 21 finalizes a commit (plan m4).
-    let reservation: ByteStream<'static> = Box::pin(Cursor::new(Vec::new()));
-    if storage.put_stream(&cache_id, reservation).await.is_err() {
+    let used = match storage.used_bytes().await {
+        Ok(used) => used,
+        Err(err) => {
+            tracing::error!(error = %err, "v1 reserve: usage accounting failed");
+            return ApiError::Internal.into_response();
+        }
+    };
+    // B3 admission estimate: at reserve time the artifact size is unknown
+    // (`PATCH` carries no `Content-Length` contract), so admission is judged
+    // against the `min_free` floor; the eviction service is not on the request
+    // path, so a below-floor reserve is logged, not rejected, and `cacheSize`
+    // simply clamps to 0 (criterion 1 QA).
+    if state.cache.max_size > 0 {
+        let capacity = Capacity::resolve(state.cache.min_free, state.cache.max_size, 0, used);
+        if !capacity.admits(None) {
+            tracing::debug!(
+                free = capacity.free(),
+                min_free = capacity.min_free,
+                "v1 reserve: below free-space floor (admission estimate)"
+            );
+        }
+    }
+    let cache_size = state.cache.max_size.saturating_sub(used);
+    let cache_id = generate_cache_id(&key, &request.version);
+    let expires_at = u64::try_from(auth::now_secs())
+        .unwrap_or(0)
+        .saturating_add(state.cache.reservation_ttl_seconds);
+    if let Err(err) = storage.reserve(&cache_id, expires_at).await {
+        tracing::error!(error = %err, "v1 reserve: staging reservation failed");
         return ApiError::Internal.into_response();
     }
-    Json(json!({"cacheId": cache_id, "cacheSize": 0})).into_response()
+    // Cluster seam (plan tasks 30/31): cluster mode advertises the chosen
+    // owner's `cacheId` for relay; single-node serving is complete without it.
+    if state.auth.cluster_enabled {
+        tracing::debug!(cache_id = %cache_id, "v1 reserve: cluster mode (placement/relay wired in task 30/31)");
+    }
+    Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
 
 /// `PATCH /_apis/artifactcache/caches/{cacheId}` — accept an upload chunk.

@@ -8,7 +8,7 @@ use cachette::config::{self, Config};
 use cachette::identity::Identity;
 use cachette::logging::{self};
 use cachette::routes;
-use cachette::state::AppState;
+use cachette::state::{AppState, CacheLimits};
 use cachette::storage::StorageBackend;
 use cachette::storage::eviction::Reaper;
 use cachette::storage::fs::FsStorage;
@@ -107,6 +107,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.auth = Arc::new(AuthPolicy::from_config(&config));
+    // Cache limits (plan task 19): the reserve handler reports capacity and
+    // stamps reservation expiry from these numbers, so thread `[cache]` /
+    // `[storage.fs]` onto the request path.
+    state.cache = CacheLimits {
+        max_size: config.cache.max_size,
+        min_free: config.storage.fs.min_free,
+        reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
+        key_case: config.cache.key_case,
+    };
 
     // Storage + reaper (plan task 34). One `FsStorage` is constructed here and
     // shared by the routes, the periodic sweep, and the shutdown flush. Its

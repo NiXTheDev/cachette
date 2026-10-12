@@ -66,6 +66,24 @@ async fn fixture_state() -> AppState {
     state
 }
 
+/// Same as [`fixture_state`] but with a configured `cache.max_size` and the
+/// storage handle returned so a test can seed entries mid-case.
+async fn sized_state(max_size: u64) -> (AppState, Arc<MemoryStorage>) {
+    let storage = Arc::new(MemoryStorage::new());
+    seed(&storage, FIXTURE_KEY, FIXTURE_BODY).await;
+    let mut state = AppState::new();
+    state.cache.max_size = max_size;
+    state.storage = Some(storage.clone());
+    state.auth = Arc::new(AuthPolicy {
+        mode: AuthMode::Bearer,
+        secret: Some(SECRET.to_owned()),
+        hmac_max_age_seconds: 600,
+        static_tokens: vec![TOKEN.to_owned()],
+        cluster_enabled: false,
+    });
+    (state, storage)
+}
+
 async fn call(
     app: &Router,
     method: &str,
@@ -320,4 +338,140 @@ async fn artifactcache_route_requires_auth() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reserve_reports_max_size_minus_used_bytes() {
+    let (state, _storage) = sized_state(1000).await;
+    let app = routes::router(state);
+    let reply = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": "fresh-key", "version": "2"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let body = json_body_of(&reply);
+    assert_eq!(body["cacheSize"], 1000 - FIXTURE_BODY.len() as u64);
+    assert!(
+        body.get("archiveLocation").is_none(),
+        "reserve must not leak archiveLocation: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reserve_clamps_cache_size_to_zero_when_over_quota() {
+    let (state, _storage) = sized_state(10).await;
+    let app = routes::router(state);
+    let reply = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": "over-quota", "version": "2"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_ne!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json_body_of(&reply)["cacheSize"], 0);
+}
+
+#[tokio::test]
+async fn reserve_of_incomplete_key_returns_200_not_409() {
+    let app = routes::router(fixture_state().await);
+    let request = || json_body(serde_json::json!({"key": "staged-key", "version": "2"}));
+    let first = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        request(),
+    )
+    .await;
+    let second = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        request(),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(second.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reserved_entry_is_invisible_to_find_until_commit() {
+    let app = routes::router(fixture_state().await);
+    let reserve = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": "pending-key", "version": "2"})),
+    )
+    .await;
+    assert_eq!(reserve.status, StatusCode::OK);
+    let find = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/cache?keys=pending-key&version=2",
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(find.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn reserve_repeat_after_completion_returns_409() {
+    let (state, storage) = sized_state(0).await;
+    let app = routes::router(state);
+    let request = || json_body(serde_json::json!({"key": "repeat-key", "version": "2"}));
+    let first = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        request(),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    seed(&storage, "repeat-key", b"payload").await;
+    let second = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        request(),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn reserve_duplicate_detection_folds_key_case() {
+    let app = routes::router(fixture_state().await);
+    let requested = "NGINX-SRC-1.30.5";
+    let reply = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": requested, "version": "2"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(json_body_of(&reply)["key"], requested);
 }

@@ -109,22 +109,6 @@ impl FsStorage {
         Ok(storage)
     }
 
-    /// Accounting total: sum of complete-entry sizes (plan B3 capacity
-    /// input, also used by index self-verification in tests).
-    pub async fn used_bytes(&self) -> io::Result<u64> {
-        let conn = Arc::clone(&self.conn);
-        blocking(move || {
-            let conn = lock(&conn)?;
-            let used: i64 = conn
-                .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                .optional()
-                .map_err(sql)?
-                .unwrap_or(0);
-            Ok(used.max(0) as u64)
-        })
-        .await
-    }
-
     /// Reservation TTL reaper (plan task 11 / M4): delete staged
     /// reservation rows whose `reservation_expires_at` has passed and the
     /// staged parts backing them. Rows without an expiry are left alone.
@@ -542,6 +526,55 @@ impl StorageBackend for FsStorage {
                 tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>> {
+        Box::pin(async move {
+            let conn = Arc::clone(&self.conn);
+            blocking(move || {
+                let conn = lock(&conn)?;
+                let used: i64 = conn
+                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                    .optional()
+                    .map_err(sql)?
+                    .unwrap_or(0);
+                Ok(used.max(0) as u64)
+            })
+            .await
+        })
+    }
+
+    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let id = entry_id(key);
+            let tmp = self.tmp_path(&id);
+            let part = self.part_path(&id);
+            let conn = Arc::clone(&self.conn);
+            let key = key.to_owned();
+            let _gate = self.gate.write().await;
+            blocking(move || {
+                write_atomic(&tmp, &part, &[])?;
+                let created_at = unix_now();
+                let expires_at = i64::try_from(expires_at)
+                    .map_err(|_| io::Error::other("expiry exceeds SQLite integer range"))?;
+                let conn = lock(&conn)?;
+                conn.execute(
+                    "INSERT INTO entries \
+                         (id, key, version, size, created_at, accessed_at, complete, \
+                          reservation_expires_at) \
+                     VALUES (?1, ?2, '', 0, ?3, ?3, 0, ?4) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         key = excluded.key, size = 0, \
+                         created_at = excluded.created_at, \
+                         accessed_at = excluded.accessed_at, complete = 0, \
+                         reservation_expires_at = excluded.reservation_expires_at",
+                    params![id, key, created_at, expires_at],
+                )
+                .map_err(sql)?;
                 Ok(())
             })
             .await
@@ -1417,6 +1450,35 @@ mod storage_fs {
         let body = read_all(storage.get_range("res", 0..8).await.expect("get")).await;
         assert_eq!(body, b"reserved");
         assert_eq!(storage.used_bytes().await.expect("used"), 8);
+    }
+
+    #[tokio::test]
+    async fn reserve_stages_a_reaper_visible_row_that_finalize_can_publish() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage.reserve("live", now + 3600).await.expect("reserve");
+        storage
+            .reserve("expired", now.saturating_sub(1))
+            .await
+            .expect("reserve");
+
+        assert_eq!(storage.stat("live").await.expect("stat"), None);
+        assert!(storage.list().await.expect("list").is_empty());
+        assert_eq!(
+            storage.used_bytes().await.expect("used"),
+            0,
+            "reservations never count toward accounting"
+        );
+
+        let reaped = storage.reap_expired_reservations(now).await.expect("reap");
+        assert_eq!(reaped, 1, "only the past-expiry reservation is reclaimed");
+
+        storage
+            .finalize("live")
+            .await
+            .expect("finalize live reservation");
+        assert!(storage.stat("live").await.expect("stat").is_some());
     }
 
     #[tokio::test]

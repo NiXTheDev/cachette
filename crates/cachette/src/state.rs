@@ -4,8 +4,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::{AuthPolicy, TokenStore};
+use crate::config::{KeyCase, MinFree};
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
+
+/// Cache capacity + reservation knobs threaded onto the request path (plan
+/// task 19). `AppState` carries no full [`crate::config::Config`] (the v1
+/// module keeps its own constants for the write-once knobs), but the reserve
+/// handler needs the live `[cache]` / `[storage.fs]` numbers to report
+/// `cacheSize`, stamp `reservation_expires_at`, and fold keys.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheLimits {
+    /// `[cache] max_size` in bytes; 0 = unlimited.
+    pub max_size: u64,
+    /// `[storage.fs] min_free` floor (B3 reserve-time admission estimate).
+    pub min_free: MinFree,
+    /// `[cache] reservation_ttl_seconds`: reservation expiry = now + this.
+    pub reservation_ttl_seconds: u64,
+    /// `[cache] key_case`: fold applied before reserve/find matching (M11).
+    pub key_case: KeyCase,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            max_size: 0,
+            min_free: MinFree::Fraction(0.2),
+            reservation_ttl_seconds: 3600,
+            key_case: KeyCase::Lower,
+        }
+    }
+}
 
 /// State threaded through every route handler.
 #[derive(Clone)]
@@ -28,6 +57,10 @@ pub struct AppState {
     /// Auth policy snapshot (plan task 15): per-request mode resolution for
     /// the v1 artifactcache routes plus the admin register/revoke gate.
     pub auth: Arc<AuthPolicy>,
+    /// Cache capacity + reservation knobs (plan task 19). Defaults mirror
+    /// `CacheConfig` / `FsConfig`; `serve()` overwrites them from the loaded
+    /// config.
+    pub cache: CacheLimits,
 }
 
 impl AppState {
@@ -42,6 +75,7 @@ impl AppState {
             peers: Arc::new(PeerPins::default()),
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(AuthPolicy::default()),
+            cache: CacheLimits::default(),
         }
     }
 }

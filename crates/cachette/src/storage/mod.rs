@@ -221,6 +221,18 @@ pub trait StorageBackend: Send + Sync {
     /// when the key is already visible and nothing new is staged;
     /// `Err(NotFound)` when there is neither staged nor visible data.
     fn finalize<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>>;
+
+    /// Accounted bytes of finalized entries only (plan B3 capacity input:
+    /// `[cache] max_size - used_bytes`; reservations and staged data never
+    /// count).
+    fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>>;
+
+    /// Stage an EMPTY reservation for `key` that stays invisible to
+    /// [`Self::stat`]/[`Self::list`]/[`Self::get_range`] until
+    /// [`Self::finalize`], stamped with `expires_at` (Unix seconds) so the
+    /// reaper reclaims an abandoned reservation (plan task 19 / M4).
+    /// Supersedes any staged data for `key`.
+    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>>;
 }
 
 /// In-memory [`StorageBackend`] double for unit and handler tests:
@@ -361,6 +373,32 @@ impl StorageBackend for MemoryStorage {
                 None if state.visible.contains_key(key) => Ok(()),
                 None => Err(not_found(key)),
             }
+        })
+    }
+
+    fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>> {
+        Box::pin(async move {
+            let state = self.inner.read().await;
+            let total = state
+                .visible
+                .values()
+                .map(|entry| entry.data.len() as u64)
+                .sum();
+            Ok(total)
+        })
+    }
+
+    fn reserve<'a>(&'a self, key: &'a str, _expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut state = self.inner.write().await;
+            state.staged.insert(
+                key.to_owned(),
+                Staged {
+                    data: Vec::new(),
+                    created_at: unix_now(),
+                },
+            );
+            Ok(())
         })
     }
 }
