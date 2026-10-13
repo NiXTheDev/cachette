@@ -302,12 +302,21 @@ pub trait StorageBackend: Send + Sync {
     /// count).
     fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>>;
 
-    /// Stage an EMPTY reservation for `key` that stays invisible to
-    /// [`Self::stat`]/[`Self::list`]/[`Self::get_range`] until
-    /// [`Self::finalize`], stamped with `expires_at` (Unix seconds) so the
-    /// reaper reclaims an abandoned reservation (plan task 19 / M4).
-    /// Supersedes any staged data for `key`.
-    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>>;
+    /// Stage an EMPTY reservation named `cache_id` that stays invisible to
+    /// [`Self::stat`]/[`Self::list`]/[`Self::get_range`] until it is published
+    /// by [`Self::commit_chunks`] (plan task 21), stamped with `expires_at`
+    /// (Unix seconds) so the reaper reclaims an abandoned reservation (plan
+    /// task 19 / M4). `key` is the artifact key the reservation will publish
+    /// under and `version` the protocol version marker stored with it; both are
+    /// carried to commit so it can address the entry and supersede a same-key
+    /// sibling. Supersedes any staged data for `cache_id`.
+    fn reserve<'a>(
+        &'a self,
+        cache_id: &'a str,
+        key: &'a str,
+        version: &'a str,
+        expires_at: u64,
+    ) -> BoxFuture<'a, io::Result<()>>;
 
     /// Stage one chunk of a chunked upload under the reservation `key`
     /// (plan task 20), addressing part files as `parts/{key}/{start}.part`.
@@ -324,6 +333,23 @@ pub trait StorageBackend: Send + Sync {
         key: &'a str,
         chunk: Chunk<'a>,
     ) -> BoxFuture<'a, io::Result<ChunkOutcome>>;
+
+    /// Assemble every chunk staged under reservation `cache_id` into the final
+    /// blob and publish it under the reservation's artifact key (plan task 21).
+    ///
+    /// Verifies the staged chunks tile `[0, declared_size)` exactly — starting
+    /// at 0, contiguous, total == `declared_size` — before writing any blob.
+    /// Error kinds the route layer maps to HTTP: `NotFound` when `cache_id` is
+    /// not an open reservation (unknown, committed, or expired) → 404;
+    /// `InvalidInput` when the chunks do not match `declared_size` → 400, with
+    /// the reservation marked for reaping. Publishing supersedes any existing
+    /// visible entry sharing the artifact key (last-writer-wins; the
+    /// [`StorageBackend`] contract keeps at most one visible entry per key).
+    fn commit_chunks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        declared_size: u64,
+    ) -> BoxFuture<'a, io::Result<()>>;
 }
 
 /// In-memory [`StorageBackend`] double for unit and handler tests:
@@ -339,10 +365,23 @@ struct MemoryState {
     staged: HashMap<String, Staged>,
     /// Visible (finalized) blobs.
     visible: HashMap<String, Visible>,
-    /// Open reservations: `key` → expiry (Unix seconds).
-    reservations: HashMap<String, u64>,
-    /// Chunk ranges already staged per reservation `key`.
-    chunks: HashMap<String, Vec<ChunkRange>>,
+    /// Open reservations: `cache_id` → reservation metadata.
+    reservations: HashMap<String, Reservation>,
+    /// Chunks already staged per reservation `cache_id`.
+    chunks: HashMap<String, Vec<StagedChunk>>,
+}
+
+#[derive(Debug)]
+struct Reservation {
+    key: String,
+    expires_at: u64,
+}
+
+/// One staged PATCH chunk: its inclusive byte range plus the bytes.
+#[derive(Debug)]
+struct StagedChunk {
+    range: ChunkRange,
+    data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -487,16 +526,20 @@ impl StorageBackend for MemoryStorage {
         })
     }
 
-    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
+    fn reserve<'a>(
+        &'a self,
+        cache_id: &'a str,
+        key: &'a str,
+        _version: &'a str,
+        expires_at: u64,
+    ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            state.reservations.insert(key.to_owned(), expires_at);
-            state.chunks.remove(key);
-            state.staged.insert(
-                key.to_owned(),
-                Staged {
-                    data: Vec::new(),
-                    created_at: unix_now(),
+            state.reservations.insert(
+                cache_id.to_owned(),
+                Reservation {
+                    key: key.to_owned(),
+                    expires_at,
                 },
             );
             Ok(())
@@ -505,33 +548,87 @@ impl StorageBackend for MemoryStorage {
 
     fn write_chunk<'a>(
         &'a self,
-        key: &'a str,
-        chunk: Chunk<'a>,
+        cache_id: &'a str,
+        mut chunk: Chunk<'a>,
     ) -> BoxFuture<'a, io::Result<ChunkOutcome>> {
         Box::pin(async move {
+            let mut data = Vec::new();
+            chunk.body.read_to_end(&mut data).await?;
             let mut state = self.inner.write().await;
-            if state.visible.contains_key(key) {
-                return Err(complete(key));
-            }
-            match state.reservations.get(key).copied() {
-                None => return Err(not_found(key)),
-                Some(expires_at) if expires_at <= unix_now() => {
-                    state.reservations.remove(key);
-                    return Err(not_found(key));
+            match state.reservations.get(cache_id) {
+                None => return Err(not_found(cache_id)),
+                Some(reservation) if reservation.expires_at <= unix_now() => {
+                    state.reservations.remove(cache_id);
+                    state.chunks.remove(cache_id);
+                    return Err(not_found(cache_id));
                 }
                 Some(_) => {}
             }
-            let ranges = state.chunks.entry(key.to_owned()).or_default();
-            for existing in ranges.iter() {
-                if *existing == chunk.range {
+            let staged = state.chunks.entry(cache_id.to_owned()).or_default();
+            for existing in staged.iter() {
+                if existing.range == chunk.range {
                     return Ok(ChunkOutcome::AlreadyPresent);
                 }
-                if existing.overlaps(&chunk.range) {
+                if existing.range.overlaps(&chunk.range) {
                     return Err(invalid_range("chunk overlaps an already-received range"));
                 }
             }
-            ranges.push(chunk.range);
+            staged.push(StagedChunk {
+                range: chunk.range,
+                data,
+            });
             Ok(ChunkOutcome::Written)
+        })
+    }
+
+    fn commit_chunks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        declared_size: u64,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut state = self.inner.write().await;
+            let Some(reservation) = state.reservations.get(cache_id) else {
+                return Err(not_found(cache_id));
+            };
+            if reservation.expires_at <= unix_now() {
+                state.reservations.remove(cache_id);
+                state.chunks.remove(cache_id);
+                return Err(not_found(cache_id));
+            }
+            let key = reservation.key.clone();
+            let mut staged = state.chunks.remove(cache_id).unwrap_or_default();
+            staged.sort_by_key(|chunk| chunk.range.start);
+            let mut expected = 0_u64;
+            let mut contiguous = true;
+            for chunk in &staged {
+                if chunk.range.start != expected {
+                    contiguous = false;
+                    break;
+                }
+                expected = expected.saturating_add(chunk.range.len());
+            }
+            if !contiguous || expected != declared_size {
+                state.reservations.remove(cache_id);
+                return Err(invalid_range(
+                    "committed size does not match the uploaded chunks",
+                ));
+            }
+            let mut data = Vec::with_capacity(usize::try_from(declared_size).unwrap_or(0));
+            for chunk in &staged {
+                data.extend_from_slice(&chunk.data);
+            }
+            let created_at = unix_now();
+            state.visible.insert(
+                key,
+                Visible {
+                    data,
+                    created_at,
+                    accessed_at: created_at,
+                },
+            );
+            state.reservations.remove(cache_id);
+            Ok(())
         })
     }
 }

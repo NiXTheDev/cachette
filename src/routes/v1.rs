@@ -15,16 +15,18 @@
 //!   (tasks 30/31).
 //! - `PATCH /_apis/artifactcache/caches/{cacheId}` — accepts a chunk and
 //!   returns 204. The parts/resume machinery lands in task 20.
-//! - `POST /_apis/artifactcache/caches/{cacheId}` `{size}` — accepts the commit
-//!   and returns 204. Size verification + assembly land in task 21.
-//! - `GET  /_apis/artifactcache/artifacts/{cacheId}` — fully wired: full 200 or
-//!   a 206 slice with `Content-Range`, via [`crate::storage::StorageBackend`].
+//! - `POST /_apis/artifactcache/caches/{cacheId}` `{size}` — commit: assemble
+//!   the staged chunks, verify their total equals `{size}`, publish the entry
+//!   under its artifact key (superseding a same-key sibling), and return 204
+//!   (task 21). A size mismatch is 400 and marks the reservation for reaping.
+//! - `GET  /_apis/artifactcache/artifacts/{cacheId}` — download: full 200 or a
+//!   206 slice with `Content-Range`, gated by a signed URL in bearer/merge or
+//!   clustered deployments, via [`crate::storage::StorageBackend`].
 //! - `POST /_apis/artifactcache/caches/clean` — 200 no-op.
 //!
-//! Deliberate skeleton limits (documented so tasks 19-21 can lift them):
-//! - The reservation keyed by `cacheId` stays staged (invisible) — there is no
-//!   HTTP path to a *visible* entry until task 21 finalizes a commit, so the
-//!   find/download fixtures in the tests are seeded directly into storage.
+//! Deliberate skeleton limits (documented so later tasks can lift them):
+//! - Supersede keeps one visible entry per artifact key (last-writer-wins);
+//!   same-key versions are replaced, not stored side-by-side.
 //! - [`crate::storage::StorageBackend::list`] yields `EntryStat`, which carries
 //!   no protocol `version`; the requested version is stamped onto the candidate
 //!   entries so `lookup`'s exact-then-prefix ordering is exercised end-to-end
@@ -33,6 +35,7 @@
 //!   `server.external_url` (main.rs is task-34-owned), so a later task must
 //!   prefix the absolute host when the value becomes available.
 
+use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,12 +43,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::auth::{self, urls};
+use crate::config::AuthMode;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
@@ -216,7 +220,10 @@ pub async fn reserve(
     let expires_at = u64::try_from(auth::now_secs())
         .unwrap_or(0)
         .saturating_add(state.cache.reservation_ttl_seconds);
-    if let Err(err) = storage.reserve(&cache_id, expires_at).await {
+    if let Err(err) = storage
+        .reserve(&cache_id, &key, &request.version, expires_at)
+        .await
+    {
         tracing::error!(error = %err, "v1 reserve: staging reservation failed");
         return ApiError::Internal.into_response();
     }
@@ -290,26 +297,56 @@ pub async fn patch_chunk(
 
 /// `POST /_apis/artifactcache/caches/{cacheId}` — commit an upload.
 ///
-/// Skeleton: accept `{size}` and reply with an empty 204. Size verification,
-/// part assembly and supersede are task 21.
-pub async fn commit(Path(_cache_id): Path<String>, Json(request): Json<CommitRequest>) -> Response {
-    tracing::debug!(size = request.size, "v1 commit skeleton: accepted");
-    StatusCode::NO_CONTENT.into_response()
+/// Assembles the reservation's staged chunks into the final blob, verifies
+/// their total equals `{size}` and publishes the entry (superseding a same-key
+/// sibling). 204 on success; 400 when the chunks do not match `{size}` (the
+/// reservation is marked failed for the reaper); 404 for an unknown/expired
+/// reservation; 400 for `cacheId=0`.
+pub async fn commit(
+    State(state): State<AppState>,
+    Path(cache_id): Path<String>,
+    Json(request): Json<CommitRequest>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    if cache_id == "0" {
+        return ApiError::BadRequest(String::from("cacheId 0 is not a valid reservation"))
+            .into_response();
+    }
+    match storage.commit_chunks(&cache_id, request.size).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => commit_error(err),
+    }
 }
 
 /// `GET /_apis/artifactcache/artifacts/{cacheId}` — download an entry.
 ///
 /// No `Range`: 200 with the full body. With `Range: bytes=a-b`: 206 with the
 /// slice and `Content-Range: bytes a-b/<size>`. Unknown id: 404 JSON.
+///
+/// Authorization (M2/M3): when signed URLs are enforced (bearer/merge modes, or
+/// any cluster), the request must carry a valid `?id&exp&mac` minted by find →
+/// 403 otherwise. In pure HMAC single-node mode the global HMAC gate already
+/// authorizes the request, so a bare signed-URL-less GET is allowed.
 pub async fn download(
     State(state): State<AppState>,
     Path(cache_id): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(storage) = state.storage.as_deref() else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
+    if requires_signed_url(&state) {
+        let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+        if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
+            return ApiError::from(err).into_response();
+        }
+    }
     let size = match storage.stat(&cache_id).await {
         Ok(Some(stat)) => stat.size,
         Ok(None) => return ApiError::not_found().into_response(),
@@ -454,6 +491,26 @@ fn chunk_error(err: io::Error) -> Response {
             ApiError::Internal.into_response()
         }
     }
+}
+
+/// Map a commit `io::Error` to its HTTP contract: 404 unknown/expired
+/// reservation, 409 already-complete entry, 400 size mismatch, 500 otherwise.
+fn commit_error(err: io::Error) -> Response {
+    match err.kind() {
+        io::ErrorKind::NotFound => ApiError::not_found().into_response(),
+        io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
+        io::ErrorKind::InvalidInput => ApiError::BadRequest(err.to_string()).into_response(),
+        _ => {
+            tracing::error!(error = %err, "v1 commit: assembly failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+/// Whether a download must present a signed URL: bearer/merge auth or any
+/// cluster deployment. Pure HMAC single-node serving relies on the HMAC gate.
+fn requires_signed_url(state: &AppState) -> bool {
+    state.auth.cluster_enabled || matches!(state.auth.mode, AuthMode::Bearer | AuthMode::Merge)
 }
 
 /// Generate a fresh 32-hex-char `cacheId`.

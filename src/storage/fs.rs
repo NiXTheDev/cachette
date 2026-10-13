@@ -61,7 +61,8 @@ const SCHEMA: &str = "
         accessed_at             INTEGER NOT NULL,
         complete                INTEGER NOT NULL DEFAULT 0,
         owner_node              TEXT NOT NULL DEFAULT '',
-        reservation_expires_at  INTEGER
+        reservation_expires_at  INTEGER,
+        artifact_key            TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS entries_key_idx ON entries(key);
     CREATE TABLE IF NOT EXISTS accounting (used_bytes INTEGER NOT NULL);
@@ -111,6 +112,7 @@ impl FsStorage {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(sql)?;
         conn.execute_batch(SCHEMA).map_err(sql)?;
+        migrate(&conn)?;
         let storage = Self {
             root,
             conn: Arc::new(Mutex::new(conn)),
@@ -528,16 +530,25 @@ impl StorageBackend for FsStorage {
                     )
                     .optional()
                     .map_err(sql)?;
+                let version: String = tx
+                    .query_row("SELECT version FROM entries WHERE id = ?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(sql)?
+                    .unwrap_or_default();
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node) \
-                         VALUES (?1, ?2, '', ?3, ?4, ?4, 1, '') \
+                          owner_node, artifact_key) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '') \
                          ON CONFLICT(id) DO UPDATE SET \
-                             key = excluded.key, size = excluded.size, \
+                             key = excluded.key, version = excluded.version, \
+                             size = excluded.size, \
                              created_at = excluded.created_at, \
-                             accessed_at = excluded.accessed_at, complete = 1",
-                    params![id, key, size, created_at],
+                             accessed_at = excluded.accessed_at, complete = 1, \
+                             artifact_key = ''",
+                    params![id, key, version, size, created_at],
                 )
                 .map_err(sql)?;
                 let used: i64 = tx
@@ -573,13 +584,21 @@ impl StorageBackend for FsStorage {
         })
     }
 
-    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
+    fn reserve<'a>(
+        &'a self,
+        cache_id: &'a str,
+        key: &'a str,
+        version: &'a str,
+        expires_at: u64,
+    ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let id = entry_id(key);
+            let id = entry_id(cache_id);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
             let conn = Arc::clone(&self.conn);
+            let cache_id = cache_id.to_owned();
             let key = key.to_owned();
+            let version = version.to_owned();
             let _gate = self.gate.write().await;
             blocking(move || {
                 write_atomic(&tmp, &part, &[])?;
@@ -590,14 +609,15 @@ impl StorageBackend for FsStorage {
                 conn.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          reservation_expires_at) \
-                     VALUES (?1, ?2, '', 0, ?3, ?3, 0, ?4) \
+                          reservation_expires_at, artifact_key) \
+                     VALUES (?1, ?2, ?3, 0, ?4, ?4, 0, ?5, ?6) \
                      ON CONFLICT(id) DO UPDATE SET \
-                         key = excluded.key, size = 0, \
+                         key = excluded.key, version = excluded.version, size = 0, \
                          created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 0, \
-                         reservation_expires_at = excluded.reservation_expires_at",
-                    params![id, key, created_at, expires_at],
+                         reservation_expires_at = excluded.reservation_expires_at, \
+                         artifact_key = excluded.artifact_key",
+                    params![id, cache_id, version, created_at, expires_at, key],
                 )
                 .map_err(sql)?;
                 Ok(())
@@ -670,6 +690,116 @@ impl StorageBackend for FsStorage {
             Ok(ChunkOutcome::Written)
         })
     }
+
+    fn commit_chunks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        declared_size: u64,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let chunk_lock = self.chunk_lock(cache_id);
+            let _chunk_guard = chunk_lock.lock().await;
+            let _gate = self.gate.write().await;
+            let root = self.root.clone();
+            let conn = Arc::clone(&self.conn);
+            let res_id = entry_id(cache_id);
+            let cache_id = cache_id.to_owned();
+            blocking(move || {
+                let now = unix_now();
+                let reservation: Option<(String, String, Option<i64>)> = {
+                    let conn = lock(&conn)?;
+                    conn.query_row(
+                        "SELECT artifact_key, version, reservation_expires_at \
+                         FROM entries WHERE id = ?1 AND complete = 0",
+                        [&res_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(sql)?
+                };
+                let Some((artifact_key, version, expires_at)) = reservation else {
+                    return Err(not_found(&cache_id));
+                };
+                if expires_at.is_some_and(|expiry| expiry <= now) {
+                    return Err(not_found(&cache_id));
+                }
+                let dir = root.join("parts").join(&cache_id);
+                let parts = list_part_files(&dir)?;
+                let mut expected = 0_u64;
+                let mut contiguous = true;
+                for (start, len, _path) in &parts {
+                    if *start != expected {
+                        contiguous = false;
+                        break;
+                    }
+                    expected = expected.saturating_add(*len);
+                }
+                if !contiguous || expected != declared_size {
+                    mark_reservation_failed(&conn, &res_id)?;
+                    return Err(invalid_range(
+                        "committed size does not match the uploaded chunks",
+                    ));
+                }
+                let blob_id = entry_id(&artifact_key);
+                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
+                let blob = root.join("blobs").join(format!("{blob_id}.blob"));
+                {
+                    let mut out = File::create(&tmp)?;
+                    for (_start, _len, path) in &parts {
+                        let mut input = File::open(path)?;
+                        std::io::copy(&mut input, &mut out)?;
+                    }
+                    out.sync_all()?;
+                }
+                // B5 ordering: blob file first, index commit second, so a crash
+                // in between leaves a rowless blob for the reaper.
+                std::fs::rename(&tmp, &blob)?;
+                let size = i64::try_from(declared_size)
+                    .map_err(|_| io::Error::other("blob exceeds SQLite integer range"))?;
+                let mut conn = lock(&conn)?;
+                let tx = conn.transaction().map_err(sql)?;
+                let previous: Option<i64> = tx
+                    .query_row(
+                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
+                        [&blob_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sql)?;
+                tx.execute(
+                    "INSERT INTO entries \
+                         (id, key, version, size, created_at, accessed_at, complete, \
+                          owner_node, artifact_key, reservation_expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         key = excluded.key, version = excluded.version, \
+                         size = excluded.size, created_at = excluded.created_at, \
+                         accessed_at = excluded.accessed_at, complete = 1, \
+                         artifact_key = '', reservation_expires_at = NULL",
+                    params![blob_id, artifact_key, version, size, now],
+                )
+                .map_err(sql)?;
+                tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
+                    .map_err(sql)?;
+                let used: i64 = tx
+                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                    .optional()
+                    .map_err(sql)?
+                    .unwrap_or(0);
+                let used = used
+                    .saturating_sub(previous.unwrap_or(0))
+                    .saturating_add(size);
+                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
+                    .map_err(sql)?;
+                tx.commit().map_err(sql)?;
+                drop(conn);
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                Ok(())
+            })
+            .await
+        })
+    }
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -681,6 +811,28 @@ fn entry_id(key: &str) -> String {
         let _ = write!(id, "{byte:02x}");
     }
     id
+}
+
+/// Bring a pre-task-21 index up to the current schema: `artifact_key` lets a
+/// reservation carry the artifact key it will publish under while `key` stays
+/// the reservation's own `cacheId` (so the reaper's `parts/{key}/` cleanup
+/// still applies).
+fn migrate(conn: &Connection) -> io::Result<()> {
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'artifact_key'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN artifact_key TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(sql)?;
+    }
+    Ok(())
 }
 
 /// Atomic write: scratch file, fsync, rename into place. Readers never see
@@ -731,6 +883,44 @@ fn list_chunk_ranges(dir: &Path) -> io::Result<Vec<ChunkRange>> {
         });
     }
     Ok(ranges)
+}
+
+/// List a reservation's staged chunk parts as `(start, len, path)` sorted by
+/// start offset. An absent directory means the reservation staged no chunks.
+fn list_part_files(dir: &Path) -> io::Result<Vec<(u64, u64, PathBuf)>> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut parts = Vec::new();
+    for dirent in read.flatten() {
+        let Some(name) = dirent.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".part") else {
+            continue;
+        };
+        let Ok(start) = stem.parse::<u64>() else {
+            continue;
+        };
+        let len = dirent.metadata()?.len();
+        parts.push((start, len, dirent.path()));
+    }
+    parts.sort_by_key(|(start, _, _)| *start);
+    Ok(parts)
+}
+
+/// Expire a reservation immediately so the reaper reclaims its staged bytes
+/// (used when a commit's declared size disagrees with the uploaded chunks).
+fn mark_reservation_failed(conn: &Arc<Mutex<Connection>>, id: &str) -> io::Result<()> {
+    let conn = lock(conn)?;
+    conn.execute(
+        "UPDATE entries SET reservation_expires_at = 0 WHERE id = ?1",
+        [id],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 /// Stream a chunk body to `tmp` and fsync it, returning the byte count. The
@@ -1596,9 +1786,12 @@ mod storage_fs {
         let dir = TestDir::new();
         let storage = FsStorage::open(dir.path()).expect("open");
         let now = u64::try_from(unix_now()).expect("positive clock");
-        storage.reserve("live", now + 3600).await.expect("reserve");
         storage
-            .reserve("expired", now.saturating_sub(1))
+            .reserve("live", "live", "", now + 3600)
+            .await
+            .expect("reserve");
+        storage
+            .reserve("expired", "expired", "", now.saturating_sub(1))
             .await
             .expect("reserve");
 

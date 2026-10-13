@@ -1,33 +1,40 @@
-//! Plan task 18 acceptance: the v1 artifactcache **status-code contract**
-//! (criterion 1), driven in-process through the real router (pattern from
-//! `tests/auth.rs`). A fixture entry is seeded straight into `MemoryStorage`
-//! because the skeleton reserves/stages (invisible) but does not finalize
-//! until plan task 21.
+//! Plan tasks 18/20/21 acceptance: the v1 artifactcache **status-code
+//! contract** (criterion 1), driven in-process through the real router
+//! (pattern from `tests/auth.rs`). Chunked uploads run against a real
+//! `FsStorage` so commit assembles the on-disk parts; find/download fixtures
+//! are seeded straight into `MemoryStorage`.
 //!
 //! Covered: find hit 200 (signed `archiveLocation`), find miss 204-empty,
 //! reserve 200, duplicate reserve 409 (GitHub exception body), PATCH 204,
-//! commit 204, download 200 full, download 206 slice + `Content-Range`,
-//! clean 200, unknown route 404 JSON, wrong method 405 JSON, auth 401, and
-//! download-of-unknown 404.
+//! commit 204, commit size-mismatch 400 (+ reservation reaped), commit
+//! supersede (one visible entry per key), download 200 full, download 206
+//! slice + `Content-Range`, download incomplete 404, signed-URL gating
+//! (bearer 403 without a URL, hmac single-node 200 bare, hmac cluster 403),
+//! clean 200, unknown route 404 JSON, wrong method 405 JSON, auth 401.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use cachette::auth::AuthPolicy;
+use cachette::auth::{AuthPolicy, urls};
 use cachette::config::AuthMode;
 use cachette::routes;
 use cachette::state::AppState;
 use cachette::storage::fs::FsStorage;
 use cachette::storage::{ByteStream, MemoryStorage, StorageBackend};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use tower::ServiceExt;
 
 const SECRET: &str = "test-secret-0123456789abcdef";
 const TOKEN: &str = "v1-test-token";
+const REPO: &str = "owner/cachette";
+const RUN: &str = "1";
 const FIXTURE_KEY: &str = "nginx-src-1.30.5";
 const FIXTURE_BODY: &[u8] = b"the quick brown fox jumps over the lazy dog";
 
@@ -44,6 +51,39 @@ fn json_body(value: serde_json::Value) -> Body {
 
 fn json_body_of(reply: &Reply) -> serde_json::Value {
     serde_json::from_slice(&reply.body).expect("response body is JSON")
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64
+}
+
+fn signed_url(key: &str) -> String {
+    let path = format!("/_apis/artifactcache/artifacts/{key}");
+    let signed = urls::mint(&path, key, SECRET, 900, now_secs());
+    format!("{path}{}", signed.query())
+}
+
+fn compute_mac(ts: i64) -> String {
+    let payload = format!("{REPO}>{RUN}>{ts}>");
+    let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).expect("hmac key");
+    mac.update(payload.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hmac_headers(ts: i64) -> [(String, String); 4] {
+    [
+        (String::from("forgejo-cache-repo"), String::from(REPO)),
+        (String::from("forgejo-cache-runnumber"), String::from(RUN)),
+        (String::from("forgejo-cache-timestamp"), ts.to_string()),
+        (String::from("forgejo-cache-mac"), compute_mac(ts)),
+    ]
 }
 
 /// Seed a finalized, visible entry directly into storage (the fixture the
@@ -85,6 +125,21 @@ async fn sized_state(max_size: u64) -> (AppState, Arc<MemoryStorage>) {
         cluster_enabled: false,
     });
     (state, storage)
+}
+
+async fn hmac_state(cluster_enabled: bool) -> AppState {
+    let storage = Arc::new(MemoryStorage::new());
+    seed(&storage, FIXTURE_KEY, FIXTURE_BODY).await;
+    let mut state = AppState::new();
+    state.storage = Some(storage);
+    state.auth = Arc::new(AuthPolicy {
+        mode: AuthMode::Hmac,
+        secret: Some(SECRET.to_owned()),
+        hmac_max_age_seconds: 600,
+        static_tokens: Vec::new(),
+        cluster_enabled,
+    });
+    state
 }
 
 async fn call(
@@ -223,16 +278,12 @@ async fn patch_chunk_returns_empty_204() {
 
 #[tokio::test]
 async fn commit_returns_empty_204() {
-    let app = routes::router(fixture_state().await);
-    let reply = call(
-        &app,
-        "POST",
-        "/_apis/artifactcache/caches/deadbeef",
-        Some(TOKEN),
-        &[("content-type", "application/json")],
-        json_body(serde_json::json!({"size": 512})),
-    )
-    .await;
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let staged = patch(&app, &cache_id, 0, 9, 10, 1).await;
+    assert_eq!(staged.status, StatusCode::NO_CONTENT);
+    let reply = commit(&app, &cache_id, 10).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     assert!(reply.body.is_empty(), "204 must carry an empty body");
 }
@@ -243,7 +294,7 @@ async fn download_without_range_returns_200_full_body() {
     let reply = call(
         &app,
         "GET",
-        "/_apis/artifactcache/artifacts/nginx-src-1.30.5",
+        &signed_url(FIXTURE_KEY),
         Some(TOKEN),
         &[],
         Body::empty(),
@@ -251,6 +302,13 @@ async fn download_without_range_returns_200_full_body() {
     .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body.as_slice(), FIXTURE_BODY);
+    assert_eq!(
+        reply
+            .headers
+            .get(header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes"),
+    );
 }
 
 #[tokio::test]
@@ -259,7 +317,7 @@ async fn download_with_range_returns_206_slice_and_content_range() {
     let reply = call(
         &app,
         "GET",
-        "/_apis/artifactcache/artifacts/nginx-src-1.30.5",
+        &signed_url(FIXTURE_KEY),
         Some(TOKEN),
         &[("range", "bytes=4-8")],
         Body::empty(),
@@ -281,7 +339,7 @@ async fn download_unknown_id_returns_404_json() {
     let reply = call(
         &app,
         "GET",
-        "/_apis/artifactcache/artifacts/missing",
+        &signed_url("missing"),
         Some(TOKEN),
         &[],
         Body::empty(),
@@ -526,22 +584,53 @@ async fn fs_state() -> (AppState, TempDir) {
     (state, dir)
 }
 
+async fn fs_state_with_fs() -> (AppState, Arc<FsStorage>, TempDir) {
+    let dir = TempDir::new();
+    let storage = Arc::new(FsStorage::open(dir.path()).expect("fs storage opens"));
+    let mut state = AppState::new();
+    state.storage = Some(storage.clone());
+    state.auth = Arc::new(AuthPolicy {
+        mode: AuthMode::Bearer,
+        secret: Some(SECRET.to_owned()),
+        hmac_max_age_seconds: 600,
+        static_tokens: vec![TOKEN.to_owned()],
+        cluster_enabled: false,
+    });
+    (state, storage, dir)
+}
+
 /// Reserve a fresh cache entry over HTTP and return its `cacheId`.
 async fn reserve_key(app: &Router) -> String {
+    reserve(app, "chunked-key", "2").await
+}
+
+async fn reserve(app: &Router, key: &str, version: &str) -> String {
     let reply = call(
         app,
         "POST",
         "/_apis/artifactcache/caches",
         Some(TOKEN),
         &[("content-type", "application/json")],
-        json_body(serde_json::json!({"key": "chunked-key", "version": "2"})),
+        json_body(serde_json::json!({"key": key, "version": version})),
     )
     .await;
-    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.status, StatusCode::OK, "reserve {key} v{version}");
     json_body_of(&reply)["cacheId"]
         .as_str()
         .expect("cacheId string")
         .to_owned()
+}
+
+async fn commit(app: &Router, cache_id: &str, size: u64) -> Reply {
+    call(
+        app,
+        "POST",
+        &format!("/_apis/artifactcache/caches/{cache_id}"),
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"size": size})),
+    )
+    .await
 }
 
 /// PATCH one chunk of `len` bytes at `start..=end` (inclusive), filled with
@@ -734,4 +823,276 @@ async fn patch_body_length_mismatch_returns_400() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn commit_then_find_and_download_round_trip() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    assert_eq!(
+        patch(&app, &cache_id, 0, 4, 5, 0xAA).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        patch(&app, &cache_id, 5, 9, 5, 0xBB).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        commit(&app, &cache_id, 10).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    let mut expected = vec![0xAA; 5];
+    expected.extend(vec![0xBB; 5]);
+
+    let find = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/cache?keys=chunked-key&version=2",
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(find.status, StatusCode::OK);
+    let location = json_body_of(&find)["archiveLocation"]
+        .as_str()
+        .expect("archiveLocation string")
+        .to_owned();
+
+    let download = call(&app, "GET", &location, Some(TOKEN), &[], Body::empty()).await;
+    assert_eq!(download.status, StatusCode::OK);
+    assert_eq!(download.body, expected);
+
+    let ranged = call(
+        &app,
+        "GET",
+        &location,
+        Some(TOKEN),
+        &[("range", "bytes=4-7")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(ranged.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        ranged
+            .headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 4-7/10"),
+    );
+    assert_eq!(ranged.body, vec![0xAA, 0xBB, 0xBB, 0xBB]);
+}
+
+#[tokio::test]
+async fn commit_wrong_size_returns_400_and_reaps_reservation() {
+    let (state, storage, _dir) = fs_state_with_fs().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    assert_eq!(
+        patch(&app, &cache_id, 0, 9, 10, 1).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    let reply = commit(&app, &cache_id, 20).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        json_body_of(&reply)["error"]
+            .as_str()
+            .expect("error string")
+            .contains("does not match"),
+    );
+
+    let reaped = storage
+        .reap_expired_reservations(now_secs() as u64)
+        .await
+        .expect("reap");
+    assert_eq!(reaped, 1, "failed reservation is reclaimed");
+
+    let download = call(
+        &app,
+        "GET",
+        &signed_url("chunked-key"),
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(download.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn commit_unknown_cache_id_returns_404() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let reply = commit(&app, "deadbeefdeadbeefdeadbeefdeadbeef", 10).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn download_incomplete_reservation_returns_404() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve(&app, "pending-dl", "2").await;
+    assert_eq!(
+        patch(&app, &cache_id, 0, 4, 5, 1).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    let download = call(
+        &app,
+        "GET",
+        &signed_url("pending-dl"),
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(download.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn commit_supersede_replaces_prior_same_key_version() {
+    let (state, storage, _dir) = fs_state_with_fs().await;
+    let app = routes::router(state);
+    let v2 = reserve(&app, "super-key", "2").await;
+    let v3 = reserve(&app, "super-key", "3").await;
+
+    assert_eq!(
+        patch(&app, &v2, 0, 2, 3, 0xC2).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(commit(&app, &v2, 3).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        storage
+            .stat("super-key")
+            .await
+            .expect("stat")
+            .expect("v2 visible")
+            .size,
+        3
+    );
+
+    assert_eq!(
+        patch(&app, &v3, 0, 3, 4, 0xC3).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(commit(&app, &v3, 4).await.status, StatusCode::NO_CONTENT);
+
+    let stat = storage
+        .stat("super-key")
+        .await
+        .expect("stat")
+        .expect("v3 visible");
+    assert_eq!(stat.size, 4, "older version superseded");
+    assert_eq!(
+        storage.list().await.expect("list").len(),
+        1,
+        "one visible entry per key"
+    );
+    assert_eq!(
+        storage.used_bytes().await.expect("used"),
+        4,
+        "superseded size subtracted from accounting"
+    );
+
+    let download = call(
+        &app,
+        "GET",
+        &signed_url("super-key"),
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(download.status, StatusCode::OK);
+    assert_eq!(download.body, vec![0xC3; 4]);
+}
+
+#[tokio::test]
+async fn download_requires_signed_url_in_bearer_mode() {
+    let app = routes::router(fixture_state().await);
+    let reply = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/artifacts/nginx-src-1.30.5",
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(json_body_of(&reply)["error"], "invalid or expired url");
+}
+
+#[tokio::test]
+async fn download_rejects_tampered_signed_url() {
+    let app = routes::router(fixture_state().await);
+    let path = format!("/_apis/artifactcache/artifacts/{FIXTURE_KEY}");
+    let signed = urls::mint(&path, FIXTURE_KEY, SECRET, 900, now_secs());
+    let mut mac = signed.mac.into_bytes();
+    mac[0] = if mac[0] == b'0' { b'1' } else { b'0' };
+    let damaged = format!(
+        "{path}?id={}&exp={}&mac={}",
+        signed.id,
+        signed.exp,
+        String::from_utf8(mac).expect("hex utf-8"),
+    );
+    let reply = call(&app, "GET", &damaged, Some(TOKEN), &[], Body::empty()).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn download_allows_bare_get_in_hmac_single_node() {
+    let app = routes::router(hmac_state(false).await);
+    let headers = hmac_headers(now_secs());
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let reply = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/artifacts/nginx-src-1.30.5",
+        None,
+        &extra,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_slice(), FIXTURE_BODY);
+}
+
+#[tokio::test]
+async fn download_requires_signed_url_in_hmac_cluster_mode() {
+    let app = routes::router(hmac_state(true).await);
+    let headers = hmac_headers(now_secs());
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+
+    let bare = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/artifacts/nginx-src-1.30.5",
+        None,
+        &extra,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(bare.status, StatusCode::FORBIDDEN);
+
+    let signed = call(
+        &app,
+        "GET",
+        &signed_url(FIXTURE_KEY),
+        None,
+        &extra,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::OK);
+    assert_eq!(signed.body.as_slice(), FIXTURE_BODY);
 }
