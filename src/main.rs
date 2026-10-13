@@ -101,6 +101,16 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.cluster.seed_fingerprints,
         config.cluster.enabled,
     ));
+    // Cluster discovery (plan task 28): seeds + mDNS populate the peer table
+    // when `[cluster] enabled`. The runtime handle is kept alive for the
+    // process lifetime so the mDNS daemon keeps responding and browsing.
+    let cluster_runtime = if config.cluster.enabled {
+        let runtime = cachette::cluster::start(&config.cluster, &identity, &config.server.listen);
+        state.peer_table = runtime.peer_table().clone();
+        Some(runtime)
+    } else {
+        None
+    };
     // Auth (plan task 15): sqlite-backed dynamic token store sharing the
     // storage database file, plus the per-request auth policy snapshot.
     state.tokens = Arc::new(TokenStore::open(
@@ -232,6 +242,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     drop(serve);
     drop(storage);
+    drop(cluster_runtime);
     tracing::info!("shutdown: complete");
     Ok(())
 }

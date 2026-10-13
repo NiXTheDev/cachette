@@ -35,6 +35,7 @@ use crate::tls::{PeerCert, PeerPins};
 pub fn router(state: AppState) -> Router {
     let peer_routes = Router::new()
         .route("/_internal/peers/hello", post(peer_hello))
+        .route("/_internal/peers", get(peer_list))
         .route_layer(middleware::from_fn_with_state(
             state.peers.clone(),
             require_pinned_peer,
@@ -70,9 +71,92 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state, auth::require_auth))
 }
 
-/// Minimal cluster hello (plan task 28 expands it): reports the responding node.
-async fn peer_hello(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"node_id": state.node_id, "accepted": true}))
+/// `POST /_internal/peers/hello` — cluster hello (plan task 28 / M5).
+///
+/// The caller (a pinned peer) reports its identity; the responder refreshes
+/// the peer's `last_hello`, folds the identity into any pre-existing seed or
+/// mDNS record, and answers with its own `{node_id, fingerprint}` so the
+/// caller can learn it in turn. The body is optional: a pinned peer that sends
+/// no body still identifies itself through its client-certificate fingerprint.
+async fn peer_hello(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<PeerCert>>()
+        .map(|info| info.0.clone());
+    let bytes = match axum::body::to_bytes(body, 4096).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ApiError::BadRequest(String::from("hello body too large")).into_response();
+        }
+    };
+    let hello: Option<HelloBody> = if bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(hello) => Some(hello),
+            Err(_) => {
+                return ApiError::BadRequest(String::from("invalid hello body")).into_response();
+            }
+        }
+    };
+    let fingerprint = hello
+        .as_ref()
+        .and_then(|hello| hello.fingerprint.clone())
+        .or_else(|| peer.as_ref().and_then(|peer| peer.fingerprint.clone()));
+    if let Some(fingerprint) = fingerprint {
+        let node_id = hello
+            .as_ref()
+            .and_then(|hello| hello.node_id.clone())
+            .unwrap_or_else(|| fingerprint.clone());
+        let addr = hello
+            .as_ref()
+            .and_then(|hello| hello.addr.clone())
+            .unwrap_or_default();
+        state
+            .peer_table
+            .hello(&node_id, &fingerprint, &addr, auth::now_secs() as u64);
+    }
+    // The responder's own identity (M5/M13: hello returns {node_id,
+    // fingerprint}); `state.node_id` is the Ed25519 fingerprint at serve time.
+    Json(serde_json::json!({
+        "accepted": true,
+        "node_id": state.node_id,
+        "fingerprint": state.node_id,
+    }))
+    .into_response()
+}
+
+/// `GET /_internal/peers` — debug peer list (plan task 28, criterion 7).
+///
+/// Every peer record with its identity, address, capacity stats, and health.
+async fn peer_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let peers: Vec<serde_json::Value> = state
+        .peer_table
+        .snapshot()
+        .iter()
+        .map(|peer| {
+            serde_json::json!({
+                "node_id": peer.node_id,
+                "fingerprint": peer.fingerprint,
+                "addr": peer.addr,
+                "used_bytes": peer.used_bytes,
+                "total_bytes": peer.total_bytes,
+                "healthy": peer.healthy,
+                "last_hello": peer.last_hello,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "peers": peers }))
+}
+
+/// Optional hello body: the caller's identity (and, when known, its dial
+/// address). The certificate fingerprint is the fallback identity.
+#[derive(serde::Deserialize)]
+struct HelloBody {
+    node_id: Option<String>,
+    fingerprint: Option<String>,
+    addr: Option<String>,
 }
 
 /// Query parameter for the admin token routes: `?token=<token>`.

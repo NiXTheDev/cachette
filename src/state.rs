@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::{AuthPolicy, TokenStore};
+use crate::cluster::PeerTable;
 use crate::config::{KeyCase, MinFree};
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -51,6 +52,11 @@ pub struct AppState {
     /// Cluster peer-certificate pins (plan task 14 / B2). Seeded from
     /// `[cluster] seed_fingerprints`; gates `/_internal/peers/*`.
     pub peers: Arc<PeerPins>,
+    /// Cluster peer table (plan task 28): the deduplicated set of discovered
+    /// peers (seeds + mDNS + hello). `serve()` seeds it when `[cluster]
+    /// enabled`; the default is an empty table so single-node tests keep
+    /// working.
+    pub peer_table: Arc<PeerTable>,
     /// Dynamic bearer-token store (plan task 15): sqlite-backed register/
     /// revoke, shared with the storage backend's database file.
     pub tokens: Arc<TokenStore>,
@@ -73,6 +79,7 @@ impl AppState {
             config_path: None,
             storage: None,
             peers: Arc::new(PeerPins::default()),
+            peer_table: Arc::new(PeerTable::new()),
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(AuthPolicy::default()),
             cache: CacheLimits::default(),
