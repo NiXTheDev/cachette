@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::Uri;
+use axum::http::{Uri, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -35,6 +35,7 @@ use crate::tls::{PeerCert, PeerPins};
 pub fn router(state: AppState) -> Router {
     let peer_routes = Router::new()
         .route("/_internal/peers/hello", post(peer_hello))
+        .route("/_internal/peers/heartbeat", post(peer_heartbeat))
         .route("/_internal/peers", get(peer_list))
         .route_layer(middleware::from_fn_with_state(
             state.peers.clone(),
@@ -71,6 +72,13 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state, auth::require_auth))
 }
 
+fn client_fingerprint(parts: &Parts) -> Option<String> {
+    parts
+        .extensions
+        .get::<ConnectInfo<PeerCert>>()
+        .and_then(|info| info.0.fingerprint.clone())
+}
+
 /// `POST /_internal/peers/hello` — cluster hello (plan task 28 / M5).
 ///
 /// The caller (a pinned peer) reports its identity; the responder refreshes
@@ -80,10 +88,7 @@ pub fn router(state: AppState) -> Router {
 /// no body still identifies itself through its client-certificate fingerprint.
 async fn peer_hello(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let peer = parts
-        .extensions
-        .get::<ConnectInfo<PeerCert>>()
-        .map(|info| info.0.clone());
+    let cert_fingerprint = client_fingerprint(&parts);
     let bytes = match axum::body::to_bytes(body, 4096).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -103,7 +108,7 @@ async fn peer_hello(State(state): State<AppState>, request: Request) -> Response
     let fingerprint = hello
         .as_ref()
         .and_then(|hello| hello.fingerprint.clone())
-        .or_else(|| peer.as_ref().and_then(|peer| peer.fingerprint.clone()));
+        .or(cert_fingerprint);
     if let Some(fingerprint) = fingerprint {
         let node_id = hello
             .as_ref()
@@ -125,6 +130,50 @@ async fn peer_hello(State(state): State<AppState>, request: Request) -> Response
         "fingerprint": state.node_id,
     }))
     .into_response()
+}
+
+/// Allowed clock skew for an inbound heartbeat timestamp (plan task 29: a
+/// heartbeat outside ±10s must not count into freshness).
+const HEARTBEAT_SKEW_SECS: u64 = 10;
+
+/// `POST /_internal/peers/heartbeat` — freshness + capacity refresh (plan
+/// task 29 / M15).
+///
+/// A pinned peer posts its live B3 stats every `heartbeat_interval_seconds`.
+/// The body's `ts` must sit within ±[`HEARTBEAT_SKEW_SECS`] of this node's
+/// clock: a stale (or future) timestamp is ignored — it must not refresh
+/// `last_hello` — and the response reports `accepted: false`. The identity
+/// falls back to the client-certificate fingerprint, exactly like hello.
+async fn peer_heartbeat(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let fingerprint = client_fingerprint(&parts).unwrap_or_default();
+    let bytes = match axum::body::to_bytes(body, 4096).await {
+        Ok(bytes) => bytes,
+        Err(_) => return ApiError::BadRequest(String::from("body too large")).into_response(),
+    };
+    let beat: HeartbeatBody = match serde_json::from_slice(&bytes) {
+        Ok(beat) => beat,
+        Err(_) => {
+            return ApiError::BadRequest(String::from("invalid heartbeat body")).into_response();
+        }
+    };
+    let now = auth::now_secs();
+    let node_id = beat.node_id.unwrap_or_else(|| fingerprint.clone());
+    // Wrapping arithmetic so a pathological `ts` (i64::MIN/MAX) cannot
+    // overflow-panic the skew check; only the magnitude matters.
+    if now.wrapping_sub(beat.ts).unsigned_abs() > HEARTBEAT_SKEW_SECS {
+        tracing::debug!(node_id = %node_id, ts = beat.ts, now, "stale heartbeat ts ignored");
+        return Json(serde_json::json!({ "accepted": false })).into_response();
+    }
+    let table = &state.peer_table;
+    table.heartbeat(
+        &node_id,
+        &fingerprint,
+        beat.used_bytes,
+        beat.total_bytes,
+        now as u64,
+    );
+    Json(serde_json::json!({ "accepted": true })).into_response()
 }
 
 /// `GET /_internal/peers` — debug peer list (plan task 28, criterion 7).
@@ -157,6 +206,16 @@ struct HelloBody {
     node_id: Option<String>,
     fingerprint: Option<String>,
     addr: Option<String>,
+}
+
+/// Heartbeat body: the sender's identity plus its live B3 stats and a Unix
+/// seconds timestamp checked against this node's clock (±10s).
+#[derive(serde::Deserialize)]
+struct HeartbeatBody {
+    node_id: Option<String>,
+    used_bytes: u64,
+    total_bytes: u64,
+    ts: i64,
 }
 
 /// Query parameter for the admin token routes: `?token=<token>`.

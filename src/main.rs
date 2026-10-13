@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::{Cli, Command};
+use cachette::cluster::heartbeat;
 use cachette::config::{self, Config};
 use cachette::identity::Identity;
 use cachette::logging::{self};
@@ -136,7 +137,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // interrupts a parts-write mid-rename — both wait for the same lock.
     let storage = Arc::new(FsStorage::open(&config.storage.fs.path)?);
     let backend: Arc<dyn StorageBackend> = storage.clone();
-    state.storage = Some(backend);
+    state.storage = Some(backend.clone());
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     // Startup sweep, before the listener binds: rowless blobs older than the
     // 1h grace and reservations whose TTL has passed (plan task 34).
@@ -148,6 +149,30 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         ),
         Err(err) => tracing::warn!(error = %err, "startup sweep failed"),
     }
+
+    // Heartbeat + health (plan task 29 / M15): self-record with live B3
+    // values, peer timeout sweep, and mTLS heartbeat sends to every peer.
+    let heartbeat_task = config.cluster.enabled.then(|| {
+        heartbeat::spawn(heartbeat::HeartbeatConfig {
+            node_id: state.node_id.clone(),
+            cert_pem: identity.cert_pem().to_owned(),
+            key_pem: identity.key_pem().to_owned(),
+            advertise_addr: config
+                .cluster
+                .advertise_addr
+                .as_deref()
+                .unwrap_or(&config.server.listen)
+                .to_owned(),
+            peer_table: state.peer_table.clone(),
+            pins: state.peers.clone(),
+            storage: backend.clone(),
+            storage_path: config.storage.fs.path.clone(),
+            min_free: config.storage.fs.min_free,
+            max_size: config.cache.max_size,
+            interval: Duration::from_secs(config.cluster.heartbeat_interval_seconds),
+            timeout: Duration::from_secs(config.cluster.peer_timeout_seconds),
+        })
+    });
 
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
@@ -232,6 +257,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // then drop the storage handle. SQLite runs in WAL mode with
     // `synchronous=NORMAL`, so the committed final sweep is durable.
     sweep_task.abort();
+    if let Some(task) = heartbeat_task {
+        task.abort();
+    }
     match reaper.sweep_once(&storage).await {
         Ok(report) => tracing::info!(
             reservations = report.reservations_reaped,

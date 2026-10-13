@@ -11,9 +11,11 @@
 //!
 //! Post-hello, peers dedup by identity: `node_id` when set, else `fingerprint`
 //! (M5/M13). A seed-discovered node and its mDNS record are ONE peer because
-//! they share `addr:port` (criterion 7). The table is deliberately
-//! connect-free: nothing here dials out at startup — transport is tasks 29-31.
+//! they share `addr:port` (criterion 7). The table itself is connect-free —
+//! the outbound dialing lives in [`heartbeat`] (task 29) and the relay
+//! transport (task 31).
 
+pub mod heartbeat;
 mod mdns;
 mod seeds;
 
@@ -140,6 +142,26 @@ impl PeerTable {
         };
         record.healthy = false;
         true
+    }
+
+    /// Timeout sweep (plan task 29 / M15): mark every fresh peer whose
+    /// `last_hello` is at least `timeout_seconds` old unhealthy. Records with
+    /// `last_hello == 0` are pre-hello seeds with no freshness yet and are
+    /// never touched; already-unhealthy peers are not recounted. Returns how
+    /// many peers were newly marked.
+    pub fn sweep_timeouts(&self, now: u64, timeout_seconds: u64) -> usize {
+        let mut marked = 0;
+        for record in self.snapshot() {
+            if record.last_hello == 0 || !record.healthy {
+                continue;
+            }
+            if now.saturating_sub(record.last_hello) >= timeout_seconds
+                && self.mark_unhealthy(&record.node_id, &record.fingerprint)
+            {
+                marked += 1;
+            }
+        }
+        marked
     }
 
     /// Snapshot of every peer, sorted by `node_id` then `addr`.

@@ -1,0 +1,329 @@
+//! Outbound heartbeat sender + peer health maintenance (plan task 29 / M15).
+//!
+//! Every `heartbeat_interval_seconds` this node POSTs
+//! `/_internal/peers/heartbeat {node_id, used_bytes, total_bytes, ts}` to each
+//! discovered peer's `addr` over mTLS: the client presents this node's
+//! identity certificate, and the server certificate is accepted only when its
+//! SPKI fingerprint passes [`PeerPins`] (seeded or TOFU) — the mirror image of
+//! the inbound pin gate in [`crate::routes`]. The same tick keeps the node's
+//! own peer-table record alive with live B3 capacity values (the own node is
+//! always included in placement) and sweeps peers that stop heartbeating
+//! after `[cluster] peer_timeout_seconds`.
+//!
+//! The HTTP exchange is a hand-rolled HTTP/1.1 POST over the TLS stream: no
+//! HTTP-client dependency is allowed, and the payload is one small JSON body.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
+    SignatureScheme,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::MissedTickBehavior;
+use tokio_rustls::TlsConnector;
+
+use crate::auth;
+use crate::cluster::PeerTable;
+use crate::config::{MinFree, split_host_port};
+use crate::identity::fingerprint_spki;
+use crate::storage::StorageBackend;
+use crate::storage::eviction::Capacity;
+use crate::tls::PeerPins;
+
+/// Path of the heartbeat route on the receiving peer.
+const HEARTBEAT_PATH: &str = "/_internal/peers/heartbeat";
+
+/// Per-dial budget: one unreachable peer must never stall the tick (and with
+/// it the timeout sweep) longer than this, well under the sample defaults of
+/// a 5s interval and a 15s peer timeout.
+const DIAL_BUDGET: Duration = Duration::from_secs(2);
+
+/// Everything the periodic heartbeat task needs (plan task 29 wiring from
+/// `main.rs::serve`). Grouped into one struct because the task spans the peer
+/// table, the pin store, the node identity, live storage, and `[cluster]`
+/// timing.
+pub struct HeartbeatConfig {
+    /// This node's identity (`state.node_id`): the Ed25519 fingerprint at
+    /// serve time; doubles as the self record's `node_id`/`fingerprint` and
+    /// as the `node_id` sent in outbound heartbeat bodies.
+    pub node_id: String,
+    /// This node's identity certificate PEM (mTLS client credential).
+    pub cert_pem: String,
+    /// This node's identity private-key PEM (mTLS client credential).
+    pub key_pem: String,
+    /// Dial target advertised for this node (`cluster.advertise_addr`, else
+    /// the listen address) — the self record's `addr`.
+    pub advertise_addr: String,
+    /// Shared peer table: self record, sweep, and send targets.
+    pub peer_table: Arc<PeerTable>,
+    /// Pin store: outbound server-certificate trust (seeded + TOFU).
+    pub pins: Arc<PeerPins>,
+    /// Storage accounting for the self record's live `used_bytes`.
+    pub storage: Arc<dyn StorageBackend>,
+    /// Storage root: the B3 disk-total fallback when `max_size` is unset.
+    pub storage_path: PathBuf,
+    /// `[storage.fs] min_free` — part of the B3 capacity model.
+    pub min_free: MinFree,
+    /// `[cache] max_size`; 0 = unlimited (the disk total caps `total`).
+    pub max_size: u64,
+    /// `[cluster] heartbeat_interval_seconds` (clamped to >= 1s).
+    pub interval: Duration,
+    /// `[cluster] peer_timeout_seconds`.
+    pub timeout: Duration,
+}
+
+/// Spawn the periodic heartbeat + health-sweep task (mirrors the task-34
+/// sweep task: `tokio::spawn` + `interval`; the first tick runs immediately,
+/// and self is registered synchronously before the task is even queued so the
+/// table always contains a healthy own node). Returns the handle so `serve()`
+/// can abort it during shutdown.
+pub fn spawn(config: HeartbeatConfig) -> tokio::task::JoinHandle<()> {
+    let id = config.node_id.as_str();
+    config
+        .peer_table
+        .hello(id, id, &config.advertise_addr, auth::now_secs() as u64);
+    tokio::spawn(run(config))
+}
+
+/// The tick loop: refresh self with live B3 values, sweep peer timeouts, then
+/// send a heartbeat to every other peer.
+async fn run(config: HeartbeatConfig) {
+    let client = match client_config(&config) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            // Practically unreachable: `serve()` already built the server
+            // TLS config from the same PEMs. Keep sweeping/self-refreshing.
+            tracing::warn!(error = %err, "heartbeat: outbound sender disabled (identity unusable)");
+            None
+        }
+    };
+    let mut ticker = tokio::time::interval(config.interval.max(Duration::from_secs(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let id = config.node_id.as_str();
+    loop {
+        ticker.tick().await;
+        let now = auth::now_secs();
+        let stats = live_capacity(&config).await;
+        if let Some((used, total)) = stats {
+            config.peer_table.heartbeat(id, id, used, total, now as u64);
+        }
+        let marked = config
+            .peer_table
+            .sweep_timeouts(now as u64, config.timeout.as_secs());
+        if marked > 0 {
+            tracing::info!(
+                marked,
+                timeout_s = config.timeout.as_secs(),
+                "peer heartbeat timed out; marked unhealthy"
+            );
+        }
+        if let (Some(client), Some((used, total))) = (&client, stats) {
+            send_all(client, &config, now, used, total).await;
+        }
+    }
+}
+
+/// This node's live B3 numbers: `used` from storage accounting, `total` from
+/// the B3 model (`[cache] max_size`, else the storage disk total). `None`
+/// (with a warning) when either query fails — the tick then skips the self
+/// refresh and the send rather than publishing zeros.
+async fn live_capacity(config: &HeartbeatConfig) -> Option<(u64, u64)> {
+    let used = match config.storage.used_bytes().await {
+        Ok(used) => used,
+        Err(err) => {
+            tracing::warn!(error = %err, "heartbeat: used_bytes unavailable");
+            return None;
+        }
+    };
+    match Capacity::from_disk(config.min_free, config.max_size, &config.storage_path, used) {
+        Ok(capacity) => Some((used, capacity.total)),
+        Err(err) => {
+            tracing::warn!(error = %err, "heartbeat: storage capacity unavailable");
+            None
+        }
+    }
+}
+
+/// POST one heartbeat to every peer with a dial address, skipping this node's
+/// own record.
+async fn send_all(
+    client: &Arc<RustlsClientConfig>,
+    config: &HeartbeatConfig,
+    now: i64,
+    used: u64,
+    total: u64,
+) {
+    let payload = serde_json::json!({
+        "node_id": config.node_id,
+        "used_bytes": used,
+        "total_bytes": total,
+        "ts": now,
+    });
+    let body = serde_json::to_string(&payload).expect("heartbeat JSON is a fixed shape");
+    for peer in config.peer_table.snapshot() {
+        if peer.addr.is_empty()
+            || peer.fingerprint == config.node_id
+            || peer.node_id == config.node_id
+        {
+            continue;
+        }
+        let attempt = tokio::time::timeout(DIAL_BUDGET, exchange(client, &peer.addr, &body)).await;
+        match attempt {
+            Ok(Ok(200)) => {
+                tracing::debug!(node = %peer.node_id, addr = %peer.addr, "heartbeat sent");
+            }
+            Ok(Ok(status)) => {
+                tracing::debug!(node = %peer.node_id, addr = %peer.addr, status, "heartbeat refused");
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(node = %peer.node_id, addr = %peer.addr, %err, "heartbeat failed");
+            }
+            Err(_) => {
+                tracing::debug!(node = %peer.node_id, addr = %peer.addr, "heartbeat dial timed out");
+            }
+        }
+    }
+}
+
+/// Hand-rolled HTTP/1.1 POST over a fresh TLS connection (`Connection: close`
+/// + read-to-end, like the TLS integration tests); returns the status code.
+async fn exchange(
+    client: &Arc<RustlsClientConfig>,
+    addr: &str,
+    body: &str,
+) -> std::io::Result<u16> {
+    let (host, port) = split_host_port(addr).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad peer addr: {addr}"),
+        )
+    })?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let server_name = ServerName::try_from(host.to_owned()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad peer host: {host}"),
+        )
+    })?;
+    let tcp = TcpStream::connect((host, port)).await?;
+    let mut stream = TlsConnector::from(client.clone())
+        .connect(server_name, tcp)
+        .await
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("TLS handshake failed: {err}"),
+            )
+        })?;
+    let request = format!(
+        "POST {HEARTBEAT_PATH} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8_lossy(&raw);
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no HTTP status in heartbeat response",
+            )
+        })
+}
+
+/// Pin-based server-certificate verifier for outbound peer connections.
+///
+/// Mirrors the inbound pin gate: accept only when the server certificate's
+/// SPKI-SHA256 fingerprint is seeded in [`PeerPins`] or admitted by TOFU
+/// (`[cluster] enabled`). Signature checks still go through the crypto
+/// provider, so a peer must hold the private key of the certificate it
+/// presents.
+#[derive(Debug)]
+struct PinnedServerCert {
+    pins: Arc<PeerPins>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedServerCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let parsed = rustls::server::ParsedCertificate::try_from(end_entity)
+            .map_err(|err| RustlsError::General(format!("peer certificate unusable: {err}")))?;
+        let fingerprint = fingerprint_spki(parsed.subject_public_key_info().as_ref());
+        if self.pins.authorize(&fingerprint) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        Err(RustlsError::General(format!(
+            "peer certificate not pinned: {fingerprint}"
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// Assemble the outbound mTLS client: this node's identity certificate as the
+/// client credential, [`PinnedServerCert`] as the trust decision.
+fn client_config(config: &HeartbeatConfig) -> Result<Arc<RustlsClientConfig>, RustlsError> {
+    let mut reader = std::io::BufReader::new(config.cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|err| RustlsError::General(format!("identity certificate: {err}")))?;
+    if certs.is_empty() {
+        return Err(RustlsError::General(String::from(
+            "identity certificate PEM was empty",
+        )));
+    }
+    let mut reader = std::io::BufReader::new(config.key_pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| RustlsError::General(format!("identity key: {err}")))?
+        .ok_or_else(|| RustlsError::General(String::from("identity key PEM was empty")))?;
+    let verifier = PinnedServerCert {
+        pins: config.pins.clone(),
+        algs: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+    };
+    let tls = RustlsClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_auth_cert(certs, key)?;
+    Ok(Arc::new(tls))
+}
