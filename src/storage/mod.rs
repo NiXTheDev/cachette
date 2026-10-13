@@ -180,6 +180,81 @@ fn newest<'a>(candidates: impl Iterator<Item = &'a Entry>) -> Option<&'a Entry> 
     })
 }
 
+/// Inclusive byte range covered by one uploaded PATCH chunk (plan task 20).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkRange {
+    /// First byte offset of the chunk (inclusive).
+    pub start: u64,
+    /// Last byte offset of the chunk (inclusive).
+    pub end: u64,
+}
+
+impl ChunkRange {
+    /// Number of bytes the range covers.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+
+    /// Whether the range covers no bytes (`end < start`). The Content-Range
+    /// parser never produces this, but callers get an honest predicate.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.end < self.start
+    }
+
+    /// Whether two inclusive ranges share at least one byte.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+/// Result of staging one PATCH chunk into a reservation (plan task 20).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkOutcome {
+    /// The chunk was newly written.
+    Written,
+    /// The exact range was already present; nothing was written (resume).
+    AlreadyPresent,
+}
+
+/// One inbound PATCH chunk: its inclusive byte range plus the body stream.
+pub struct Chunk<'a> {
+    /// Byte range this chunk covers.
+    pub range: ChunkRange,
+    /// Chunk body, streamed to disk by the storage backend.
+    pub body: ByteStream<'a>,
+}
+
+/// Cluster relay seam for chunked PATCH (plan tasks 20/31).
+///
+/// The PATCH path never writes a chunk to disk directly; it hands the chunk to
+/// a [`RelayTransport`]. The default implementation ([`LocalRelay`]) streams it
+/// into the reservation owner's local parts directory. Plan task 31 supplies a
+/// cluster implementation that forwards the chunk to the placement owner's
+/// peer endpoint instead.
+pub trait RelayTransport: Send + Sync {
+    /// Relay `chunk` for reservation `cache_id` to whichever node owns it. The
+    /// default single-node body writes it locally via
+    /// [`StorageBackend::write_chunk`].
+    fn stream_to_owner<'a>(
+        &'a self,
+        storage: &'a dyn StorageBackend,
+        cache_id: &'a str,
+        chunk: Chunk<'a>,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move { storage.write_chunk(cache_id, chunk).await.map(|_| ()) })
+    }
+}
+
+/// Single-node relay: writes each chunk into local storage. Cluster mode (plan
+/// task 31) replaces this with a peer-forwarding implementation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalRelay;
+
+impl RelayTransport for LocalRelay {}
+
 /// Node-local cache storage (plan task 8 / m4).
 ///
 /// Keys are opaque strings; every method is async and object-safe so
@@ -233,6 +308,22 @@ pub trait StorageBackend: Send + Sync {
     /// reaper reclaims an abandoned reservation (plan task 19 / M4).
     /// Supersedes any staged data for `key`.
     fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>>;
+
+    /// Stage one chunk of a chunked upload under the reservation `key`
+    /// (plan task 20), addressing part files as `parts/{key}/{start}.part`.
+    ///
+    /// Error kinds the route layer maps to HTTP: `NotFound` when `key` is not
+    /// an open reservation (unknown or expired) → 404; `AlreadyExists` when a
+    /// finalized entry already holds `key` → 409; `InvalidInput` when `range`
+    /// overlaps an already-staged chunk, or the body length disagrees with the
+    /// range → 400. An exact re-PATCH is accepted without a write
+    /// ([`ChunkOutcome::AlreadyPresent`]) so a resumed upload idempotently
+    /// replays ranges.
+    fn write_chunk<'a>(
+        &'a self,
+        key: &'a str,
+        chunk: Chunk<'a>,
+    ) -> BoxFuture<'a, io::Result<ChunkOutcome>>;
 }
 
 /// In-memory [`StorageBackend`] double for unit and handler tests:
@@ -248,6 +339,10 @@ struct MemoryState {
     staged: HashMap<String, Staged>,
     /// Visible (finalized) blobs.
     visible: HashMap<String, Visible>,
+    /// Open reservations: `key` → expiry (Unix seconds).
+    reservations: HashMap<String, u64>,
+    /// Chunk ranges already staged per reservation `key`.
+    chunks: HashMap<String, Vec<ChunkRange>>,
 }
 
 #[derive(Debug)]
@@ -320,6 +415,8 @@ impl StorageBackend for MemoryStorage {
             let mut state = self.inner.write().await;
             state.staged.remove(key);
             state.visible.remove(key);
+            state.reservations.remove(key);
+            state.chunks.remove(key);
             Ok(())
         })
     }
@@ -359,6 +456,8 @@ impl StorageBackend for MemoryStorage {
             let mut state = self.inner.write().await;
             match state.staged.remove(key) {
                 Some(staged) => {
+                    state.reservations.remove(key);
+                    state.chunks.remove(key);
                     state.visible.insert(
                         key.to_owned(),
                         Visible {
@@ -388,9 +487,11 @@ impl StorageBackend for MemoryStorage {
         })
     }
 
-    fn reserve<'a>(&'a self, key: &'a str, _expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
+    fn reserve<'a>(&'a self, key: &'a str, expires_at: u64) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
+            state.reservations.insert(key.to_owned(), expires_at);
+            state.chunks.remove(key);
             state.staged.insert(
                 key.to_owned(),
                 Staged {
@@ -399,6 +500,38 @@ impl StorageBackend for MemoryStorage {
                 },
             );
             Ok(())
+        })
+    }
+
+    fn write_chunk<'a>(
+        &'a self,
+        key: &'a str,
+        chunk: Chunk<'a>,
+    ) -> BoxFuture<'a, io::Result<ChunkOutcome>> {
+        Box::pin(async move {
+            let mut state = self.inner.write().await;
+            if state.visible.contains_key(key) {
+                return Err(complete(key));
+            }
+            match state.reservations.get(key).copied() {
+                None => return Err(not_found(key)),
+                Some(expires_at) if expires_at <= unix_now() => {
+                    state.reservations.remove(key);
+                    return Err(not_found(key));
+                }
+                Some(_) => {}
+            }
+            let ranges = state.chunks.entry(key.to_owned()).or_default();
+            for existing in ranges.iter() {
+                if *existing == chunk.range {
+                    return Ok(ChunkOutcome::AlreadyPresent);
+                }
+                if existing.overlaps(&chunk.range) {
+                    return Err(invalid_range("chunk overlaps an already-received range"));
+                }
+            }
+            ranges.push(chunk.range);
+            Ok(ChunkOutcome::Written)
         })
     }
 }
@@ -416,6 +549,13 @@ pub(crate) fn not_found(key: &str) -> io::Error {
 
 pub(crate) fn invalid_range(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_owned())
+}
+
+pub(crate) fn complete(key: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("cache entry already complete: {key}"),
+    )
 }
 
 #[cfg(test)]

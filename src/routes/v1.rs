@@ -33,12 +33,14 @@
 //!   `server.external_url` (main.rs is task-34-owned), so a later task must
 //!   prefix the absolute host when the value becomes available.
 
+use std::io;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -47,7 +49,10 @@ use crate::auth::{self, urls};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
-use crate::storage::{Entry, StorageBackend, Version, lookup, normalize_key};
+use crate::storage::{
+    ByteStream, Chunk, ChunkRange, Entry, LocalRelay, RelayTransport, StorageBackend, Version,
+    lookup, normalize_key,
+};
 
 /// Signed-URL TTL for `archiveLocation` (seconds). Mirrors
 /// `config.v1.signed_url_ttl_seconds` (`V1Config::default()`); wiring the live
@@ -63,6 +68,10 @@ const ARTIFACT_PATH_PREFIX: &str = "/_apis/artifactcache/artifacts/";
 
 /// Error name carried in the duplicate-reserve body (GitHub v1 spec).
 const DUPLICATE_ERROR: &str = "ArtifactCacheItemAlreadyExistsException";
+
+/// Largest single PATCH chunk accepted (guards the in-memory read; the
+/// go-actions-cache fixture uses 32 MiB chunks, the toolkit 4 MiB).
+const MAX_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `GET /_apis/artifactcache/cache` query parameters.
 #[derive(serde::Deserialize)]
@@ -221,10 +230,62 @@ pub async fn reserve(
 
 /// `PATCH /_apis/artifactcache/caches/{cacheId}` — accept an upload chunk.
 ///
-/// Skeleton: acknowledge with an empty 204. Chunk staging, resume and overlap
-/// detection are task 20.
-pub async fn patch_chunk(Path(_cache_id): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
+/// `Content-Range: bytes start-end/*` (end inclusive) addresses the chunk;
+/// the bytes are streamed to `parts/{cacheId}/{start}.part` without assembling
+/// the blob (task 21 owns commit/assembly). 204 on success (including an
+/// idempotent re-PATCH of an already-received range); 400 for a malformed
+/// header, an overlapping range, a length mismatch, or `cacheId=0`; 404 for an
+/// unknown/expired reservation; 409 when the entry is already complete.
+pub async fn patch_chunk(
+    State(state): State<AppState>,
+    Path(cache_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    if cache_id == "0" {
+        return ApiError::BadRequest(String::from("cacheId 0 is not a valid reservation"))
+            .into_response();
+    }
+    let Some(range) = parse_content_range(headers.get(header::CONTENT_RANGE)) else {
+        return ApiError::BadRequest(String::from("invalid or missing Content-Range"))
+            .into_response();
+    };
+    let expected = range.len();
+    if expected > MAX_CHUNK_BYTES {
+        return ApiError::BadRequest(String::from("chunk exceeds the maximum size"))
+            .into_response();
+    }
+    let limit = usize::try_from(expected).unwrap_or(usize::MAX);
+    let bytes = match to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ApiError::BadRequest(String::from("chunk body could not be read"))
+                .into_response();
+        }
+    };
+    if bytes.len() as u64 != expected {
+        return ApiError::BadRequest(String::from("chunk length does not match Content-Range"))
+            .into_response();
+    }
+    let stream: ByteStream<'_> = Box::pin(std::io::Cursor::new(bytes));
+    let chunk = Chunk {
+        range,
+        body: stream,
+    };
+    // Relay seam (plan tasks 20/31): single-node serving writes locally; task
+    // 31 swaps in a cluster transport that forwards to the placement owner.
+    if state.auth.cluster_enabled {
+        tracing::debug!(cache_id = %cache_id, "v1 patch: cluster mode (relay wired in task 31)");
+    }
+    let relay = LocalRelay;
+    match relay.stream_to_owner(storage, &cache_id, chunk).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => chunk_error(err),
+    }
 }
 
 /// `POST /_apis/artifactcache/caches/{cacheId}` — commit an upload.
@@ -360,6 +421,41 @@ fn range_not_satisfiable(size: u64) -> Response {
         .into_response()
 }
 
+/// Parse a PATCH `Content-Range: bytes start-end/*` header into an inclusive
+/// [`ChunkRange`]. The total is `*` on the upload path (the size is only known
+/// at commit); a numeric total is tolerated and ignored. Malformed input —
+/// wrong unit, missing `-`/`/`, non-numeric bounds, or `end < start` — yields
+/// `None` (→ 400).
+fn parse_content_range(value: Option<&HeaderValue>) -> Option<ChunkRange> {
+    let raw = value?.to_str().ok()?.trim();
+    let spec = raw
+        .strip_prefix("bytes ")
+        .or_else(|| raw.strip_prefix("bytes="))?;
+    let (range_part, total_part) = spec.split_once('/')?;
+    let total = total_part.trim();
+    if total != "*" && (total.is_empty() || !total.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let (start_raw, end_raw) = range_part.split_once('-')?;
+    let start = start_raw.trim().parse::<u64>().ok()?;
+    let end = end_raw.trim().parse::<u64>().ok()?;
+    (end >= start).then_some(ChunkRange { start, end })
+}
+
+/// Map a chunk-staging `io::Error` to its HTTP contract: 404 unknown/expired
+/// reservation, 409 already-complete entry, 400 overlap/length, 500 otherwise.
+fn chunk_error(err: io::Error) -> Response {
+    match err.kind() {
+        io::ErrorKind::NotFound => ApiError::not_found().into_response(),
+        io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
+        io::ErrorKind::InvalidInput => ApiError::BadRequest(err.to_string()).into_response(),
+        _ => {
+            tracing::error!(error = %err, "v1 patch: chunk staging failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
 /// Generate a fresh 32-hex-char `cacheId`.
 ///
 /// No `uuid`/`rand` dependency is available (and none may be added for this
@@ -421,5 +517,45 @@ mod tests {
         assert_eq!(first.len(), 32);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(first, second, "sequence must keep ids unique");
+    }
+
+    #[test]
+    fn content_range_accepts_star_total_and_inclusive_bounds() {
+        let h = |s: &str| HeaderValue::from_str(s).expect("header value");
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 0-4194303/*"))),
+            Some(ChunkRange {
+                start: 0,
+                end: 4194303
+            })
+        );
+        assert_eq!(
+            parse_content_range(Some(&h("bytes=4194304-8388607/*"))),
+            Some(ChunkRange {
+                start: 4194304,
+                end: 8388607
+            })
+        );
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 5-5/*"))),
+            Some(ChunkRange { start: 5, end: 5 })
+        );
+        // A numeric total is tolerated (the upload path only knows it at commit).
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 0-99/100"))),
+            Some(ChunkRange { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn content_range_rejects_malformed_forms() {
+        let h = |s: &str| HeaderValue::from_str(s).expect("header value");
+        assert_eq!(parse_content_range(None), None);
+        assert_eq!(parse_content_range(Some(&h("items 0-1/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0-1"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes a-b/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 5-4/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0-1/abc"))), None);
     }
 }

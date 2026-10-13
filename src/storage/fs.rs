@@ -28,6 +28,7 @@
 //! (plan rule: never delete a blob that has a complete row — orphans belong
 //! to the reaper).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
@@ -39,10 +40,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use super::{BoxFuture, ByteStream, EntryStat, StorageBackend, invalid_range, not_found};
+use super::{
+    BoxFuture, ByteStream, Chunk, ChunkOutcome, ChunkRange, EntryStat, StorageBackend, complete,
+    invalid_range, not_found,
+};
 
 /// Metadata + accounting schema (B5). The cluster/reservation columns stay
 /// empty until the tasks that populate them (11/18); `complete` doubles as
@@ -65,6 +69,11 @@ const SCHEMA: &str = "
         SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM accounting);
 ";
 
+/// Per-reservation serialization for chunk staging (plan task 20): one async
+/// mutex per reservation key so sequential chunks from one client never race,
+/// while different reservations write concurrently.
+type ChunkLocks = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
 /// Node-local blob store: raw files for payloads plus one SQLite file for
 /// the metadata index. Share behind `Arc`: SQLite access is funnelled
 /// through a mutex inside tokio's blocking pool, and mutating operations
@@ -76,6 +85,8 @@ pub struct FsStorage {
     /// Single-writer gate for put/finalize/delete; readers take it shared so
     /// metadata is never observed describing a blob mid-swap.
     gate: RwLock<()>,
+    /// Per-reservation chunk locks (see [`ChunkLocks`]).
+    chunk_locks: ChunkLocks,
 }
 
 impl std::fmt::Debug for FsStorage {
@@ -104,6 +115,7 @@ impl FsStorage {
             root,
             conn: Arc::new(Mutex::new(conn)),
             gate: RwLock::new(()),
+            chunk_locks: Mutex::new(HashMap::new()),
         };
         storage.reconcile()?;
         Ok(storage)
@@ -120,29 +132,32 @@ impl FsStorage {
         blocking(move || {
             let mut conn = lock(&conn)?;
             let tx = conn.transaction().map_err(sql)?;
-            let expired: Vec<String> = {
+            let expired: Vec<(String, String)> = {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT id FROM entries WHERE complete = 0 \
+                        "SELECT id, key FROM entries WHERE complete = 0 \
                          AND reservation_expires_at IS NOT NULL \
                          AND reservation_expires_at <= ?1",
                     )
                     .map_err(sql)?;
                 let rows = stmt
-                    .query_map(params![now_unix], |row| row.get::<_, String>(0))
+                    .query_map(params![now_unix], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
                     .map_err(sql)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
             };
-            for id in &expired {
-                tx.execute("DELETE FROM entries WHERE id = ?1", [&id])
+            for (id, _key) in &expired {
+                tx.execute("DELETE FROM entries WHERE id = ?1", [id])
                     .map_err(sql)?;
             }
             tx.commit().map_err(sql)?;
             // Files last (B5 convention): a crash in between leaves rowless
             // parts for the boot sweep, never a dangling row.
-            for id in &expired {
+            for (id, key) in &expired {
                 let _ = std::fs::remove_file(parts.join(format!("{id}.part")));
                 let _ = std::fs::remove_dir_all(parts.join(id));
+                let _ = std::fs::remove_dir_all(parts.join(key));
             }
             tracing::debug!(reaped = expired.len(), "expired reservations reaped");
             Ok(expired.len() as u64)
@@ -248,6 +263,16 @@ impl FsStorage {
 
     fn tmp_path(&self, id: &str) -> PathBuf {
         self.root.join("tmp").join(format!("{id}.tmp"))
+    }
+
+    /// Per-reservation async mutex serializing chunk staging for `key`.
+    fn chunk_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.chunk_locks.lock().expect("chunk lock map poisoned");
+        Arc::clone(
+            locks
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// Plan B5 boot reconciliation: drop index rows whose blob file is
@@ -580,6 +605,71 @@ impl StorageBackend for FsStorage {
             .await
         })
     }
+
+    fn write_chunk<'a>(
+        &'a self,
+        key: &'a str,
+        mut chunk: Chunk<'a>,
+    ) -> BoxFuture<'a, io::Result<ChunkOutcome>> {
+        Box::pin(async move {
+            let chunk_lock = self.chunk_lock(key);
+            let _chunk_guard = chunk_lock.lock().await;
+            let _gate = self.gate.read().await;
+            let id = entry_id(key);
+            let now = unix_now();
+            let conn = Arc::clone(&self.conn);
+            let id_for_query = id.clone();
+            let status = blocking(move || {
+                let conn = lock(&conn)?;
+                let row: Option<(i64, Option<i64>)> = conn
+                    .query_row(
+                        "SELECT complete, reservation_expires_at FROM entries WHERE id = ?1",
+                        [&id_for_query],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(sql)?;
+                Ok(match row {
+                    None => ReservationState::Missing,
+                    Some((1, _)) => ReservationState::Complete,
+                    Some((0, Some(expires_at))) if expires_at <= now => ReservationState::Missing,
+                    Some(_) => ReservationState::Open,
+                })
+            })
+            .await?;
+            match status {
+                ReservationState::Complete => return Err(complete(key)),
+                ReservationState::Missing => return Err(not_found(key)),
+                ReservationState::Open => {}
+            }
+            let dir = self.root.join("parts").join(key);
+            let dir_for_list = dir.clone();
+            let existing = blocking(move || list_chunk_ranges(&dir_for_list)).await?;
+            for range in &existing {
+                if *range == chunk.range {
+                    return Ok(ChunkOutcome::AlreadyPresent);
+                }
+                if range.overlaps(&chunk.range) {
+                    return Err(invalid_range("chunk overlaps an already-received range"));
+                }
+            }
+            let tmp = self
+                .root
+                .join("tmp")
+                .join(format!("{id}-{}.chunk.tmp", chunk.range.start));
+            let written = stream_chunk_to_file(&tmp, &mut chunk.body).await?;
+            if written != chunk.range.len() {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(invalid_range(
+                    "chunk body length does not match Content-Range",
+                ));
+            }
+            let dest = dir.join(format!("{}.part", chunk.range.start));
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::rename(&tmp, &dest).await?;
+            Ok(ChunkOutcome::Written)
+        })
+    }
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -602,6 +692,55 @@ fn write_atomic(tmp: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
     drop(file);
     std::fs::rename(tmp, dest)?;
     Ok(())
+}
+
+/// Reservation gate result for [`FsStorage::write_chunk`].
+enum ReservationState {
+    Missing,
+    Complete,
+    Open,
+}
+
+/// List the inclusive byte ranges already staged for a reservation by reading
+/// the `{start}.part` file names and sizes in `parts/{key}/`. An absent
+/// directory means no chunks yet.
+fn list_chunk_ranges(dir: &Path) -> io::Result<Vec<ChunkRange>> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut ranges = Vec::new();
+    for dirent in read.flatten() {
+        let Some(name) = dirent.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".part") else {
+            continue;
+        };
+        let Ok(start) = stem.parse::<u64>() else {
+            continue;
+        };
+        let len = dirent.metadata()?.len();
+        if len == 0 {
+            continue;
+        }
+        ranges.push(ChunkRange {
+            start,
+            end: start.saturating_add(len - 1),
+        });
+    }
+    Ok(ranges)
+}
+
+/// Stream a chunk body to `tmp` and fsync it, returning the byte count. The
+/// caller renames `tmp` into place only after validating the length.
+async fn stream_chunk_to_file(tmp: &Path, source: &mut ByteStream<'_>) -> io::Result<u64> {
+    let mut file = tokio::fs::File::create(tmp).await?;
+    let written = tokio::io::copy(source, &mut file).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(written)
 }
 
 fn modified_unix(path: &Path) -> io::Result<i64> {

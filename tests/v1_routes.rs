@@ -11,7 +11,9 @@
 //! download-of-unknown 404.
 
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::body::Body;
@@ -20,6 +22,7 @@ use cachette::auth::AuthPolicy;
 use cachette::config::AuthMode;
 use cachette::routes;
 use cachette::state::AppState;
+use cachette::storage::fs::FsStorage;
 use cachette::storage::{ByteStream, MemoryStorage, StorageBackend};
 use tower::ServiceExt;
 
@@ -202,11 +205,13 @@ async fn reserve_duplicate_returns_409_exception_body() {
 
 #[tokio::test]
 async fn patch_chunk_returns_empty_204() {
-    let app = routes::router(fixture_state().await);
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
     let reply = call(
         &app,
         "PATCH",
-        "/_apis/artifactcache/caches/deadbeef",
+        &format!("/_apis/artifactcache/caches/{cache_id}"),
         Some(TOKEN),
         &[("content-range", "bytes 0-9/*")],
         Body::from(vec![0_u8; 10]),
@@ -474,4 +479,259 @@ async fn reserve_duplicate_detection_folds_key_case() {
     .await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(json_body_of(&reply)["key"], requested);
+}
+
+/// Temp dir removed on drop; unique per test so parallel runs never collide.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "cachette-t20-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        Self { path }
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// AppState backed by a real `FsStorage` on disk (chunk tests need the parts
+/// directory layout). The `TempDir` must outlive the state.
+async fn fs_state() -> (AppState, TempDir) {
+    let dir = TempDir::new();
+    let storage = Arc::new(FsStorage::open(dir.path()).expect("fs storage opens"));
+    let mut state = AppState::new();
+    state.storage = Some(storage);
+    state.auth = Arc::new(AuthPolicy {
+        mode: AuthMode::Bearer,
+        secret: Some(SECRET.to_owned()),
+        hmac_max_age_seconds: 600,
+        static_tokens: vec![TOKEN.to_owned()],
+        cluster_enabled: false,
+    });
+    (state, dir)
+}
+
+/// Reserve a fresh cache entry over HTTP and return its `cacheId`.
+async fn reserve_key(app: &Router) -> String {
+    let reply = call(
+        app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": "chunked-key", "version": "2"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    json_body_of(&reply)["cacheId"]
+        .as_str()
+        .expect("cacheId string")
+        .to_owned()
+}
+
+/// PATCH one chunk of `len` bytes at `start..=end` (inclusive), filled with
+/// `fill` so distinct chunks are distinguishable on disk.
+async fn patch(app: &Router, cache_id: &str, start: u64, end: u64, len: usize, fill: u8) -> Reply {
+    call(
+        app,
+        "PATCH",
+        &format!("/_apis/artifactcache/caches/{cache_id}"),
+        Some(TOKEN),
+        &[("content-range", &format!("bytes {start}-{end}/*"))],
+        Body::from(vec![fill; len]),
+    )
+    .await
+}
+
+/// `parts/{cacheId}/{start}.part` file sizes, keyed by start offset.
+fn chunk_sizes(dir: &Path, cache_id: &str) -> Vec<(u64, u64)> {
+    let parts = dir.join("parts").join(cache_id);
+    let mut sizes = Vec::new();
+    for dirent in std::fs::read_dir(parts).expect("parts dir") {
+        let dirent = dirent.expect("dirent");
+        let name = dirent.file_name();
+        let name = name.to_str().expect("utf8 name");
+        let Some(stem) = name.strip_suffix(".part") else {
+            continue;
+        };
+        let start = stem.parse::<u64>().expect("numeric start");
+        sizes.push((start, dirent.metadata().expect("metadata").len()));
+    }
+    sizes.sort_unstable();
+    sizes
+}
+
+#[tokio::test]
+async fn patch_4mib_chunks_in_8_parts_stages_each_part_file() {
+    let (state, dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let chunk = 4 * 1024 * 1024;
+    for i in 0..8_u64 {
+        let start = i * chunk;
+        let reply = patch(
+            &app,
+            &cache_id,
+            start,
+            start + chunk - 1,
+            chunk as usize,
+            i as u8,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::NO_CONTENT, "chunk {i}");
+    }
+    let sizes = chunk_sizes(dir.path(), &cache_id);
+    assert_eq!(sizes.len(), 8, "one part file per chunk: {sizes:?}");
+    for (i, (start, len)) in sizes.iter().enumerate() {
+        assert_eq!(*start, i as u64 * chunk, "offsets: {sizes:?}");
+        assert_eq!(*len, chunk, "sizes: {sizes:?}");
+    }
+}
+
+#[tokio::test]
+async fn patch_32mib_chunks_in_4_parts_stages_each_part_file() {
+    let (state, dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let chunk = 32 * 1024 * 1024;
+    for i in 0..4_u64 {
+        let start = i * chunk;
+        let reply = patch(
+            &app,
+            &cache_id,
+            start,
+            start + chunk - 1,
+            chunk as usize,
+            i as u8,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::NO_CONTENT, "chunk {i}");
+    }
+    let sizes = chunk_sizes(dir.path(), &cache_id);
+    assert_eq!(sizes.len(), 4, "one part file per chunk: {sizes:?}");
+    for (i, (start, len)) in sizes.iter().enumerate() {
+        assert_eq!(*start, i as u64 * chunk, "offsets: {sizes:?}");
+        assert_eq!(*len, chunk, "sizes: {sizes:?}");
+    }
+}
+
+#[tokio::test]
+async fn patch_overlapping_range_returns_400() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let first = patch(&app, &cache_id, 500, 599, 100, 1).await;
+    assert_eq!(first.status, StatusCode::NO_CONTENT);
+    let overlap = patch(&app, &cache_id, 400, 599, 200, 2).await;
+    assert_eq!(overlap.status, StatusCode::BAD_REQUEST);
+    let adjacent = patch(&app, &cache_id, 600, 699, 100, 3).await;
+    assert_eq!(
+        adjacent.status,
+        StatusCode::NO_CONTENT,
+        "adjacent ranges are fine"
+    );
+}
+
+#[tokio::test]
+async fn patch_unknown_cache_id_returns_404() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let reply = patch(&app, "deadbeefdeadbeefdeadbeefdeadbeef", 0, 9, 10, 1).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(json_body_of(&reply)["error"], "not found");
+}
+
+#[tokio::test]
+async fn patch_completed_entry_returns_409() {
+    let (state, _dir) = fs_state().await;
+    let storage = state.storage.as_ref().expect("storage configured").clone();
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let reply = patch(&app, &cache_id, 0, 9, 10, 1).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    storage.finalize(&cache_id).await.expect("finalize");
+    let after = patch(&app, &cache_id, 10, 19, 10, 2).await;
+    assert_eq!(after.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn patch_repeat_of_received_range_is_idempotent_204() {
+    let (state, dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let first = patch(&app, &cache_id, 0, 4_194_303, 4_194_304, 7).await;
+    assert_eq!(first.status, StatusCode::NO_CONTENT);
+    let second = patch(&app, &cache_id, 0, 4_194_303, 4_194_304, 7).await;
+    assert_eq!(second.status, StatusCode::NO_CONTENT);
+    let sizes = chunk_sizes(dir.path(), &cache_id);
+    assert_eq!(
+        sizes,
+        vec![(0, 4_194_304)],
+        "no duplicate part file: {sizes:?}"
+    );
+}
+
+#[tokio::test]
+async fn patch_malformed_content_range_returns_400() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    for bad in [
+        "bytes 0-9",
+        "bytes 0/*",
+        "bytes a-b/*",
+        "bytes 5-4/*",
+        "items 0-1/*",
+    ] {
+        let reply = call(
+            &app,
+            "PATCH",
+            &format!("/_apis/artifactcache/caches/{cache_id}"),
+            Some(TOKEN),
+            &[("content-range", bad)],
+            Body::from(vec![0_u8; 10]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "header: {bad}");
+    }
+}
+
+#[tokio::test]
+async fn patch_cache_id_zero_returns_400() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let reply = patch(&app, "0", 0, 9, 10, 1).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_body_length_mismatch_returns_400() {
+    let (state, _dir) = fs_state().await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    let reply = call(
+        &app,
+        "PATCH",
+        &format!("/_apis/artifactcache/caches/{cache_id}"),
+        Some(TOKEN),
+        &[("content-range", "bytes 0-9/*")],
+        Body::from(vec![0_u8; 5]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 }
