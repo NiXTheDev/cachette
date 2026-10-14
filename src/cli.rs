@@ -2,13 +2,17 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use clap::Subcommand;
 
 /// Cachette - GitHub Actions cache server (v1 artifactcache + Twirp v2).
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Cli {
-    /// Path to a TOML config file (default: cachette.toml if present).
+    /// Path to a TOML config file. When omitted, the platform default is used
+    /// if present: /etc/cachette/cachette.toml (*nix),
+    /// %APPDATA%\cachette\cachette.toml (Windows), /config/cachette.toml
+    /// (Docker image). An explicit path always overrides the default.
     #[arg(long, value_name = "path")]
     pub config: Option<PathBuf>,
     /// Print the resolved configuration (secrets masked) and exit.

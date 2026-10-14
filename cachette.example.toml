@@ -1,6 +1,14 @@
 # Canonical example configuration for cachette
 # This file documents all configuration options with their defaults.
 # Values shown are the built-in defaults unless otherwise noted.
+#
+# Default search locations (used when --config is NOT passed):
+#   *nix (Linux/BSD/macOS): /etc/cachette/cachette.toml
+#   Windows:                %APPDATA%\cachette\cachette.toml
+#   Docker image:           /config/cachette.toml (the image's CMD passes
+#                           --config /config/cachette.toml explicitly)
+# If the default file is absent, cachette starts on built-in defaults.
+# An explicit `--config <path>` always overrides these locations.
 
 [server]
 # Address and port to listen on (host:port). IPv6 literals: [::1]:8080

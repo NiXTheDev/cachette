@@ -1,11 +1,12 @@
 //! Configuration: TOML file + `CACHETTE__*` env overrides + validation
 //! (plan task 5).
 //!
-//! Load order: `--config <path>` (default `cachette.toml` if present), then
-//! environment variables (env wins). Unknown TOML keys and unknown
+//! Load order: `--config <path>` (default [`default_config_file`] if present),
+//! then environment variables (env wins). Unknown TOML keys and unknown
 //! `CACHETTE__*` variables are hard errors. `auth.secret` is only required
 //! to serve: `--print-config` succeeds without it (secrets render as `***`).
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -24,7 +25,41 @@ pub use error::ConfigError;
 pub use min_free::MinFree;
 pub use sections::*;
 
-pub const DEFAULT_CONFIG_FILE: &str = "cachette.toml";
+/// Name of the config file looked for inside [`default_config_dir`].
+pub const CONFIG_FILE_NAME: &str = "cachette.toml";
+
+/// Platform default directory searched for `cachette.toml` when `--config`
+/// is not passed:
+///
+/// * `*nix` (Linux/BSD/macOS): `/etc/cachette`
+/// * Windows: `%APPDATA%\cachette` (falls back to
+///   [`std::env::temp_dir`]`/cachette` when `APPDATA` is unset, e.g. on
+///   service accounts)
+/// * Docker: `/config` — the image's `CMD` passes `--config
+///   /config/cachette.toml` explicitly, so no runtime Docker detection is
+///   needed here.
+#[must_use]
+pub fn default_config_dir() -> PathBuf {
+    default_config_dir_from(std::env::var_os("APPDATA").as_deref())
+}
+
+/// Pure core of [`default_config_dir`]: takes the (possibly absent) `%APPDATA%`
+/// value so tests can exercise both branches without mutating process-global
+/// environment.
+fn default_config_dir_from(appdata: Option<&OsStr>) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        let base = appdata.map_or_else(std::env::temp_dir, PathBuf::from);
+        base.join("cachette")
+    } else {
+        PathBuf::from("/etc/cachette")
+    }
+}
+
+/// Platform default config file: [`default_config_dir`]`/cachette.toml`.
+#[must_use]
+pub fn default_config_file() -> PathBuf {
+    default_config_dir().join(CONFIG_FILE_NAME)
+}
 
 /// Fully resolved configuration: file, env, and derived defaults applied.
 #[derive(Debug, Default, Serialize)]
@@ -64,11 +99,13 @@ impl Config {
     }
 }
 
-/// Load the config file (`--config <path>`, else `cachette.toml` if present)
-/// and overlay `CACHETTE__*` environment variables.
+/// Load the config file (`--config <path>`, else [`default_config_file`] if
+/// present) and overlay `CACHETTE__*` environment variables. An explicit
+/// `--config` path always wins, even when the file does not exist (that is a
+/// hard error rather than a fallback to the platform default).
 pub fn load(cli_config: Option<PathBuf>) -> Result<Config, ConfigError> {
     let explicit = cli_config.is_some();
-    let path = cli_config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
+    let path = cli_config.unwrap_or_else(default_config_file);
     let raw = if explicit || path.exists() {
         Some(
             std::fs::read_to_string(&path).map_err(|err| ConfigError::ReadFile {
@@ -380,5 +417,79 @@ mod tests {
         config.require_auth_secret().expect("fixture secret serves");
         let rendered = render_masked(&config).expect("example renders masked");
         assert!(!rendered.contains("CHANGE_ME_MIN_16_CHARS"));
+    }
+
+    #[test]
+    fn default_config_file_ends_with_cachette_toml() {
+        let file = default_config_file();
+        assert_eq!(file.file_name(), Some(OsStr::new(CONFIG_FILE_NAME)));
+        assert_eq!(file, default_config_dir().join(CONFIG_FILE_NAME));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_config_dir_uses_appdata() {
+        let dir = default_config_dir_from(Some(OsStr::new(r"C:\Users\x\AppData\Roaming")));
+        assert_eq!(
+            dir,
+            PathBuf::from(r"C:\Users\x\AppData\Roaming").join("cachette")
+        );
+        assert!(dir.ends_with("cachette"));
+
+        // `APPDATA` unset → temp-dir fallback, still a `.../cachette` dir.
+        let fallback = default_config_dir_from(None);
+        assert!(fallback.ends_with("cachette"));
+        assert!(fallback.starts_with(std::env::temp_dir()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_config_file_is_under_appdata() {
+        let appdata = r"C:\Users\x\AppData\Roaming";
+        assert_eq!(
+            default_config_dir_from(Some(OsStr::new(appdata))).join(CONFIG_FILE_NAME),
+            PathBuf::from(appdata)
+                .join("cachette")
+                .join("cachette.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_default_config_dir_is_etc_cachette() {
+        // The `appdata` argument is ignored on *nix; both forms resolve to the
+        // fixed system path.
+        assert_eq!(
+            default_config_dir_from(None),
+            PathBuf::from("/etc/cachette")
+        );
+        assert_eq!(
+            default_config_dir_from(Some(OsStr::new("/ignored"))),
+            PathBuf::from("/etc/cachette")
+        );
+        assert_eq!(
+            default_config_file(),
+            PathBuf::from("/etc/cachette/cachette.toml")
+        );
+    }
+
+    #[test]
+    fn explicit_config_path_overrides_the_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "cachette-config-test-explicit-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("custom.toml");
+        std::fs::write(&path, "[cache]\nmax_size = 4242\n").expect("write custom config");
+
+        let config = load(Some(path.clone())).expect("explicit config loads");
+        assert_eq!(config.cache.max_size, 4242);
+
+        // An explicit but missing path must be an error, NOT a silent fallback
+        // to the platform default file.
+        load(Some(dir.join("missing.toml"))).expect_err("explicit missing path is an error");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

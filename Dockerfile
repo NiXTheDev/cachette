@@ -17,19 +17,19 @@
 #   `cachette listening on ...` in the logs instead.)
 #
 # Non-root: numeric `USER 65532:65532` works in scratch without /etc/passwd;
-#   /etc/cachette and /var/lib/cachette are chowned to 65532 so the compose
+#   /config and /var/lib/cachette are chowned to 65532 so the compose
 #   named volume is writable on first use.
 #
 # Entrypoint / command / port:
 #   ENTRYPOINT ["/usr/local/bin/cachette"]
-#   CMD        ["--config", "/etc/cachette/cachette.toml"]
+#   CMD        ["--config", "/config/cachette.toml"]
 #   EXPOSE     8080   # [server] listen = "0.0.0.0:8080" - always TLS
 #                     # (self-signed Ed25519 identity cert when the mounted
 #                     # config sets no tls_cert/tls_key)
-#   docker run --rm cachette:local            -> cachette --config /etc/cachette/cachette.toml
+#   docker run --rm cachette:local            -> cachette --config /config/cachette.toml
 #   docker run --rm cachette:local --version  -> cachette 0.1.0   (replaces CMD)
 #
-# The baked /etc/cachette/cachette.toml is the repo's cachette.example.toml - a
+# The baked /config/cachette.toml is the repo's cachette.example.toml - a
 # DEMO default (secret = CHANGE_ME_*). Real deployments must override
 # CACHETTE__AUTH__SECRET (compose does) or mount their own config.
 
@@ -61,9 +61,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked && \
     ./target/release/cachette --version && \
     file target/release/cachette | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked' && \
-    mkdir -p /rootfs/usr/local/bin /rootfs/etc/cachette /rootfs/var/lib/cachette && \
+    mkdir -p /rootfs/usr/local/bin /rootfs/config /rootfs/var/lib/cachette && \
     cp target/release/cachette /rootfs/usr/local/bin/cachette && \
-    cp cachette.example.toml /rootfs/etc/cachette/cachette.toml && \
+    cp cachette.example.toml /rootfs/config/cachette.toml && \
     chown -R 65532:65532 /rootfs
 
 FROM scratch AS runtime
@@ -71,4 +71,4 @@ COPY --from=builder --chown=65532:65532 /rootfs /
 USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/cachette"]
-CMD ["--config", "/etc/cachette/cachette.toml"]
+CMD ["--config", "/config/cachette.toml"]
