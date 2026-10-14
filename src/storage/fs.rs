@@ -827,6 +827,164 @@ impl StorageBackend for FsStorage {
             .await
         })
     }
+
+    fn put_block<'a>(
+        &'a self,
+        cache_id: &'a str,
+        block_id: &'a str,
+        mut source: ByteStream<'a>,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            // Buffer first so a cancelled future never reaches the filesystem
+            // (same cancel-safety rule as `put_stream`).
+            let mut data = Vec::new();
+            source.read_to_end(&mut data).await?;
+            let _gate = self.gate.write().await;
+            let res_id = entry_id(cache_id);
+            let now = unix_now();
+            let conn = Arc::clone(&self.conn);
+            let cache_id = cache_id.to_owned();
+            let block_id = block_id.to_owned();
+            let dir = self.root.join("parts").join(&cache_id).join("blocks");
+            let tmp = self
+                .root
+                .join("tmp")
+                .join(format!("{res_id}-{block_id}.block.tmp"));
+            let dest = dir.join(format!("{block_id}.block"));
+            blocking(move || {
+                let status = {
+                    let conn = lock(&conn)?;
+                    let row: Option<(i64, Option<i64>)> = conn
+                        .query_row(
+                            "SELECT complete, reservation_expires_at FROM entries WHERE id = ?1",
+                            [&res_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(sql)?;
+                    match row {
+                        None => ReservationState::Missing,
+                        Some((1, _)) => ReservationState::Complete,
+                        Some((0, Some(expires_at))) if expires_at <= now => {
+                            ReservationState::Missing
+                        }
+                        Some(_) => ReservationState::Open,
+                    }
+                };
+                match status {
+                    ReservationState::Complete => return Err(complete(&cache_id)),
+                    ReservationState::Missing => return Err(not_found(&cache_id)),
+                    ReservationState::Open => {}
+                }
+                std::fs::create_dir_all(&dir)?;
+                write_atomic(&tmp, &dest, &data)
+            })
+            .await
+        })
+    }
+
+    fn assemble_blocks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        ordered_block_ids: &'a [String],
+    ) -> BoxFuture<'a, io::Result<u64>> {
+        Box::pin(async move {
+            let chunk_lock = self.chunk_lock(cache_id);
+            let _chunk_guard = chunk_lock.lock().await;
+            let _gate = self.gate.write().await;
+            let root = self.root.clone();
+            let conn = Arc::clone(&self.conn);
+            let res_id = entry_id(cache_id);
+            let cache_id = cache_id.to_owned();
+            let ordered = ordered_block_ids.to_vec();
+            blocking(move || {
+                let now = unix_now();
+                let reservation: Option<(String, String, Option<i64>)> = {
+                    let conn = lock(&conn)?;
+                    conn.query_row(
+                        "SELECT artifact_key, version, reservation_expires_at \
+                         FROM entries WHERE id = ?1 AND complete = 0",
+                        [&res_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(sql)?
+                };
+                let Some((artifact_key, version, expires_at)) = reservation else {
+                    return Err(not_found(&cache_id));
+                };
+                if expires_at.is_some_and(|expiry| expiry <= now) {
+                    return Err(not_found(&cache_id));
+                }
+                let blocks = root.join("parts").join(&cache_id).join("blocks");
+                let blob_id = entry_id(&artifact_key);
+                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
+                let blob = root.join("blobs").join(format!("{blob_id}.blob"));
+                let mut total = 0_u64;
+                {
+                    let mut out = File::create(&tmp)?;
+                    for block_id in &ordered {
+                        let path = blocks.join(format!("{block_id}.block"));
+                        let mut input = File::open(&path).map_err(|err| {
+                            if err.kind() == io::ErrorKind::NotFound {
+                                invalid_range("blocklist references an unknown block")
+                            } else {
+                                err
+                            }
+                        })?;
+                        total = total.saturating_add(std::io::copy(&mut input, &mut out)?);
+                    }
+                    out.sync_all()?;
+                }
+                // B5 ordering: blob file first, index commit second, so a crash
+                // in between leaves a rowless blob for the reaper.
+                std::fs::rename(&tmp, &blob)?;
+                let size = i64::try_from(total)
+                    .map_err(|_| io::Error::other("blob exceeds SQLite integer range"))?;
+                let mut conn = lock(&conn)?;
+                let tx = conn.transaction().map_err(sql)?;
+                let previous: Option<i64> = tx
+                    .query_row(
+                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
+                        [&blob_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sql)?;
+                tx.execute(
+                    "INSERT INTO entries \
+                         (id, key, version, size, created_at, accessed_at, complete, \
+                          owner_node, artifact_key, reservation_expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         key = excluded.key, version = excluded.version, \
+                         size = excluded.size, created_at = excluded.created_at, \
+                         accessed_at = excluded.accessed_at, complete = 1, \
+                         artifact_key = '', reservation_expires_at = NULL",
+                    params![blob_id, artifact_key, version, size, now],
+                )
+                .map_err(sql)?;
+                tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
+                    .map_err(sql)?;
+                let used: i64 = tx
+                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                    .optional()
+                    .map_err(sql)?
+                    .unwrap_or(0);
+                let used = used
+                    .saturating_sub(previous.unwrap_or(0))
+                    .saturating_add(size);
+                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
+                    .map_err(sql)?;
+                tx.commit().map_err(sql)?;
+                drop(conn);
+                let _ = std::fs::remove_dir_all(&blocks);
+                let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                Ok(total)
+            })
+            .await
+        })
+    }
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -1974,5 +2132,113 @@ mod storage_fs {
 
         let reopened = FsStorage::open(dir.path()).expect("reopen");
         assert_eq!(reopened.used_bytes().await.expect("used"), size);
+    }
+
+    #[tokio::test]
+    async fn put_block_then_assemble_publishes_visible_entry_in_listed_order() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("cache-id", "artifact-key", "v1", now + 3600)
+            .await
+            .expect("reserve");
+
+        // Stage three named blocks, then list them out of upload order.
+        for (id, data) in [
+            ("aa", &b"first"[..]),
+            ("bb", &b"second"[..]),
+            ("cc", &b"third"[..]),
+        ] {
+            storage
+                .put_block("cache-id", id, bytes(data))
+                .await
+                .expect("put block");
+        }
+        assert_eq!(
+            storage.stat("artifact-key").await.expect("stat"),
+            None,
+            "staged blocks stay invisible"
+        );
+        assert_eq!(storage.used_bytes().await.expect("used"), 0);
+
+        let ordered = vec!["cc".to_owned(), "aa".to_owned(), "bb".to_owned()];
+        let size = storage
+            .assemble_blocks("cache-id", &ordered)
+            .await
+            .expect("assemble");
+        assert_eq!(size, (5 + 5 + 6) as u64);
+
+        let body = read_all(
+            storage
+                .get_range("artifact-key", 0..size)
+                .await
+                .expect("get"),
+        )
+        .await;
+        assert_eq!(body, b"thirdfirstsecond");
+        assert_eq!(storage.used_bytes().await.expect("used"), size);
+        // The reservation is consumed: a second assemble is not found.
+        let err = storage
+            .assemble_blocks("cache-id", &ordered)
+            .await
+            .expect_err("reservation consumed");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn assemble_blocks_rejects_a_block_that_was_never_staged() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("cache-id", "artifact-key", "v1", now + 3600)
+            .await
+            .expect("reserve");
+        storage
+            .put_block("cache-id", "aa", bytes(b"present"))
+            .await
+            .expect("put block");
+
+        let ordered = vec!["aa".to_owned(), "missing".to_owned()];
+        let err = storage
+            .assemble_blocks("cache-id", &ordered)
+            .await
+            .expect_err("unknown block");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            storage.stat("artifact-key").await.expect("stat"),
+            None,
+            "a failed assemble publishes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_and_assemble_block_require_an_open_reservation() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+
+        let err = storage
+            .put_block("unknown-cache", "aa", bytes(b"x"))
+            .await
+            .expect_err("put block without reservation");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let err = storage
+            .assemble_blocks("unknown-cache", &["aa".to_owned()])
+            .await
+            .expect_err("assemble without reservation");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("expired-cache", "expired-key", "v1", now.saturating_sub(1))
+            .await
+            .expect("reserve expired");
+        let err = storage
+            .put_block("expired-cache", "aa", bytes(b"x"))
+            .await
+            .expect_err("put block on expired reservation");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

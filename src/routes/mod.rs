@@ -13,6 +13,7 @@
 mod health;
 mod twirp;
 mod v1;
+mod v2_upload;
 
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{Uri, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 
 use crate::auth;
 use crate::error::ApiError;
@@ -60,16 +61,33 @@ pub fn router(state: AppState) -> Router {
         "/twirp/github.actions.results.api.v1.CacheService/{method}",
         post(twirp::dispatch),
     );
+    let v2_upload_routes = Router::new().route("/v2/upload/{entryId}", put(v2_upload::upload));
     Router::new()
         .route("/health", get(health::health))
         .merge(peer_routes)
         .merge(admin_routes)
         .merge(v1_routes)
         .merge(twirp_routes)
+        .merge(v2_upload_routes)
         .with_state(state.clone())
         .fallback(fallback_404)
         .method_not_allowed_fallback(fallback_405)
         .layer(middleware::from_fn_with_state(state, auth::require_auth))
+}
+
+/// HMAC secret for v2 capability URLs (task 24 mints, tasks 25/26 validate).
+/// Both sides MUST agree, so the fallback for a secretless boot lives here:
+/// when `[auth] secret` is unset the fixed placeholder is used (tests /
+/// `--print-config` boots); production always serves with a real secret.
+pub(crate) const FALLBACK_SIGNING_SECRET: &str = "cachette-v2-route";
+
+/// Resolve the signing secret for a v2 capability URL.
+pub(crate) fn signing_secret(state: &AppState) -> &str {
+    state
+        .auth
+        .secret
+        .as_deref()
+        .unwrap_or(FALLBACK_SIGNING_SECRET)
 }
 
 fn client_fingerprint(parts: &Parts) -> Option<String> {

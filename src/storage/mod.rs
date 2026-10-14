@@ -360,6 +360,35 @@ pub trait StorageBackend: Send + Sync {
         cache_id: &'a str,
         declared_size: u64,
     ) -> BoxFuture<'a, io::Result<()>>;
+
+    /// Stage one named Azure "Put Block" block for reservation `cache_id`
+    /// (plan task 25). `block_id` is a filesystem-safe caller-supplied token
+    /// (the route layer lowercase-hex-encodes the decoded Azure `blockid`,
+    /// which is exactly 48 or 64 bytes). Error kinds the route layer maps to
+    /// HTTP: `NotFound` when `cache_id` is not an open reservation (unknown or
+    /// expired) → 404; `AlreadyExists` when a finalized entry already holds
+    /// `cache_id` → 409.
+    fn put_block<'a>(
+        &'a self,
+        cache_id: &'a str,
+        block_id: &'a str,
+        source: ByteStream<'a>,
+    ) -> BoxFuture<'a, io::Result<()>>;
+
+    /// Assemble the blocks staged by [`Self::put_block`] for reservation
+    /// `cache_id` in `ordered_block_ids` order and publish the result as a
+    /// COMPLETE entry (plan task 25). Returns the assembled size.
+    ///
+    /// Error kinds the route layer maps to HTTP: `NotFound` when `cache_id` is
+    /// not an open reservation (unknown or expired) → 404; `InvalidInput` when
+    /// any listed block is not staged → 400. Publishing is B5-ordered (blob
+    /// file first, then the index row) and supersedes any existing visible
+    /// entry sharing the artifact key (one visible entry per key).
+    fn assemble_blocks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        ordered_block_ids: &'a [String],
+    ) -> BoxFuture<'a, io::Result<u64>>;
 }
 
 /// In-memory [`StorageBackend`] double for unit and handler tests:
@@ -379,6 +408,9 @@ struct MemoryState {
     reservations: HashMap<String, Reservation>,
     /// Chunks already staged per reservation `cache_id`.
     chunks: HashMap<String, Vec<StagedChunk>>,
+    /// Azure "Put Block" blocks staged per reservation `cache_id`:
+    /// `block_id` (hex token) → bytes (plan task 25).
+    blocks: HashMap<String, HashMap<String, Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -466,6 +498,7 @@ impl StorageBackend for MemoryStorage {
             state.visible.remove(key);
             state.reservations.remove(key);
             state.chunks.remove(key);
+            state.blocks.remove(key);
             Ok(())
         })
     }
@@ -552,6 +585,8 @@ impl StorageBackend for MemoryStorage {
                     expires_at,
                 },
             );
+            // A fresh reserve supersedes any blocks staged for this cache_id.
+            state.blocks.remove(cache_id);
             Ok(())
         })
     }
@@ -618,6 +653,7 @@ impl StorageBackend for MemoryStorage {
             if reservation.expires_at <= unix_now() {
                 state.reservations.remove(cache_id);
                 state.chunks.remove(cache_id);
+                state.blocks.remove(cache_id);
                 return Err(not_found(cache_id));
             }
             let key = reservation.key.clone();
@@ -652,7 +688,76 @@ impl StorageBackend for MemoryStorage {
                 },
             );
             state.reservations.remove(cache_id);
+            state.blocks.remove(cache_id);
             Ok(())
+        })
+    }
+
+    fn put_block<'a>(
+        &'a self,
+        cache_id: &'a str,
+        block_id: &'a str,
+        mut source: ByteStream<'a>,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut data = Vec::new();
+            source.read_to_end(&mut data).await?;
+            let mut state = self.inner.write().await;
+            match state.reservations.get(cache_id) {
+                None => return Err(not_found(cache_id)),
+                Some(reservation) if reservation.expires_at <= unix_now() => {
+                    state.reservations.remove(cache_id);
+                    state.blocks.remove(cache_id);
+                    return Err(not_found(cache_id));
+                }
+                Some(_) => {}
+            }
+            state
+                .blocks
+                .entry(cache_id.to_owned())
+                .or_default()
+                .insert(block_id.to_owned(), data);
+            Ok(())
+        })
+    }
+
+    fn assemble_blocks<'a>(
+        &'a self,
+        cache_id: &'a str,
+        ordered_block_ids: &'a [String],
+    ) -> BoxFuture<'a, io::Result<u64>> {
+        Box::pin(async move {
+            let mut state = self.inner.write().await;
+            let Some(reservation) = state.reservations.get(cache_id) else {
+                return Err(not_found(cache_id));
+            };
+            if reservation.expires_at <= unix_now() {
+                state.reservations.remove(cache_id);
+                state.blocks.remove(cache_id);
+                return Err(not_found(cache_id));
+            }
+            let key = reservation.key.clone();
+            let staged = state.blocks.get(cache_id);
+            let mut data = Vec::new();
+            for block_id in ordered_block_ids {
+                let Some(bytes) = staged.and_then(|blocks| blocks.get(block_id)) else {
+                    return Err(invalid_range("blocklist references an unknown block"));
+                };
+                data.extend_from_slice(bytes);
+            }
+            let size = data.len() as u64;
+            let created_at = unix_now();
+            state.visible.insert(
+                key,
+                Visible {
+                    data,
+                    created_at,
+                    accessed_at: created_at,
+                },
+            );
+            state.reservations.remove(cache_id);
+            state.blocks.remove(cache_id);
+            Ok(size)
         })
     }
 }

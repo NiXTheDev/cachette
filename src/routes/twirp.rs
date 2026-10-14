@@ -112,9 +112,9 @@ pub async fn dispatch(
 const UPLOAD_PATH_PREFIX: &str = "/v2/upload/";
 const ARTIFACT_PATH_PREFIX: &str = "/v2/artifacts/";
 
-/// HMAC secret fallback when `auth.secret` is unset (mirrors `v1.rs`'s
-/// placeholder so capability URLs still mint in tests / secretless boots).
-const FALLBACK_SECRET: &str = "cachette-v2-route";
+// HMAC secret fallback when `auth.secret` is unset is shared with the upload
+// route ([`super::signing_secret`] / [`super::FALLBACK_SIGNING_SECRET`]) so
+// minting and validation always agree.
 
 /// `CreateCacheEntry` request. `key`/`version` are the reservation identity;
 /// `scope` (`refs/heads/main`-style or a sha) is stored verbatim and never
@@ -219,7 +219,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
     if state.auth.cluster_enabled {
         tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (owner placement wired in task 30/31)");
     }
-    let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+    let secret = super::signing_secret(state);
     let now = auth::now_secs();
     let ttl = state.cache.signed_url_ttl_seconds;
     let base = state.external_url.as_deref().unwrap_or_default();
