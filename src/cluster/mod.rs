@@ -17,6 +17,7 @@
 
 pub mod heartbeat;
 mod mdns;
+pub mod placement;
 mod seeds;
 
 use std::collections::HashMap;
@@ -271,6 +272,7 @@ fn merge_into(existing: &mut PeerRecord, incoming: PeerRecord) {
 /// Handle keeping the mDNS daemon + browser alive for the process lifetime.
 pub struct ClusterRuntime {
     peer_table: std::sync::Arc<PeerTable>,
+    placement: std::sync::Arc<placement::Placement>,
     _mdns: Option<mdns::MdnsHandle>,
 }
 
@@ -279,6 +281,16 @@ impl ClusterRuntime {
     #[must_use]
     pub fn peer_table(&self) -> &std::sync::Arc<PeerTable> {
         &self.peer_table
+    }
+
+    /// The shared placement handle (plan task 30): the tiebreak state
+    /// (round-robin cursors, PRNG stream) that the relay (task 31) and the v2
+    /// owner route (task 32) reuse across requests. Hold this single instance
+    /// rather than building a per-request [`placement::Placement`] — a fresh
+    /// handle would reset the round-robin cursor.
+    #[must_use]
+    pub fn placement(&self) -> &std::sync::Arc<placement::Placement> {
+        &self.placement
     }
 }
 
@@ -321,6 +333,7 @@ pub fn start(cluster: &ClusterConfig, identity: &Identity, listen: &str) -> Clus
     };
     ClusterRuntime {
         peer_table,
+        placement: std::sync::Arc::new(placement::Placement::new(cluster.tiebreak)),
         _mdns: mdns,
     }
 }
