@@ -15,6 +15,7 @@ use cachette::auth::{self, AuthPolicy};
 use cachette::config::AuthMode;
 use cachette::routes;
 use cachette::state::AppState;
+use cachette::storage::{ByteStream, MemoryStorage, StorageBackend};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -26,6 +27,8 @@ const REPO: &str = "owner/cachette";
 const RUN: &str = "1";
 const SERVICE: &str = "/twirp/github.actions.results.api.v1.CacheService";
 const FIND: &str = "FindMissingOrStaleCacheEntries";
+const CREATE: &str = "CreateCacheEntry";
+const HOST: &str = "https://cache.example.com";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -44,6 +47,39 @@ fn state_with_mode(mode: AuthMode) -> AppState {
         cluster_enabled: false,
     });
     state
+}
+
+/// A merge-mode state with an in-memory backend and a configured external host,
+/// so `CreateCacheEntry` can reserve and mint absolute capability URLs.
+fn state_with_storage(mode: AuthMode) -> AppState {
+    let mut state = state_with_mode(mode);
+    state.storage = Some(Arc::new(MemoryStorage::default()));
+    state.external_url = Some(String::from(HOST));
+    state
+}
+
+fn create_body(key: &str, version: &str) -> String {
+    format!(r#"{{"key":"{key}","version":"{version}"}}"#)
+}
+
+/// Read a `GET` response from the router and return its status and JSON body.
+async fn get(router: Router, uri: &str) -> (StatusCode, Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request body"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body");
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
 }
 
 fn json_ct() -> (String, String) {
@@ -135,7 +171,7 @@ async fn all_five_methods_are_routed() {
         "GetCacheEntryDownloadURL",
         FIND,
     ] {
-        let app = routes::router(state_with_mode(AuthMode::Merge));
+        let app = routes::router(state_with_storage(AuthMode::Merge));
         let headers = [bearer(STATIC_TOKEN), json_ct()];
         let (status, body) = call(app, method, &headers, "{}").await;
         assert_eq!(status, StatusCode::OK, "method {method}, body: {body}");
@@ -314,4 +350,142 @@ async fn unknown_twirp_path_still_returns_twirp_not_found_envelope() {
         .expect("response body");
     let value: Value = serde_json::from_slice(&bytes).expect("json response");
     assert_eq!(value["code"], "not_found");
+}
+
+#[tokio::test]
+async fn create_cache_entry_returns_two_capability_urls_on_the_configured_host() {
+    let app = routes::router(state_with_storage(AuthMode::Merge));
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let (status, body) = call(app, CREATE, &headers, &create_body("build-cache", "v1")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["ok"], json!(true));
+
+    let cache_id = body["cacheId"].as_str().expect("cacheId present");
+    assert_eq!(cache_id.len(), 32, "cacheId is 32 hex chars: {cache_id}");
+    let upload = body["signedUploadUrl"].as_str().expect("signedUploadUrl");
+    let download = body["signedDownloadUrl"]
+        .as_str()
+        .expect("signedDownloadUrl");
+    assert!(
+        upload.starts_with("https://cache.example.com/v2/upload/"),
+        "{upload}"
+    );
+    assert!(
+        download.starts_with("https://cache.example.com/v2/artifacts/"),
+        "{download}"
+    );
+    assert!(
+        upload.contains(&format!("/v2/upload/{cache_id}?")),
+        "{upload}"
+    );
+    assert!(
+        download.contains(&format!("/v2/artifacts/{cache_id}?")),
+        "{download}"
+    );
+    for url in [upload, download] {
+        assert!(url.contains(&format!("id={cache_id}")), "id missing: {url}");
+        assert!(url.contains("&exp="), "exp missing: {url}");
+        assert!(url.contains("&mac="), "mac missing: {url}");
+        assert!(!url.contains(SECRET), "secret leaked into URL: {url}");
+    }
+}
+
+#[tokio::test]
+async fn create_cache_entry_open_reservation_is_a_duplicate_without_upload_url() {
+    let state = state_with_storage(AuthMode::Merge);
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let body = create_body("dup-cache", "v1");
+
+    let (status, first) = call(routes::router(state.clone()), CREATE, &headers, &body).await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    assert_eq!(first["ok"], json!(true));
+
+    let (status, second) = call(routes::router(state), CREATE, &headers, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "duplicate is 200, not 400: {second}"
+    );
+    assert_eq!(second["ok"], json!(false));
+    assert_eq!(second["otherFields"]["duplicateKey"], json!(true));
+    assert!(
+        second["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "reason present: {second}"
+    );
+    assert!(
+        second.get("signedUploadUrl").is_none(),
+        "duplicate must not carry an upload URL: {second}"
+    );
+    assert!(
+        second.get("signedDownloadUrl").is_none(),
+        "no download URL: {second}"
+    );
+}
+
+#[tokio::test]
+async fn create_cache_entry_complete_entry_is_a_duplicate() {
+    let storage = Arc::new(MemoryStorage::new());
+    let stream: ByteStream<'static> = Box::pin(std::io::Cursor::new(b"data".to_vec()));
+    storage
+        .put_stream("done-cache", stream)
+        .await
+        .expect("seed put");
+    storage.finalize("done-cache").await.expect("seed finalize");
+
+    let mut state = state_with_mode(AuthMode::Merge);
+    state.storage = Some(storage);
+    state.external_url = Some(String::from(HOST));
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let (status, body) = call(
+        routes::router(state),
+        CREATE,
+        &headers,
+        &create_body("done-cache", "v1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["otherFields"]["duplicateKey"], json!(true));
+}
+
+#[tokio::test]
+async fn create_cache_entry_signed_download_url_404s_before_content() {
+    let app = routes::router(state_with_storage(AuthMode::Merge));
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let (_, body) = call(
+        app.clone(),
+        CREATE,
+        &headers,
+        &create_body("pending-cache", "v1"),
+    )
+    .await;
+    let download = body["signedDownloadUrl"]
+        .as_str()
+        .expect("signedDownloadUrl present");
+    let path_and_query = download.strip_prefix(HOST).expect("URL uses the host");
+    assert!(path_and_query.starts_with("/v2/artifacts/"), "{download}");
+
+    let (status, _) = get(app, path_and_query).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nothing uploaded yet, so the artifact path 404s"
+    );
+}
+
+#[tokio::test]
+async fn create_cache_entry_ignores_unknown_fields() {
+    let app = routes::router(state_with_storage(AuthMode::Merge));
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let body = concat!(
+        r#"{"key":"extra-cache","version":"v1","scope":"refs/heads/main","#,
+        r#""metadata":{"repository_id":7,"scope":"refs/heads/main"},"#,
+        r#""request_id":"abc","github_actor_id":9}"#,
+    );
+    let (status, value) = call(app, CREATE, &headers, body).await;
+    assert_eq!(status, StatusCode::OK, "body: {value}");
+    assert_eq!(value["ok"], json!(true));
+    assert!(value["signedUploadUrl"].as_str().is_some(), "body: {value}");
 }

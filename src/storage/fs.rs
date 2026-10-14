@@ -626,6 +626,33 @@ impl StorageBackend for FsStorage {
         })
     }
 
+    fn reservation_exists<'a>(
+        &'a self,
+        key: &'a str,
+        now_unix: u64,
+    ) -> BoxFuture<'a, io::Result<bool>> {
+        Box::pin(async move {
+            let _gate = self.gate.read().await;
+            let conn = Arc::clone(&self.conn);
+            let key = key.to_owned();
+            let now = i64::try_from(now_unix).unwrap_or(i64::MAX);
+            blocking(move || {
+                let conn = lock(&conn)?;
+                let found: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries \
+                         WHERE artifact_key = ?1 AND complete = 0 \
+                         AND (reservation_expires_at IS NULL OR reservation_expires_at > ?2)",
+                        params![key, now],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                Ok(found > 0)
+            })
+            .await
+        })
+    }
+
     fn write_chunk<'a>(
         &'a self,
         key: &'a str,
@@ -1811,6 +1838,40 @@ mod storage_fs {
             .await
             .expect("finalize live reservation");
         assert!(storage.stat("live").await.expect("stat").is_some());
+    }
+
+    #[tokio::test]
+    async fn reservation_exists_reports_open_but_not_expired_reservations() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("open-id", "open-key", "v1", now + 3600)
+            .await
+            .expect("reserve open");
+        storage
+            .reserve("expired-id", "expired-key", "v1", now.saturating_sub(1))
+            .await
+            .expect("reserve expired");
+
+        assert!(
+            storage
+                .reservation_exists("open-key", now)
+                .await
+                .expect("open")
+        );
+        assert!(
+            !storage
+                .reservation_exists("expired-key", now)
+                .await
+                .expect("expired")
+        );
+        assert!(
+            !storage
+                .reservation_exists("absent-key", now)
+                .await
+                .expect("absent")
+        );
     }
 
     #[tokio::test]

@@ -24,6 +24,8 @@ pub struct CacheLimits {
     pub reservation_ttl_seconds: u64,
     /// `[cache] key_case`: fold applied before reserve/find matching (M11).
     pub key_case: KeyCase,
+    /// `[v1] signed_url_ttl_seconds` for capability/signed URLs.
+    pub signed_url_ttl_seconds: u64,
 }
 
 impl Default for CacheLimits {
@@ -33,6 +35,7 @@ impl Default for CacheLimits {
             min_free: MinFree::Fraction(0.2),
             reservation_ttl_seconds: 3600,
             key_case: KeyCase::Lower,
+            signed_url_ttl_seconds: crate::config::V1Config::default().signed_url_ttl_seconds,
         }
     }
 }
@@ -67,6 +70,10 @@ pub struct AppState {
     /// `CacheConfig` / `FsConfig`; `serve()` overwrites them from the loaded
     /// config.
     pub cache: CacheLimits,
+    /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
+    /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
+    /// `None` yields host-relative URLs (tests without a configured host).
+    pub external_url: Option<String>,
 }
 
 impl AppState {
@@ -83,6 +90,7 @@ impl AppState {
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(AuthPolicy::default()),
             cache: CacheLimits::default(),
+            external_url: None,
         }
     }
 }

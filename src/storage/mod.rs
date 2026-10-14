@@ -318,6 +318,16 @@ pub trait StorageBackend: Send + Sync {
         expires_at: u64,
     ) -> BoxFuture<'a, io::Result<()>>;
 
+    /// Whether an OPEN (unfinalized) reservation for artifact `key` exists and
+    /// has not expired at `now_unix` (v2 `CreateCacheEntry` duplicate rule,
+    /// plan task 24: a concurrent same-key reserve must be rejected). Finalized
+    /// entries are reported by [`Self::stat`], not here.
+    fn reservation_exists<'a>(
+        &'a self,
+        key: &'a str,
+        now_unix: u64,
+    ) -> BoxFuture<'a, io::Result<bool>>;
+
     /// Stage one chunk of a chunked upload under the reservation `key`
     /// (plan task 20), addressing part files as `parts/{key}/{start}.part`.
     ///
@@ -543,6 +553,20 @@ impl StorageBackend for MemoryStorage {
                 },
             );
             Ok(())
+        })
+    }
+
+    fn reservation_exists<'a>(
+        &'a self,
+        key: &'a str,
+        now_unix: u64,
+    ) -> BoxFuture<'a, io::Result<bool>> {
+        Box::pin(async move {
+            let state = self.inner.read().await;
+            Ok(state
+                .reservations
+                .values()
+                .any(|reservation| reservation.key == key && reservation.expires_at > now_unix))
         })
     }
 

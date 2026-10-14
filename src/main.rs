@@ -118,6 +118,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.auth = Arc::new(AuthPolicy::from_config(&config));
+    // Runner-visible base URL for capability URLs (`/v2/*`); the config
+    // resolver always derives it from `listen` when `external_url` is unset.
+    state.external_url = config.server.external_url.clone();
     // Cache limits (plan task 19): the reserve handler reports capacity and
     // stamps reservation expiry from these numbers, so thread `[cache]` /
     // `[storage.fs]` onto the request path.
@@ -126,6 +129,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         min_free: config.storage.fs.min_free,
         reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
         key_case: config.cache.key_case,
+        signed_url_ttl_seconds: config.v1.signed_url_ttl_seconds,
     };
 
     // Storage + reaper (plan task 34). One `FsStorage` is constructed here and
