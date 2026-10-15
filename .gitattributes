@@ -1,0 +1,4 @@
+# Shell hooks are executed directly by Git, so they MUST keep LF line endings
+# even on Windows checkouts (a CRLF line makes /bin/sh fail with
+# "$'\r': command not found"). core.autocrlf=true would otherwise rewrite them.
+.githooks/* text eol=lf
