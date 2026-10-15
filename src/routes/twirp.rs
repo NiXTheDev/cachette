@@ -14,10 +14,10 @@
 //! | method | request | response |
 //! |---|---|---|
 //! | `CreateCacheEntry` | `metadata`, `key`, `version`, `scope` | `{"ok","signedUploadUrl","signedDownloadUrl","cacheId"}` (task 24) |
-//! | `FinalizeCacheEntryUpload` | `metadata`, `key`, `sizeBytes`, `version` | `{"ok":false}` |
-//! | `SupersedeCacheEntry` | `metadata`, `key`, `version` | `{"ok":false}` |
-//! | `GetCacheEntryDownloadURL` | `metadata`, `key`, `restoreKeys`, `version` | `{"signedDownloadUrl":""}` |
-//! | `FindMissingOrStaleCacheEntries` | `keyVersions` | `{"cacheEntries":[]}` |
+//! | `FinalizeCacheEntryUpload` | `metadata`, `key`, `sizeBytes`, `version`, `cacheId` | `{"ok":true}` or `{"ok":false,"message":"..."}` |
+//! | `SupersedeCacheEntry` | `metadata`, `key`, `version` | `{"ok":true}` |
+//! | `GetCacheEntryDownloadURL` | `metadata`, `key`, `restoreKeys`, `version` | `{"ok":true,"signedDownloadUrl":"...","matchedKey":"..."}` or `{"ok":false,"signedDownloadUrl":""}` |
+//! | `FindMissingOrStaleCacheEntries` | `keyVersions` | `{"cacheEntries":[{"key","version","size","creationTime"}]}` |
 //!
 //! Auth policy on `/twirp/*` (mirrors the v1 handler matrix):
 //! * static tokens (`[auth] tokens` + the dynamic `TokenStore`) are accepted in
@@ -41,7 +41,7 @@ use crate::config::AuthMode;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
-use crate::storage::normalize_key;
+use crate::storage::{Entry, Version, lookup, normalize_key};
 
 /// The five `CacheService` methods this node answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,10 +98,12 @@ pub async fn dispatch(
     }
     match known {
         Method::CreateCacheEntry => create_cache_entry(&state, &body).await,
-        Method::FinalizeCacheEntryUpload => Json(json!({"ok": false})).into_response(),
-        Method::SupersedeCacheEntry => Json(json!({"ok": false})).into_response(),
-        Method::GetCacheEntryDownloadURL => Json(json!({"signedDownloadUrl": ""})).into_response(),
-        Method::FindMissingOrStaleCacheEntries => Json(json!({"cacheEntries": []})).into_response(),
+        Method::FinalizeCacheEntryUpload => finalize_cache_entry(&state, &body).await,
+        Method::SupersedeCacheEntry => supersede_cache_entry(&state, &body).await,
+        Method::GetCacheEntryDownloadURL => get_cache_entry_download_url(&state, &body).await,
+        Method::FindMissingOrStaleCacheEntries => {
+            find_missing_or_stale_cache_entries(&state, &body).await
+        }
     }
 }
 
@@ -113,8 +115,58 @@ const UPLOAD_PATH_PREFIX: &str = "/v2/upload/";
 const ARTIFACT_PATH_PREFIX: &str = "/v2/artifacts/";
 
 // HMAC secret fallback when `auth.secret` is unset is shared with the upload
-// route ([`super::signing_secret`] / [`super::FALLBACK_SIGNING_SECRET`]) so
-// minting and validation always agree.
+// and download routes ([`super::signing_secret`] /
+// [`super::FALLBACK_SIGNING_SECRET`]) so minting and validation always agree.
+
+/// `FinalizeCacheEntryUpload` request (go-actions-cache proto fields `key`,
+/// `version`, `sizeBytes`, `cacheId`). Only `key`, `sizeBytes`, and `cacheId`
+/// are consumed: the published entry is addressed by its artifact key, and the
+/// proto's `metadata`/`version` are ignored (serde drops unknown fields).
+#[derive(serde::Deserialize)]
+struct FinalizeCacheEntryUploadRequest {
+    #[serde(default)]
+    key: String,
+    #[serde(default, alias = "sizeBytes")]
+    size_bytes: Option<u64>,
+    #[serde(default, alias = "cacheId")]
+    cache_id: Option<String>,
+}
+
+/// `SupersedeCacheEntry` request (go-actions-cache proto fields `metadata`,
+/// `key`, `version`). The entry is deleted by its normalized key.
+#[derive(serde::Deserialize)]
+struct SupersedeCacheEntryRequest {
+    #[serde(default)]
+    key: String,
+}
+
+/// `GetCacheEntryDownloadURL` request (go-actions-cache proto fields `metadata`,
+/// `key`, `restoreKeys`, `version`).
+#[derive(serde::Deserialize)]
+struct GetCacheEntryDownloadURLRequest {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default, alias = "restoreKeys")]
+    restore_keys: Option<Vec<String>>,
+}
+
+/// A single key-version pair for FindMissing.
+#[derive(serde::Deserialize, Clone)]
+struct KeyVersion {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// `FindMissingOrStaleCacheEntries` request.
+#[derive(serde::Deserialize)]
+struct FindMissingOrStaleCacheEntriesRequest {
+    #[serde(default, alias = "keyVersions")]
+    key_versions: Vec<KeyVersion>,
+}
 
 /// `CreateCacheEntry` request. `key`/`version` are the reservation identity;
 /// `scope` (`refs/heads/main`-style or a sha) is stored verbatim and never
@@ -242,6 +294,258 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
     .into_response()
 }
 
+/// `FinalizeCacheEntryUpload` (plan task 26): the runner reports the uploaded
+/// size for a reservation it just assembled. The B5 commit (tasks 21/25) has
+/// already published the entry under its artifact key, so this only verifies
+/// the blob is present (and, when given, that `sizeBytes` matches).
+///
+/// * blob present, size matches (or omitted) → 200 `{"ok":true}`;
+/// * blob present, size mismatched → 200 `{"ok":false,"message":"size mismatch"}`
+///   (a client error, deliberately NOT 500);
+/// * blob absent → HTTP 500 with `{"ok":false,...}` — never `ok:true`.
+///
+/// Single-node: the blob is local. In cluster mode the owning node may be a
+/// peer; task 32 forwards this call to `POST B/_internal/peers/v2/finalize`.
+async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
+    let request: FinalizeCacheEntryUploadRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return ApiError::BadRequest(format!(
+                "malformed FinalizeCacheEntryUpload request: {err}"
+            ))
+            .into_twirp_response();
+        }
+    };
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_twirp_response();
+    };
+    let key = normalize_key(&request.key, state.cache.key_case);
+    // Cluster seam (plan tasks 31/32): on entry node A a finalize for a blob
+    // owned by B is forwarded to B's peer route; single-node serving is complete.
+    if state.auth.cluster_enabled {
+        tracing::debug!(
+            key = %key,
+            cache_id = ?request.cache_id,
+            "v2 finalize: cluster mode (peer forwarding wired in task 32)"
+        );
+    }
+    // The published entry is addressed by its artifact key (B5 commit). Fall
+    // back to the reservation `cacheId` for a backend that publishes under the
+    // reservation id instead.
+    let stat = match storage.stat(&key).await {
+        Ok(Some(stat)) => Some(stat),
+        Ok(None) => match request.cache_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(cache_id) => match storage.stat(cache_id).await {
+                Ok(found) => found,
+                Err(err) => {
+                    tracing::error!(error = %err, "v2 finalize: stat failed");
+                    return ApiError::Internal.into_twirp_response();
+                }
+            },
+            None => None,
+        },
+        Err(err) => {
+            tracing::error!(error = %err, "v2 finalize: stat failed");
+            return ApiError::Internal.into_twirp_response();
+        }
+    };
+    let Some(stat) = stat else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": "cache entry blob not found"})),
+        )
+            .into_response();
+    };
+    if let Some(size) = request.size_bytes
+        && size != stat.size
+    {
+        return Json(json!({"ok": false, "message": "size mismatch"})).into_response();
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+/// `SupersedeCacheEntry` (plan task 26): delete the entry for the normalized
+/// key so a follow-up `CreateCacheEntry` is no longer a duplicate. Idempotent —
+/// superseding a missing key is still `{"ok":true}`.
+///
+/// Single-node: deletes locally. In cluster mode task 32 forwards this to the
+/// owner (`POST B/_internal/peers/v2/supersede`).
+async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
+    let request: SupersedeCacheEntryRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return ApiError::BadRequest(format!("malformed SupersedeCacheEntry request: {err}"))
+                .into_twirp_response();
+        }
+    };
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_twirp_response();
+    };
+    let key = normalize_key(&request.key, state.cache.key_case);
+    if state.auth.cluster_enabled {
+        tracing::debug!(key = %key, "v2 supersede: cluster mode (peer forwarding wired in task 32)");
+    }
+    if let Err(err) = storage.delete(&key).await {
+        tracing::error!(error = %err, "v2 supersede: delete failed");
+        return ApiError::Internal.into_twirp_response();
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+/// `GetCacheEntryDownloadURL` (plan task 26): find a complete entry for `key`
+/// (falling back through `restoreKeys` in order, exactly like
+/// [`v1::find`](super::v1)) and mint a signed download URL bound to
+/// `/v2/artifacts/{matchedKey}` on `server.external_url`.
+///
+/// Hit → 200 `{"ok":true,"signedDownloadUrl":"...","matchedKey":"..."}`;
+/// miss → 200 `{"ok":false,"signedDownloadUrl":""}`. The proto field is
+/// `signedDownloadUrl`.
+///
+/// Single-node: mints locally. In cluster mode task 32 forwards this to the
+/// owner (`POST B/_internal/peers/v2/getdownloadurl`).
+async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response {
+    let request: GetCacheEntryDownloadURLRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return ApiError::BadRequest(format!(
+                "malformed GetCacheEntryDownloadURL request: {err}"
+            ))
+            .into_twirp_response();
+        }
+    };
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_twirp_response();
+    };
+    let key = normalize_key(&request.key, state.cache.key_case);
+    if state.auth.cluster_enabled {
+        tracing::debug!(key = %key, "v2 getdownloadurl: cluster mode (peer forwarding wired in task 32)");
+    }
+    let mut lookup_keys = vec![key];
+    if let Some(restore_keys) = &request.restore_keys {
+        lookup_keys.extend(
+            restore_keys
+                .iter()
+                .map(|restore| normalize_key(restore, state.cache.key_case)),
+        );
+    }
+    let finalized = match storage.list().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::error!(error = %err, "v2 getdownloadurl: listing entries failed");
+            return ApiError::Internal.into_twirp_response();
+        }
+    };
+    // `list` yields `EntryStat` (no protocol version); stamp the requested
+    // version so `lookup`'s version-filtered exact-then-prefix pass runs (the
+    // same skeleton-only stand-in `v1::find` documents).
+    let candidates: Vec<Entry> = finalized
+        .into_iter()
+        .map(|stat| Entry {
+            key: stat.key,
+            version: request.version.clone(),
+            size: stat.size,
+            created_at: stat.created_at,
+            accessed_at: stat.accessed_at,
+            complete: true,
+        })
+        .collect();
+    match lookup(
+        &candidates,
+        &lookup_keys,
+        &Version::from(request.version.as_str()),
+        state.cache.key_case,
+    ) {
+        Some(entry) => {
+            let matched_key = entry.key.clone();
+            let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
+            let signed = format!(
+                "{}{artifact_path}{}",
+                state.external_url.as_deref().unwrap_or_default(),
+                urls::mint(
+                    &artifact_path,
+                    &matched_key,
+                    super::signing_secret(state),
+                    state.cache.signed_url_ttl_seconds,
+                    auth::now_secs(),
+                )
+                .query()
+            );
+            Json(json!({
+                "ok": true,
+                "signedDownloadUrl": signed,
+                "matchedKey": matched_key,
+            }))
+            .into_response()
+        }
+        None => Json(json!({"ok": false, "signedDownloadUrl": ""})).into_response(),
+    }
+}
+
+/// `FindMissingOrStaleCacheEntries` (plan task 26): report the requested
+/// key-version pairs that are PRESENT as complete entries. Missing pairs are
+/// implicitly absent from `cacheEntries`.
+///
+/// Single-node: reports this node's entries. In cluster mode task 32 fans the
+/// query out across healthy peers and unions the responses
+/// (`POST B/_internal/peers/v2/findmissing`).
+async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> Response {
+    let request: FindMissingOrStaleCacheEntriesRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => {
+            return ApiError::BadRequest(format!(
+                "malformed FindMissingOrStaleCacheEntries request: {err}"
+            ))
+            .into_twirp_response();
+        }
+    };
+    if state.auth.cluster_enabled {
+        tracing::debug!("v2 findmissing: cluster mode (peer fan-out wired in task 32)");
+    }
+    let Some(storage) = state.storage.as_deref() else {
+        return Json(json!({"cacheEntries": []})).into_response();
+    };
+    let finalized = match storage.list().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::error!(error = %err, "v2 findmissing: listing entries failed");
+            return ApiError::Internal.into_twirp_response();
+        }
+    };
+    let mut cache_entries: Vec<serde_json::Value> = Vec::new();
+    for key_version in &request.key_versions {
+        let key = normalize_key(&key_version.key, state.cache.key_case);
+        let version = key_version.version.clone();
+        let candidates: Vec<Entry> = finalized
+            .iter()
+            .filter(|stat| stat.key == key)
+            .map(|stat| Entry {
+                key: stat.key.clone(),
+                version: version.clone(),
+                size: stat.size,
+                created_at: stat.created_at,
+                accessed_at: stat.accessed_at,
+                complete: true,
+            })
+            .collect();
+        if let Some(hit) = lookup(
+            &candidates,
+            &[key],
+            &Version::from(version.as_str()),
+            state.cache.key_case,
+        ) {
+            cache_entries.push(json!({
+                "key": hit.key.clone(),
+                "version": version,
+                "size": hit.size,
+                "creationTime": hit.created_at,
+            }));
+        }
+    }
+    Json(json!({"cacheEntries": cache_entries})).into_response()
+}
 /// Duplicate-entry body (plan task 24): HTTP 200 `{"ok":false,...}` with the
 /// `otherFields.duplicateKey` flag and a human reason — deliberately NOT 400.
 fn duplicate_entry_response() -> Response {

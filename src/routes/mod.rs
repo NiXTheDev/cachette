@@ -13,6 +13,7 @@
 mod health;
 mod twirp;
 mod v1;
+mod v2_download;
 mod v2_upload;
 
 use std::sync::Arc;
@@ -61,14 +62,16 @@ pub fn router(state: AppState) -> Router {
         "/twirp/github.actions.results.api.v1.CacheService/{method}",
         post(twirp::dispatch),
     );
-    let v2_upload_routes = Router::new().route("/v2/upload/{entryId}", put(v2_upload::upload));
+    let v2_routes = Router::new()
+        .route("/v2/upload/{entryId}", put(v2_upload::upload))
+        .route("/v2/artifacts/{entryId}", get(v2_download::download));
     Router::new()
         .route("/health", get(health::health))
         .merge(peer_routes)
         .merge(admin_routes)
         .merge(v1_routes)
         .merge(twirp_routes)
-        .merge(v2_upload_routes)
+        .merge(v2_routes)
         .with_state(state.clone())
         .fallback(fallback_404)
         .method_not_allowed_fallback(fallback_405)

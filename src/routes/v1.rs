@@ -408,7 +408,13 @@ fn duplicate_response(key: &str) -> Response {
 }
 
 /// Read a finalized entry's `range` into memory (test/skeleton-scale payloads).
-async fn read_range(storage: &dyn StorageBackend, key: &str, range: Range<u64>) -> Option<Vec<u8>> {
+/// Shared with the v2 artifact download (plan task 26) so both protocols slice
+/// bytes identically.
+pub(crate) async fn read_range(
+    storage: &dyn StorageBackend,
+    key: &str,
+    range: Range<u64>,
+) -> Option<Vec<u8>> {
     let mut stream = storage.get_range(key, range).await.ok()?;
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await.ok()?;
@@ -418,7 +424,7 @@ async fn read_range(storage: &dyn StorageBackend, key: &str, range: Range<u64>) 
 /// Parse a single `Range: bytes=a-b` request against `size` into an inclusive
 /// `(start, end)`. Supports open ends (`bytes=a-`) and suffixes (`bytes=-n`);
 /// multi-range and out-of-bounds requests return `None` (→ 416).
-fn parse_range(raw: &str, size: u64) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(raw: &str, size: u64) -> Option<(u64, u64)> {
     if size == 0 {
         return None;
     }
@@ -447,7 +453,7 @@ fn parse_range(raw: &str, size: u64) -> Option<(u64, u64)> {
 }
 
 /// 416 response with `Content-Range: bytes */<size>` (RFC 9110).
-fn range_not_satisfiable(size: u64) -> Response {
+pub(crate) fn range_not_satisfiable(size: u64) -> Response {
     (
         StatusCode::RANGE_NOT_SATISFIABLE,
         [

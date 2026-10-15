@@ -174,8 +174,29 @@ async fn all_five_methods_are_routed() {
         let app = routes::router(state_with_storage(AuthMode::Merge));
         let headers = [bearer(STATIC_TOKEN), json_ct()];
         let (status, body) = call(app, method, &headers, "{}").await;
-        assert_eq!(status, StatusCode::OK, "method {method}, body: {body}");
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "method {method} must be routed, body: {body}"
+        );
     }
+}
+
+#[tokio::test]
+async fn finalize_without_a_published_blob_is_500_not_ok() {
+    // A routed-but-unknown finalize is a hard error: it must never answer
+    // `ok:true` when the blob is absent (plan task 26).
+    let app = routes::router(state_with_storage(AuthMode::Merge));
+    let headers = [bearer(STATIC_TOKEN), json_ct()];
+    let (status, body) = call(
+        app,
+        "FinalizeCacheEntryUpload",
+        &headers,
+        r#"{"key":"ghost-cache","version":"v1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["ok"], json!(false));
 }
 
 #[tokio::test]
