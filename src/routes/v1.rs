@@ -10,9 +10,9 @@
 //!   and an **empty** 204 on a miss.
 //! - `POST /_apis/artifactcache/caches` — reserve: rejects a duplicate finalized
 //!   `(key, version)` with 409, stages an expiry-stamped reservation under a
-//!   fresh 32-hex `cacheId`, and reports `cacheSize = max(0, max_size -
-//!   used_bytes)`. Version siblings live behind the artifact-key primary index
-//!   (tasks 30/31).
+//!   fresh numeric `cacheId` (GitHub's v1 contract), and reports `cacheSize =
+//!   max(0, max_size - used_bytes)`. Version siblings live behind the
+//!   artifact-key primary index (tasks 30/31).
 //! - `PATCH /_apis/artifactcache/caches/{cacheId}` — accepts a chunk and
 //!   returns 204. The parts/resume machinery lands in task 20.
 //! - `POST /_apis/artifactcache/caches/{cacheId}` `{size}` — commit: assemble
@@ -31,9 +31,10 @@
 //!   no protocol `version`; the requested version is stamped onto the candidate
 //!   entries so `lookup`'s exact-then-prefix ordering is exercised end-to-end
 //!   until task 19/21 add the versioned reservation index.
-//! - `archiveLocation` is a **relative** path. `AppState` does not carry
-//!   `server.external_url` (main.rs is task-34-owned), so a later task must
-//!   prefix the absolute host when the value becomes available.
+//! - `archiveLocation` is absolute when `server.external_url` is known
+//!   (production always resolves it from `listen`) and host-relative otherwise
+//!   (unit fixtures that omit the host). Real clients GET it verbatim, so the
+//!   absolute value is required off-box (task 22).
 
 use std::collections::HashMap;
 use std::io;
@@ -157,7 +158,12 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
                 SIGNED_URL_TTL_SECONDS,
                 auth::now_secs(),
             );
-            let archive_location = format!("{path}{}", signed.query());
+            // Absolute when `server.external_url` is known (production always
+            // resolves it from `listen`); host-relative otherwise. Real clients
+            // (`@actions/cache`, `go-actions-cache`) GET this value verbatim, so
+            // a bare relative path breaks them (task 22).
+            let base = state.external_url.as_deref().unwrap_or_default();
+            let archive_location = format!("{base}{path}{}", signed.query());
             Json(json!({
                 "result": "hit",
                 "cacheKey": cache_key,
@@ -171,8 +177,9 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
 
 /// `POST /_apis/artifactcache/caches` — reserve a new entry.
 ///
-/// 200 `{"cacheId":"<32-hex>","cacheSize":<n>}` where
-/// `cacheSize = max(0, cache.max_size - used_bytes)`; 409 with the GitHub
+/// 200 `{"cacheId":<n>,"cacheSize":<n>}` where the `cacheId` is a positive
+/// numeric handle (GitHub's v1 contract) and `cacheSize =
+/// max(0, cache.max_size - used_bytes)`; 409 with the GitHub
 /// duplicate body when a finalized entry already holds `(key, version)`.
 pub async fn reserve(
     State(state): State<AppState>,
@@ -217,11 +224,12 @@ pub async fn reserve(
     }
     let cache_size = state.cache.max_size.saturating_sub(used);
     let cache_id = generate_cache_id(&key, &request.version);
+    let cache_id_key = cache_id.to_string();
     let expires_at = u64::try_from(auth::now_secs())
         .unwrap_or(0)
         .saturating_add(state.cache.reservation_ttl_seconds);
     if let Err(err) = storage
-        .reserve(&cache_id, &key, &request.version, expires_at)
+        .reserve(&cache_id_key, &key, &request.version, expires_at)
         .await
     {
         tracing::error!(error = %err, "v1 reserve: staging reservation failed");
@@ -337,16 +345,18 @@ pub async fn download(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
-        return ApiError::Unavailable(String::from("storage backend not configured"))
-            .into_response();
-    };
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
     if requires_signed_url(&state) {
         let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
         if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
             return ApiError::from(err).into_response();
         }
     }
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     let size = match storage.stat(&cache_id).await {
         Ok(Some(stat)) => stat.size,
         Ok(None) => return ApiError::not_found().into_response(),
@@ -519,14 +529,23 @@ fn requires_signed_url(state: &AppState) -> bool {
     state.auth.cluster_enabled || matches!(state.auth.mode, AuthMode::Bearer | AuthMode::Merge)
 }
 
-/// Generate a fresh 32-hex-char `cacheId`.
+/// Generate a fresh numeric `cacheId`.
 ///
-/// No `uuid`/`rand` dependency is available (and none may be added for this
-/// task), so this is a FNV-1a hash of `key|version|now|sequence` with a
-/// splitmix64 avalanche. The process-wide atomic sequence makes ids unique
-/// even for identical key/version reservations within the same second; lower
-/// 64 bits expose the sequence for easy debugging. Task 19 may swap in a UUID.
-fn generate_cache_id(key: &str, version: &str) -> String {
+/// GitHub's v1 contract is a unique (notionally incrementing) positive integer
+/// (api.md: "Numeric unique ID used in next requests"); the vendored
+/// `go-actions-cache` parses it into `int` and rejects `0`, and the JS
+/// `@actions/cache` toolkit round-trips it through a `number`, so it must stay
+/// within `Number.MAX_SAFE_INTEGER` (2^53 - 1) or the toolkit's rounded value
+/// 404s the subsequent `PATCH`/`POST`. No `uuid`/`rand` dependency is available
+/// (and none may be added), so this is a FNV-1a hash of
+/// `key|version|now|sequence` with a splitmix64 avalanche, masked to 53 bits
+/// (`hash & (2^53 - 1) | 1`, nonzero and JS-safe). The process-wide atomic
+/// sequence keeps ids unique even for identical key/version reservations
+/// within the same second.
+fn generate_cache_id(key: &str, version: &str) -> u64 {
+    /// `Number.MAX_SAFE_INTEGER`; larger ids lose precision in the JS toolkit.
+    const MAX_SAFE_CACHE_ID: u64 = (1 << 53) - 1;
+
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
 
@@ -548,7 +567,8 @@ fn generate_cache_id(key: &str, version: &str) -> String {
     hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
     hash ^= hash >> 31;
 
-    format!("{hash:016x}{sequence:016x}")
+    // Force nonzero (`go-actions-cache` treats `cacheID == 0` as a failure).
+    (hash & MAX_SAFE_CACHE_ID) | 1
 }
 
 #[cfg(test)]
@@ -574,11 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_id_is_32_lowercase_hex_and_unique_per_call() {
+    fn cache_id_is_positive_nonzero_and_unique_per_call() {
         let first = generate_cache_id("k", "2");
         let second = generate_cache_id("k", "2");
-        assert_eq!(first.len(), 32);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(first > 0, "cacheId must be nonzero: {first}");
+        // Bounded by JS `Number.MAX_SAFE_INTEGER` so the toolkit's `number`
+        // round trip does not round the id and 404 the next request.
+        assert!(
+            first <= 9_007_199_254_740_991,
+            "cacheId must be a safe JS integer: {first}"
+        );
         assert_ne!(first, second, "sequence must keep ids unique");
     }
 

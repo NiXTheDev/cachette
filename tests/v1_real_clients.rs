@@ -1,7 +1,7 @@
-//! Plan task 22 — prove the v1 artifactcache protocol against the *real*
+//! Plan task 22 â€” prove the v1 artifactcache protocol against the *real*
 //! clients that GitHub Actions runners use in production:
 //!
-//! * the GitHub Actions toolkit — `@actions/cache` v3 (the `toolkit.js`
+//! * the GitHub Actions toolkit â€” `@actions/cache` v3 (the `toolkit.js`
 //!   fixture drives its public `saveCache` / `restoreCache` API), and
 //! * the vendored `github.com/tonistiigi/go-actions-cache` client (the `gac`
 //!   fixture, the library `docker buildx --cache-to type=gha` uses).
@@ -14,9 +14,9 @@
 //! JWT-shaped); the token is registered as a static token so the server accepts
 //! it too. The scenarios are:
 //!
-//! * toolkit: `miss → save → lookup(hit) → restore`
-//! * go-actions-cache: `miss → cross-client find → cross-client restore → save
-//!   → restore`
+//! * toolkit: `miss â†’ save â†’ lookup(hit) â†’ restore`
+//! * go-actions-cache: `miss â†’ cross-client find â†’ cross-client restore â†’ save
+//!   â†’ restore`
 //! * a bare, correctly-signed `GET` of the artifact URL with no bearer token,
 //!   exactly what both clients' download path issues.
 //!
@@ -26,37 +26,28 @@
 //! # The two tests
 //!
 //! * [`v1_real_clients_characterize_contract`] runs by default. It asserts
-//!   everything the current server does correctly and, for the round-trip,
-//!   asserts EITHER a byte-identical sha256 restore OR the precise known server
-//!   gap (below). It always prints the full client transcripts so a failure is
-//!   never silent.
+//!   everything the server does correctly and tolerates the known server gaps
+//!   (below) so a failure is always accompanied by the full client transcripts.
 //! * [`v1_real_clients_byte_identical_round_trip`] is the strict acceptance
-//!   test from the plan. It is `#[ignore]`d because the current v1 server
-//!   cannot satisfy it; run it with
-//!   `cargo test --test v1_real_clients -- --ignored` once the gaps below are
-//!   fixed.
+//!   test from the plan: both clients must round-trip byte-identically and the
+//!   signed `archiveLocation` alone must authorize the download.
 //!
-//! # Known v1 server gaps surfaced by the real clients
+//! # v1 server compliance fixed for these real clients
 //!
-//! These are server defects. Task 22 owns only `tests/fixtures/**` and this
-//! file, so they are **reported, not fixed here** (see `tests/fixtures/README.md`
-//! and the task-22 evidence file for the transcripts):
+//! The real clients surfaced three v1 server defects, all now fixed:
 //!
-//! 1. `GET /_apis/artifactcache/cache` returns a **relative** `archiveLocation`
-//!    — `src/routes/v1.rs::find` ignores `AppState::external_url`. The toolkit
-//!    runs `new URL(archiveLocation)`, which throws `Invalid URL`; the Go client
-//!    issues the GET verbatim and fails with `unsupported protocol scheme ""`.
-//! 2. `POST /_apis/artifactcache/caches` returns `cacheId` as a 32-hex
-//!    **string**; the Go client unmarshals it into `ReserveCacheResp.CacheID
-//!    int`, so `Save` fails with `json: cannot unmarshal string into Go struct
-//!    field ReserveCacheResp.cacheId of type int`. GitHub's v1 contract uses a
-//!    numeric `cacheId`.
-//! 3. `auth::require_auth` gates every `/_apis/artifactcache/*` request,
-//!    including the artifact download. The toolkit's download client is a bare
-//!    `HttpClient('actions/cache')` with **no** bearer handler, so even with an
-//!    absolute, signed `archiveLocation` the download is rejected with `401
-//!    {"error":"authentication required"}`; the signed URL alone is supposed to
-//!    authorize the download (the test isolates this with a raw signed GET).
+//! 1. `find` returns an **absolute** `archiveLocation`: it prefixes
+//!    `AppState::external_url`, which production resolves from `listen`. The
+//!    toolkit runs `new URL(archiveLocation)` and the Go client issues the GET
+//!    verbatim, so a bare relative path breaks both.
+//! 2. `reserve` returns a **numeric** `cacheId` (GitHub's v1 contract). The Go
+//!    client unmarshals it into `ReserveCacheResp.CacheID int` (and rejects 0),
+//!    and the JS toolkit round-trips it through a `number`, so the id is kept
+//!    within `Number.MAX_SAFE_INTEGER`.
+//! 3. `auth::require_auth` exempts the `/_apis/artifactcache/artifacts/`
+//!    download path: both clients follow `archiveLocation` with **no**
+//!    `Authorization` header, so the signed URL alone authorizes the download
+//!    (`v1::download` still enforces the signature).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -249,7 +240,7 @@ impl Outcome {
     }
 
     fn report(&self) {
-        eprintln!("\n================= task 22 · v1 real-client transcripts =================");
+        eprintln!("\n================= task 22 Â· v1 real-client transcripts =================");
         eprintln!("server endpoint: {}", self.endpoint);
         for (label, observed) in self.steps() {
             eprintln!("\n### {label}\n{}", observed.transcript());
@@ -346,7 +337,7 @@ impl Outcome {
         // 4b. Cross-client download: the Go client must be able to download the
         // entry the toolkit created, or reproduce the relative-URL gap. The two
         // clients use different archive formats (the toolkit stores tar.gz, the
-        // Go client a raw blob), so only download *success* is asserted here —
+        // Go client a raw blob), so only download *success* is asserted here â€”
         // never payload-byte equality.
         match self.go_cross_client_restore.result().as_deref() {
             Some("restored") => {}
@@ -530,7 +521,6 @@ async fn v1_real_clients_characterize_contract() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "strict plan-task-22 acceptance: fails until the v1 server serves an absolute signed archiveLocation, authorizes the artifact download by the signed URL alone, and returns a numeric cacheId"]
 async fn v1_real_clients_byte_identical_round_trip() {
     let outcome = run_scenarios()
         .await
@@ -656,7 +646,7 @@ async fn run_scenarios() -> Result<Outcome, String> {
     ));
 
     // Probe the artifact route with a *correctly signed* URL but no bearer
-    // token — exactly what both real clients' download path issues. If the
+    // token â€” exactly what both real clients' download path issues. If the
     // server answers 200 the signed URL alone authorizes the download; a 401
     // proves the global `require_auth` layer wrongly gates it.
     let artifact_path = format!("/_apis/artifactcache/artifacts/{TOOLKIT_KEY}");

@@ -493,11 +493,23 @@ async fn signed_url_primitive_over_tls() {
     let now = now_secs();
     let signed = auth::urls::mint(path, "42", SECRET, 900, now);
 
-    // The minted query really travels the loopback TLS connection (the auth
-    // gate has no v1 credential here, so the observed 401 proves transport).
+    // The minted query really travels the loopback TLS connection. The
+    // artifact path is authorized by its signed URL alone (task 22), so a valid
+    // signature passes the download gate and reaches the handler (this fixture
+    // has no storage, so the handler reports 503); an unsigned request is still
+    // rejected with 403 at the download gate.
     let url = format!("{path}{}", signed.query());
     let (status, body) = request(addr, client_config(&pki, None), "GET", &url, &[]).await;
-    assert_auth_rejected(status, &body, "signed-url GET over TLS");
+    assert_eq!(
+        status, 503,
+        "signed-url GET over TLS must reach the download handler: {body}"
+    );
+    let (unsigned_status, unsigned_body) =
+        request(addr, client_config(&pki, None), "GET", path, &[]).await;
+    assert_eq!(
+        unsigned_status, 403,
+        "an unsigned artifact GET must be rejected by the download gate: {unsigned_body}"
+    );
 
     // C16 — minted params validate against the exact bound path.
     let params = HashMap::from([

@@ -230,12 +230,8 @@ async fn reserve_returns_200_with_fresh_cache_id_and_zero_size() {
     .await;
     assert_eq!(reply.status, StatusCode::OK);
     let body = json_body_of(&reply);
-    let cache_id = body["cacheId"].as_str().expect("cacheId string");
-    assert_eq!(cache_id.len(), 32, "cacheId: {cache_id}");
-    assert!(
-        cache_id.chars().all(|c| c.is_ascii_hexdigit()),
-        "cacheId not hex: {cache_id}"
-    );
+    let cache_id = body["cacheId"].as_u64().expect("cacheId number");
+    assert!(cache_id > 0, "cacheId must be nonzero: {cache_id}");
     assert_eq!(body["cacheSize"], 0);
 }
 
@@ -616,9 +612,9 @@ async fn reserve(app: &Router, key: &str, version: &str) -> String {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "reserve {key} v{version}");
     json_body_of(&reply)["cacheId"]
-        .as_str()
-        .expect("cacheId string")
-        .to_owned()
+        .as_u64()
+        .expect("cacheId number")
+        .to_string()
 }
 
 async fn commit(app: &Router, cache_id: &str, size: u64) -> Reply {
@@ -1024,6 +1020,55 @@ async fn download_requires_signed_url_in_bearer_mode() {
     .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(json_body_of(&reply)["error"], "invalid or expired url");
+}
+
+/// Task 22: a correctly signed artifact URL authorizes the download on its own
+/// — real clients follow `archiveLocation` with no `Authorization` header, so
+/// the HMAC/bearer gate must not reject it (the signed URL is the credential).
+#[tokio::test]
+async fn download_signed_url_authorizes_without_bearer() {
+    let app = routes::router(fixture_state().await);
+    let reply = call(
+        &app,
+        "GET",
+        &signed_url(FIXTURE_KEY),
+        None,
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_slice(), FIXTURE_BODY);
+}
+
+/// Task 22: `find` returns an **absolute** `archiveLocation` once
+/// `server.external_url` is configured (production always resolves it from
+/// `listen`); clients `GET` the value verbatim.
+#[tokio::test]
+async fn find_returns_absolute_archive_location_when_external_url_configured() {
+    let mut state = fixture_state().await;
+    state.external_url = Some(String::from("https://cache.example.test"));
+    let app = routes::router(state);
+    let reply = call(
+        &app,
+        "GET",
+        "/_apis/artifactcache/cache?keys=nginx-src-1.30.5&version=2",
+        Some(TOKEN),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let location = json_body_of(&reply)["archiveLocation"]
+        .as_str()
+        .expect("archiveLocation string")
+        .to_owned();
+    assert!(
+        location.starts_with(
+            "https://cache.example.test/_apis/artifactcache/artifacts/nginx-src-1.30.5?id="
+        ),
+        "archiveLocation must be absolute: {location}"
+    );
 }
 
 #[tokio::test]

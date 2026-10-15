@@ -31,6 +31,16 @@ pub use urls::{SignedUrl, UrlError};
 /// Path prefix guarded by [`require_auth`]; plan task 18 owns the handlers.
 pub const ARTIFACTCACHE_PREFIX: &str = "/_apis/artifactcache";
 
+/// Artifact **downloads** are authorized by their signed URL alone: the GitHub
+/// contract calls `archiveLocation` "already authenticated", and both real
+/// clients (`@actions/cache`, `go-actions-cache`) follow it with **no**
+/// `Authorization` header. They are therefore exempt from the HMAC/bearer gate
+/// here; `routes::v1::download` still enforces `?id&exp&mac` whenever signed
+/// URLs are required (bearer/merge modes, or any cluster) and permits a bare
+/// GET only in pure single-node HMAC (the Forgejo proxy pattern, task 21
+/// M2/M3). See plan task 22.
+pub const ARTIFACT_DOWNLOAD_PREFIX: &str = "/_apis/artifactcache/artifacts/";
+
 /// Auth policy snapshot: mode, admin secret, HMAC staleness window, static
 /// bearer tokens, and whether cluster mode is on (loopback admin bypass).
 #[derive(Clone, Debug)]
@@ -74,7 +84,8 @@ impl Default for AuthPolicy {
 /// a path-scoped layer instead: requests outside the prefix pass through
 /// untouched, everything under it must authenticate.
 pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if !request.uri().path().starts_with(ARTIFACTCACHE_PREFIX) {
+    let path = request.uri().path();
+    if !path.starts_with(ARTIFACTCACHE_PREFIX) || path.starts_with(ARTIFACT_DOWNLOAD_PREFIX) {
         return next.run(request).await;
     }
     let authorized = match state.auth.mode {
