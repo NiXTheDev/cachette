@@ -18,7 +18,9 @@
 pub mod heartbeat;
 mod mdns;
 pub mod placement;
+pub mod relay;
 mod seeds;
+mod tls_client;
 
 use std::collections::HashMap;
 use std::sync::RwLock;

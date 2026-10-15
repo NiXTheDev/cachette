@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::auth::{AuthPolicy, TokenStore};
 use crate::cluster::PeerTable;
+use crate::cluster::relay::ClusterRelay;
 use crate::config::{KeyCase, MinFree};
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -74,6 +75,15 @@ pub struct AppState {
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
     pub external_url: Option<String>,
+    /// v1 relay transport (plan task 31): forwards a cluster-mode upload to the
+    /// placement owner. `Some` only when `[cluster] enabled`; `None` keeps the
+    /// single-node local path byte-for-byte unchanged.
+    pub relay: Option<Arc<ClusterRelay>>,
+    /// Resolved B3 `total` bytes (`[cache] max_size` when set, else the storage
+    /// path's disk total), cached at boot (plan task 31): the owner reservation
+    /// path re-checks live admission without a blocking disk query on the
+    /// request path.
+    pub capacity_total: u64,
 }
 
 impl AppState {
@@ -91,6 +101,8 @@ impl AppState {
             auth: Arc::new(AuthPolicy::default()),
             cache: CacheLimits::default(),
             external_url: None,
+            relay: None,
+            capacity_total: 0,
         }
     }
 }

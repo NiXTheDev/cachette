@@ -2,7 +2,9 @@
 //!
 //! `/_internal/peers/*` (plan task 14) is the first pin-gated route group:
 //! every request there must carry a peer certificate whose SPKI fingerprint is
-//! pinned. `/_internal/register` + `/_internal/revoke` (plan task 15) are the
+//! pinned. Plan task 31 adds the relay endpoints to that group
+//! (`reserve`/`upload`/`commit`, handled by [`peer_relay`]), which receive a v1
+//! upload forwarded from the entry node. `/_internal/register` + `/_internal/revoke` (plan task 15) are the
 //! admin token routes: `Authorization: Bearer <auth.secret>`, or loopback-only
 //! when `[cluster] enabled` is false. The `/_apis/artifactcache/*` group is
 //! auth-gated by a path-scoped layer (plan task 15) and served by the v1
@@ -11,6 +13,7 @@
 //! Public routes and the 404/405 fallbacks never require a client cert.
 
 mod health;
+mod peer_relay;
 mod twirp;
 mod v1;
 mod v2_download;
@@ -39,6 +42,12 @@ pub fn router(state: AppState) -> Router {
         .route("/_internal/peers/hello", post(peer_hello))
         .route("/_internal/peers/heartbeat", post(peer_heartbeat))
         .route("/_internal/peers", get(peer_list))
+        .route("/_internal/peers/reserve", post(peer_relay::reserve))
+        .route("/_internal/peers/upload/{cacheId}", put(peer_relay::upload))
+        .route(
+            "/_internal/peers/commit/{cacheId}",
+            post(peer_relay::commit),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.peers.clone(),
             require_pinned_peer,

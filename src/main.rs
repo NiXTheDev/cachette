@@ -5,13 +5,14 @@ use std::time::Duration;
 use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::{Cli, Command};
 use cachette::cluster::heartbeat;
+use cachette::cluster::relay::{ClusterRelay, RelayConfig};
 use cachette::config::{self, Config};
 use cachette::identity::Identity;
 use cachette::logging::{self};
 use cachette::routes;
 use cachette::state::{AppState, CacheLimits};
 use cachette::storage::StorageBackend;
-use cachette::storage::eviction::Reaper;
+use cachette::storage::eviction::{Capacity, Reaper};
 use cachette::storage::fs::FsStorage;
 use cachette::tls::{self, PeerPins};
 use clap::Parser;
@@ -112,6 +113,32 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    // v1 relay (plan task 31): with cluster mode on, the entry node forwards a
+    // reservation/chunks/commit to the placement owner over mTLS. It reuses the
+    // same pinned client config as the heartbeat sender and falls back to the
+    // unchanged single-node path when disabled or when the client cannot be
+    // built.
+    if let Some(runtime) = cluster_runtime.as_ref() {
+        let relay_config = RelayConfig {
+            node_id: state.node_id.clone(),
+            cert_pem: identity.cert_pem().to_owned(),
+            key_pem: identity.key_pem().to_owned(),
+            pins: state.peers.clone(),
+            placement: runtime.placement().clone(),
+            peer_table: state.peer_table.clone(),
+            min_free: config.storage.fs.min_free,
+            max_size: config.cache.max_size,
+        };
+        match ClusterRelay::new(relay_config) {
+            Ok(relay) => {
+                state.relay = Some(Arc::new(relay));
+                tracing::info!("v1 relay enabled (cluster mode)");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "v1 relay disabled: outbound mTLS client failed");
+            }
+        }
+    }
     // Auth (plan task 15): sqlite-backed dynamic token store sharing the
     // storage database file, plus the per-request auth policy snapshot.
     state.tokens = Arc::new(TokenStore::open(
@@ -131,6 +158,16 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         key_case: config.cache.key_case,
         signed_url_ttl_seconds: config.v1.signed_url_ttl_seconds,
     };
+    // Resolve the B3 `total` once at boot (plan task 31): the peer reserve
+    // admission path must not do a blocking disk query per request.
+    state.capacity_total = Capacity::from_disk(
+        config.storage.fs.min_free,
+        config.cache.max_size,
+        &config.storage.fs.path,
+        0,
+    )
+    .map(|capacity| capacity.total)
+    .unwrap_or(config.cache.max_size);
 
     // Storage + reaper (plan task 34). One `FsStorage` is constructed here and
     // shared by the routes, the periodic sweep, and the shutdown flush. Its

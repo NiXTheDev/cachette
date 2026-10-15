@@ -26,6 +26,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     Unavailable(String),
+    #[error("{0}")]
+    BadGateway(String),
     #[error("internal error")]
     Internal,
 }
@@ -47,6 +49,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -61,6 +64,7 @@ impl ApiError {
             Self::Forbidden(_) => "permission_denied",
             Self::Conflict(_) => "already_exists",
             Self::Unavailable(_) => "unavailable",
+            Self::BadGateway(_) => "unavailable",
             Self::Internal => "internal",
         }
     }

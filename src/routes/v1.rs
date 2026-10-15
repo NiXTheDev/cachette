@@ -50,6 +50,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::auth::{self, urls};
+use crate::cluster::relay::{RelayCommit, RelayReserve, RelayUpload};
 use crate::config::AuthMode;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -75,8 +76,9 @@ const ARTIFACT_PATH_PREFIX: &str = "/_apis/artifactcache/artifacts/";
 const DUPLICATE_ERROR: &str = "ArtifactCacheItemAlreadyExistsException";
 
 /// Largest single PATCH chunk accepted (guards the in-memory read; the
-/// go-actions-cache fixture uses 32 MiB chunks, the toolkit 4 MiB).
-const MAX_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+/// go-actions-cache fixture uses 32 MiB chunks, the toolkit 4 MiB). Shared with
+/// the peer upload route (plan task 31).
+pub(crate) const MAX_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `GET /_apis/artifactcache/cache` query parameters.
 #[derive(serde::Deserialize)]
@@ -223,6 +225,29 @@ pub async fn reserve(
         }
     }
     let cache_size = state.cache.max_size.saturating_sub(used);
+    // Cluster seam (plan tasks 30/31): when a relay is present (cluster mode),
+    // placement picks the owner. A remote owner takes the reservation and the
+    // client keeps A's `cacheId`; a self owner (or no peers yet) falls through
+    // to the local single-node reservation below.
+    if let Some(relay) = state.relay.as_deref() {
+        let client_cache_id = generate_cache_id(&key, &request.version);
+        match relay.reserve(client_cache_id, &key, &request.version).await {
+            RelayReserve::Local => {}
+            RelayReserve::Relayed => {
+                return Json(json!({"cacheId": client_cache_id, "cacheSize": cache_size}))
+                    .into_response();
+            }
+            RelayReserve::Duplicate => return duplicate_response(&request.key),
+            RelayReserve::NoCapacity => {
+                return ApiError::Unavailable(String::from("insufficient capacity"))
+                    .into_response();
+            }
+            RelayReserve::Unreachable => {
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
+    }
     let cache_id = generate_cache_id(&key, &request.version);
     let cache_id_key = cache_id.to_string();
     let expires_at = u64::try_from(auth::now_secs())
@@ -234,11 +259,6 @@ pub async fn reserve(
     {
         tracing::error!(error = %err, "v1 reserve: staging reservation failed");
         return ApiError::Internal.into_response();
-    }
-    // Cluster seam (plan tasks 30/31): cluster mode advertises the chosen
-    // owner's `cacheId` for relay; single-node serving is complete without it.
-    if state.auth.cluster_enabled {
-        tracing::debug!(cache_id = %cache_id, "v1 reserve: cluster mode (placement/relay wired in task 30/31)");
     }
     Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
@@ -286,16 +306,27 @@ pub async fn patch_chunk(
         return ApiError::BadRequest(String::from("chunk length does not match Content-Range"))
             .into_response();
     }
+    // Cluster relay (plan task 31): a `cacheId` reserved on a peer forwards the
+    // chunk to the owner. Anything else — a self-owned reservation or a
+    // single-node deployment — writes locally exactly as before.
+    if let Some(relay) = state.relay.as_deref() {
+        match relay.upload(&cache_id, range.start, &bytes).await {
+            RelayUpload::NoSession => {}
+            RelayUpload::Written => return StatusCode::NO_CONTENT.into_response(),
+            RelayUpload::NotFound => return ApiError::not_found().into_response(),
+            RelayUpload::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
+            RelayUpload::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
+            RelayUpload::Unreachable => {
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
+    }
     let stream: ByteStream<'_> = Box::pin(std::io::Cursor::new(bytes));
     let chunk = Chunk {
         range,
         body: stream,
     };
-    // Relay seam (plan tasks 20/31): single-node serving writes locally; task
-    // 31 swaps in a cluster transport that forwards to the placement owner.
-    if state.auth.cluster_enabled {
-        tracing::debug!(cache_id = %cache_id, "v1 patch: cluster mode (relay wired in task 31)");
-    }
     let relay = LocalRelay;
     match relay.stream_to_owner(storage, &cache_id, chunk).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -322,6 +353,22 @@ pub async fn commit(
     if cache_id == "0" {
         return ApiError::BadRequest(String::from("cacheId 0 is not a valid reservation"))
             .into_response();
+    }
+    // Cluster relay (plan task 31): forward the commit to the owner; a
+    // committed session is an idempotent 204. No session means a self-owned or
+    // single-node reservation, which commits locally as before.
+    if let Some(relay) = state.relay.as_deref() {
+        match relay.commit(&cache_id, request.size).await {
+            RelayCommit::NoSession => {}
+            RelayCommit::Committed => return StatusCode::NO_CONTENT.into_response(),
+            RelayCommit::NotFound => return ApiError::not_found().into_response(),
+            RelayCommit::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
+            RelayCommit::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
+            RelayCommit::Unreachable => {
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
     }
     match storage.commit_chunks(&cache_id, request.size).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -405,7 +452,7 @@ pub async fn clean() -> Response {
 
 /// GitHub v1 duplicate-reserve body:
 /// `{"error":"ArtifactCacheItemAlreadyExistsException","type":"key","key":"<k>"}`.
-fn duplicate_response(key: &str) -> Response {
+pub(crate) fn duplicate_response(key: &str) -> Response {
     (
         StatusCode::CONFLICT,
         Json(json!({
@@ -497,7 +544,8 @@ fn parse_content_range(value: Option<&HeaderValue>) -> Option<ChunkRange> {
 
 /// Map a chunk-staging `io::Error` to its HTTP contract: 404 unknown/expired
 /// reservation, 409 already-complete entry, 400 overlap/length, 500 otherwise.
-fn chunk_error(err: io::Error) -> Response {
+/// Shared with the pin-gated peer upload route (plan task 31).
+pub(crate) fn chunk_error(err: io::Error) -> Response {
     match err.kind() {
         io::ErrorKind::NotFound => ApiError::not_found().into_response(),
         io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
@@ -511,7 +559,8 @@ fn chunk_error(err: io::Error) -> Response {
 
 /// Map a commit `io::Error` to its HTTP contract: 404 unknown/expired
 /// reservation, 409 already-complete entry, 400 size mismatch, 500 otherwise.
-fn commit_error(err: io::Error) -> Response {
+/// Shared with the pin-gated peer commit route (plan task 31).
+pub(crate) fn commit_error(err: io::Error) -> Response {
     match err.kind() {
         io::ErrorKind::NotFound => ApiError::not_found().into_response(),
         io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
@@ -541,8 +590,9 @@ fn requires_signed_url(state: &AppState) -> bool {
 /// `key|version|now|sequence` with a splitmix64 avalanche, masked to 53 bits
 /// (`hash & (2^53 - 1) | 1`, nonzero and JS-safe). The process-wide atomic
 /// sequence keeps ids unique even for identical key/version reservations
-/// within the same second.
-fn generate_cache_id(key: &str, version: &str) -> u64 {
+/// within the same second. Shared with the peer reserve route (plan task 31),
+/// which issues the owner-side `cacheId`.
+pub(crate) fn generate_cache_id(key: &str, version: &str) -> u64 {
     /// `Number.MAX_SAFE_INTEGER`; larger ids lose precision in the JS toolkit.
     const MAX_SAFE_CACHE_ID: u64 = (1 << 53) - 1;
 

@@ -17,13 +17,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{
-    ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError,
-    SignatureScheme,
-};
+use rustls::ClientConfig as RustlsClientConfig;
+use rustls::Error as RustlsError;
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::MissedTickBehavior;
@@ -32,7 +28,6 @@ use tokio_rustls::TlsConnector;
 use crate::auth;
 use crate::cluster::PeerTable;
 use crate::config::{MinFree, split_host_port};
-use crate::identity::fingerprint_spki;
 use crate::storage::StorageBackend;
 use crate::storage::eviction::Capacity;
 use crate::tls::PeerPins;
@@ -245,85 +240,14 @@ async fn exchange(
         })
 }
 
-/// Pin-based server-certificate verifier for outbound peer connections.
-///
-/// Mirrors the inbound pin gate: accept only when the server certificate's
-/// SPKI-SHA256 fingerprint is seeded in [`PeerPins`] or admitted by TOFU
-/// (`[cluster] enabled`). Signature checks still go through the crypto
-/// provider, so a peer must hold the private key of the certificate it
-/// presents.
-#[derive(Debug)]
-struct PinnedServerCert {
-    pins: Arc<PeerPins>,
-    algs: WebPkiSupportedAlgorithms,
-}
-
-impl ServerCertVerifier for PinnedServerCert {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
-        let parsed = rustls::server::ParsedCertificate::try_from(end_entity)
-            .map_err(|err| RustlsError::General(format!("peer certificate unusable: {err}")))?;
-        let fingerprint = fingerprint_spki(parsed.subject_public_key_info().as_ref());
-        if self.pins.authorize(&fingerprint) {
-            return Ok(ServerCertVerified::assertion());
-        }
-        Err(RustlsError::General(format!(
-            "peer certificate not pinned: {fingerprint}"
-        )))
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        verify_tls12_signature(message, cert, dss, &self.algs)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        verify_tls13_signature(message, cert, dss, &self.algs)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
-    }
-}
-
 /// Assemble the outbound mTLS client: this node's identity certificate as the
-/// client credential, [`PinnedServerCert`] as the trust decision.
+/// client credential, [`PinnedServerCert`](crate::cluster::tls_client) as the
+/// trust decision. Delegates to the shared peer-client builder (task 31 reuses
+/// the exact same config for the relay's outbound calls).
 fn client_config(config: &HeartbeatConfig) -> Result<Arc<RustlsClientConfig>, RustlsError> {
-    let mut reader = std::io::BufReader::new(config.cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-        .map_err(|err| RustlsError::General(format!("identity certificate: {err}")))?;
-    if certs.is_empty() {
-        return Err(RustlsError::General(String::from(
-            "identity certificate PEM was empty",
-        )));
-    }
-    let mut reader = std::io::BufReader::new(config.key_pem.as_bytes());
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| RustlsError::General(format!("identity key: {err}")))?
-        .ok_or_else(|| RustlsError::General(String::from("identity key PEM was empty")))?;
-    let verifier = PinnedServerCert {
-        pins: config.pins.clone(),
-        algs: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-    };
-    let tls = RustlsClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_client_auth_cert(certs, key)?;
-    Ok(Arc::new(tls))
+    crate::cluster::tls_client::client_config(
+        &config.cert_pem,
+        &config.key_pem,
+        config.pins.clone(),
+    )
 }
