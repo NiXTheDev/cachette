@@ -50,8 +50,8 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::auth::{self, urls};
-use crate::cluster::relay::{RelayCommit, RelayReserve, RelayUpload};
-use crate::config::AuthMode;
+use crate::cluster::relay::{self, RelayCommit, RelayReserve, RelayUpload};
+use crate::config::{AuthMode, KeyCase};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
@@ -109,6 +109,12 @@ pub struct CommitRequest {
 ///
 /// Hit: 200 `{"result":"hit","cacheKey":"<key>","archiveLocation":"<signed>"}`.
 /// Miss (or empty `keys`): 204 with an **empty** body.
+///
+/// Plan task 32: a local miss with cluster mode on becomes a **find fan-out**
+/// to the healthy peers. The owner B answers with the artifact key it holds and
+/// its runner-visible base, A mints the signed `archiveLocation` against B's
+/// host (shared secret per M12) and returns it — A never proxies the body. A
+/// dead owner degrades to a plain 204 miss inside the fan-out's ≤1s budget.
 pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>) -> Response {
     let Some(storage) = state.storage.as_deref() else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
@@ -126,21 +132,54 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         return StatusCode::NO_CONTENT.into_response();
     }
     let version = query.version.unwrap_or_default();
-    let finalized = match storage.list().await {
-        Ok(entries) => entries,
+    match lookup_local(storage, &keys, &version, state.cache.key_case).await {
+        Ok(Some(entry)) => {
+            let base = state.external_url.as_deref().unwrap_or_default();
+            return signed_find_hit(&state, base, &entry.key);
+        }
+        Ok(None) => {}
         Err(err) => {
             tracing::error!(error = %err, "v1 find: listing entries failed");
             return ApiError::Internal.into_response();
         }
+    }
+    // Local miss: resolve the owner durably via the peer fan-out (plan task 32).
+    let Some(relay) = state.relay.as_deref() else {
+        return StatusCode::NO_CONTENT.into_response();
     };
-    // `list` yields `EntryStat` (no version); stamp the requested version so
-    // `lookup` can run its version-filtered exact-then-prefix pass (see module
-    // docs for why this is a skeleton-only stand-in).
+    let hits = relay.find(&keys, &version).await;
+    match relay::best_hit(&hits, &keys, state.cache.key_case) {
+        Some(hit) => {
+            let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
+            tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
+            signed_find_hit(&state, &base, &hit.key)
+        }
+        None => {
+            tracing::warn!(
+                peers = hits.len(),
+                "v1 find: no owner holds the key (or all owners unreachable); miss"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// Exact-then-prefix lookup over THIS node's finalized entries, stamping the
+/// requested version onto the version-less `EntryStat` candidates so
+/// [`crate::storage::lookup`] can run its version-filtered pass. Shared by the
+/// v1 find route and the pin-gated peer find endpoint (plan task 32).
+pub(crate) async fn lookup_local(
+    storage: &dyn StorageBackend,
+    keys: &[String],
+    version: &str,
+    key_case: KeyCase,
+) -> io::Result<Option<Entry>> {
+    let finalized = storage.list().await?;
     let candidates: Vec<Entry> = finalized
         .into_iter()
         .map(|stat| Entry {
             key: stat.key,
-            version: version.clone(),
+            version: version.to_owned(),
             size: stat.size,
             created_at: stat.created_at,
             accessed_at: stat.accessed_at,
@@ -148,33 +187,27 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         })
         .collect();
     let marker = Version::from(version);
-    match lookup(&candidates, &keys, &marker, state.cache.key_case) {
-        Some(entry) => {
-            let cache_key = entry.key.clone();
-            let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
-            let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
-            let signed = urls::mint(
-                &path,
-                &cache_key,
-                secret,
-                SIGNED_URL_TTL_SECONDS,
-                auth::now_secs(),
-            );
-            // Absolute when `server.external_url` is known (production always
-            // resolves it from `listen`); host-relative otherwise. Real clients
-            // (`@actions/cache`, `go-actions-cache`) GET this value verbatim, so
-            // a bare relative path breaks them (task 22).
-            let base = state.external_url.as_deref().unwrap_or_default();
-            let archive_location = format!("{base}{path}{}", signed.query());
-            Json(json!({
-                "result": "hit",
-                "cacheKey": cache_key,
-                "archiveLocation": archive_location,
-            }))
-            .into_response()
-        }
-        None => StatusCode::NO_CONTENT.into_response(),
-    }
+    Ok(lookup(&candidates, keys, &marker, key_case).cloned())
+}
+
+/// Mint the signed `archiveLocation` hit body against `base` (the host that
+/// actually holds the blob — self or a remote owner).
+fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
+    let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+    let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
+    let signed = urls::mint(
+        &path,
+        cache_key,
+        secret,
+        SIGNED_URL_TTL_SECONDS,
+        auth::now_secs(),
+    );
+    Json(json!({
+        "result": "hit",
+        "cacheKey": cache_key,
+        "archiveLocation": format!("{base}{path}{}", signed.query()),
+    }))
+    .into_response()
 }
 
 /// `POST /_apis/artifactcache/caches` — reserve a new entry.

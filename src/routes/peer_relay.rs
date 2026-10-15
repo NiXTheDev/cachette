@@ -194,3 +194,206 @@ pub(crate) async fn commit(
         Err(err) => super::v1::commit_error(err),
     }
 }
+
+/// `GET /_internal/peers/find` query parameters (plan task 32).
+#[derive(serde::Deserialize)]
+pub(crate) struct FindParams {
+    /// Comma-joined cache keys (`keys` is GitHub's v1 spelling; accept both).
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default, alias = "keys")]
+    keys: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// `GET /_internal/peers/find?key=<csv>&version=<v>` — owner lookup for a
+/// finalized entry (plan task 32). 200
+/// `{"hit":true,"cacheId":...,"key":...,"size":...,"createdAt":...,"externalUrl":...}`
+/// when B holds a match, else 204. B reports its runner-visible `externalUrl`
+/// so the entry node A can mint capability URLs against B's host (M12).
+pub(crate) async fn find(
+    State(state): State<AppState>,
+    Query(params): Query<FindParams>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let raw = params
+        .key
+        .as_deref()
+        .or(params.keys.as_deref())
+        .unwrap_or("");
+    let keys: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if keys.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let version = params.version.as_deref().unwrap_or("");
+    match super::v1::lookup_local(storage, &keys, version, state.cache.key_case).await {
+        Ok(Some(entry)) => Json(json!({
+            "hit": true,
+            "cacheId": entry.key,
+            "key": entry.key,
+            "size": entry.size,
+            "createdAt": entry.created_at,
+            "externalUrl": state.external_url,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "peer find: lookup failed");
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// `POST /_internal/peers/v2/reserve` request body.
+#[derive(serde::Deserialize)]
+pub(crate) struct V2ReserveBody {
+    cache_id: String,
+    key: String,
+    version: String,
+    /// Declared size when known; omitted on the v2 create path, so admission
+    /// falls back to the `min_free` floor.
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+/// `POST /_internal/peers/v2/reserve` — stage a v2 reservation under the entry
+/// `cache_id` A minted, so the runner's direct upload to B finds B's local
+/// reservation (plan task 32). 200 `{"ok":true,"externalUrl":...}` on accept;
+/// 409 duplicate; 503 below the free-space floor; 500 on error.
+pub(crate) async fn v2_reserve(
+    State(state): State<AppState>,
+    Json(body): Json<V2ReserveBody>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    let key = normalize_key(&body.key, state.cache.key_case);
+    match storage.stat(&key).await {
+        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "peer v2 reserve: duplicate check failed");
+            return ApiError::Internal.into_response();
+        }
+    }
+    let now_unix = u64::try_from(crate::auth::now_secs()).unwrap_or(0);
+    match storage.reservation_exists(&key, now_unix).await {
+        Ok(true) => return StatusCode::CONFLICT.into_response(),
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "peer v2 reserve: reservation check failed");
+            return ApiError::Internal.into_response();
+        }
+    }
+    let used = match storage.used_bytes().await {
+        Ok(used) => used,
+        Err(err) => {
+            tracing::error!(error = %err, "peer v2 reserve: usage accounting failed");
+            return ApiError::Internal.into_response();
+        }
+    };
+    // M15: the owner re-checks its OWN live admission at accept time.
+    let capacity = Capacity::resolve(
+        state.cache.min_free,
+        state.cache.max_size,
+        state.capacity_total,
+        used,
+    );
+    if !capacity.admits(body.size) {
+        return ApiError::Unavailable(String::from("insufficient capacity")).into_response();
+    }
+    let expires_at = now_unix.saturating_add(state.cache.reservation_ttl_seconds);
+    if let Err(err) = storage
+        .reserve(&body.cache_id, &key, &body.version, expires_at)
+        .await
+    {
+        tracing::error!(error = %err, "peer v2 reserve: staging reservation failed");
+        return ApiError::Internal.into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "externalUrl": state.external_url,
+    }))
+    .into_response()
+}
+
+/// `POST /_internal/peers/v2/finalize` request body.
+#[derive(serde::Deserialize)]
+pub(crate) struct V2FinalizeBody {
+    key: String,
+    #[serde(default, alias = "sizeBytes")]
+    size_bytes: Option<u64>,
+    #[serde(default, alias = "cacheId")]
+    cache_id: Option<String>,
+}
+
+/// `POST /_internal/peers/v2/finalize` — verify a v2 entry the runner uploaded
+/// to B (plan task 32). 200 when B holds a size-matched entry, 409 on size
+/// mismatch, 404 when absent, 500 on error.
+pub(crate) async fn v2_finalize(
+    State(state): State<AppState>,
+    Json(body): Json<V2FinalizeBody>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": "storage backend not configured"})),
+        )
+            .into_response();
+    };
+    let key = normalize_key(&body.key, state.cache.key_case);
+    match super::twirp::stat_key_or_id(storage, &key, body.cache_id.as_deref()).await {
+        Ok(Some(stat)) => {
+            if let Some(size) = body.size_bytes
+                && size != stat.size
+            {
+                return (StatusCode::CONFLICT, Json(json!({"ok": false}))).into_response();
+            }
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"ok": false}))).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "peer v2 finalize: stat failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /_internal/peers/v2/supersede` request body.
+#[derive(serde::Deserialize)]
+pub(crate) struct V2SupersedeBody {
+    key: String,
+}
+
+/// `POST /_internal/peers/v2/supersede` — delete B's entry by key (idempotent).
+pub(crate) async fn v2_supersede(
+    State(state): State<AppState>,
+    Json(body): Json<V2SupersedeBody>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return Json(json!({"ok": true})).into_response();
+    };
+    let key = normalize_key(&body.key, state.cache.key_case);
+    if let Err(err) = storage.delete(&key).await {
+        tracing::error!(error = %err, "peer v2 supersede: delete failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false})),
+        )
+            .into_response();
+    }
+    Json(json!({"ok": true})).into_response()
+}

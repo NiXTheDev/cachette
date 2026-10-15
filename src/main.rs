@@ -128,6 +128,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             peer_table: state.peer_table.clone(),
             min_free: config.storage.fs.min_free,
             max_size: config.cache.max_size,
+            reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
         };
         match ClusterRelay::new(relay_config) {
             Ok(relay) => {

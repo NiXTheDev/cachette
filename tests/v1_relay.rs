@@ -15,6 +15,9 @@
 //! * owner death mid-upload → A answers 502 and marks the session failed;
 //! * self-owner placement → the unchanged local path (no relay);
 //! * B's peer endpoints directly — duplicate + idempotent repeat commit.
+//!
+//! Plan task 32 (find fan-out + owner-targeted v2 capability URLs) lives in
+//! [`tests/v1_find_fanout.rs`](v1_find_fanout.rs).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -186,6 +189,7 @@ fn build_relay(identity: &Identity, state: &AppState, table: Arc<PeerTable>) -> 
         peer_table: table,
         min_free: state.cache.min_free,
         max_size: state.cache.max_size,
+        reservation_ttl_seconds: state.cache.reservation_ttl_seconds,
     })
     .expect("relay builds")
 }

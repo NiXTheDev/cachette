@@ -48,6 +48,16 @@ pub fn router(state: AppState) -> Router {
             "/_internal/peers/commit/{cacheId}",
             post(peer_relay::commit),
         )
+        .route("/_internal/peers/find", get(peer_relay::find))
+        .route("/_internal/peers/v2/reserve", post(peer_relay::v2_reserve))
+        .route(
+            "/_internal/peers/v2/finalize",
+            post(peer_relay::v2_finalize),
+        )
+        .route(
+            "/_internal/peers/v2/supersede",
+            post(peer_relay::v2_supersede),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.peers.clone(),
             require_pinned_peer,
@@ -100,6 +110,19 @@ pub(crate) fn signing_secret(state: &AppState) -> &str {
         .secret
         .as_deref()
         .unwrap_or(FALLBACK_SIGNING_SECRET)
+}
+
+/// Runner-visible base URL of a remote owner B (plan task 32 / M12): B's
+/// configured `[server] external_url` when it reported one, else its dial
+/// address (`advertise_addr`) under the same `http://` scheme the config
+/// resolver uses for `external_url`. Trailing slashes are trimmed so
+/// `base + path` is exact. A's capability URLs must host B, never A — the
+/// runner talks to the owner directly.
+pub(crate) fn owner_base_url(external_url: Option<&str>, addr: &str) -> String {
+    match external_url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => format!("http://{addr}"),
+    }
 }
 
 fn client_fingerprint(parts: &Parts) -> Option<String> {

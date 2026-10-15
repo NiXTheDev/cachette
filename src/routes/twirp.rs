@@ -34,6 +34,7 @@
 //!   authenticate v2 either);
 //! * missing/invalid credentials → `401 {"code":"unauthenticated",...}`.
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
@@ -44,11 +45,12 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::auth::{self, jwt, urls};
+use crate::cluster::relay::{self, V2Finalize, V2Reserve};
 use crate::config::AuthMode;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
-use crate::storage::{Entry, Version, lookup, normalize_key};
+use crate::storage::{Entry, EntryStat, StorageBackend, Version, lookup, normalize_key};
 
 /// The five `CacheService` methods this node answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +225,51 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache.key_case);
+    // Cluster placement (plan task 32): when a relay is configured the owner is
+    // chosen by placement over the healthy peers. A self-owner falls through to
+    // the local path below; a remote owner B gets a v2 reservation forwarded to
+    // it (so the runner's direct upload to B succeeds) and A mints capability
+    // URLs against B's host. No healthy owner at all → `ok:false`.
+    if let Some(relay) = state.relay.as_deref() {
+        match relay.owner_candidate() {
+            None => {
+                tracing::warn!(key = %key, "v2 create: no healthy owner");
+                return Json(json!({
+                    "ok": false,
+                    "message": "no healthy storage owner is available",
+                }))
+                .into_response();
+            }
+            Some(owner) if !relay.is_self_node(&owner) => {
+                let cache_id = generate_cache_id(&key, &request.version);
+                return match relay
+                    .v2_reserve(&owner, &cache_id, &key, &request.version)
+                    .await
+                {
+                    V2Reserve::Accepted { external_url } => {
+                        let base = super::owner_base_url(external_url.as_deref(), &owner.addr);
+                        tracing::debug!(
+                            owner = %owner.node_id, addr = %owner.addr, cache_id = %cache_id,
+                            "v2 create: reserved on remote owner"
+                        );
+                        mint_create_response(state, &base, &cache_id)
+                    }
+                    V2Reserve::Duplicate => duplicate_entry_response(),
+                    V2Reserve::NoCapacity => Json(json!({
+                        "ok": false,
+                        "message": "the storage owner is below its free-space floor",
+                    }))
+                    .into_response(),
+                    V2Reserve::Unreachable => Json(json!({
+                        "ok": false,
+                        "message": "the storage owner is unreachable",
+                    }))
+                    .into_response(),
+                };
+            }
+            Some(_) => {}
+        }
+    }
     // v2 duplicate rule (plan task 24 / handoff): a COMPLETE entry OR a
     // still-open reservation for the key is a duplicate — a concurrent
     // same-key reserve must be rejected. `stat` sees only finalized entries,
@@ -277,21 +324,30 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         tracing::debug!(cache_id = %cache_id, scope = %scope, "v2 create: scope observed");
     }
     if state.auth.cluster_enabled {
-        tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (owner placement wired in task 30/31)");
+        tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (self-owned entry)");
     }
+    let base = state.external_url.as_deref().unwrap_or_default();
+    mint_create_response(state, base, &cache_id)
+}
+
+/// Mint the `CreateCacheEntry` capability URLs against `base` (the host that
+/// owns the entry: self on the single-node/self-owner path, a remote owner B on
+/// the cluster path). The MAC key is the shared secret (M12), so B validates
+/// URLs A minted, and the paths match the `/v2/upload` + `/v2/artifacts`
+/// handlers.
+fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Response {
     let secret = super::signing_secret(state);
     let now = auth::now_secs();
     let ttl = state.cache.signed_url_ttl_seconds;
-    let base = state.external_url.as_deref().unwrap_or_default();
     let upload_path = format!("{UPLOAD_PATH_PREFIX}{cache_id}");
     let download_path = format!("{ARTIFACT_PATH_PREFIX}{cache_id}");
     let signed_upload = format!(
         "{base}{upload_path}{}",
-        urls::mint(&upload_path, &cache_id, secret, ttl, now).query()
+        urls::mint(&upload_path, cache_id, secret, ttl, now).query()
     );
     let signed_download = format!(
         "{base}{download_path}{}",
-        urls::mint(&download_path, &cache_id, secret, ttl, now).query()
+        urls::mint(&download_path, cache_id, secret, ttl, now).query()
     );
     // `snake_case` proto/Twirp JSON names (see the module docs): the vendored
     // go-actions-cache `cache_v2.go` reads `signed_upload_url` from this
@@ -332,48 +388,57 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache.key_case);
-    // Cluster seam (plan tasks 31/32): on entry node A a finalize for a blob
-    // owned by B is forwarded to B's peer route; single-node serving is complete.
-    if state.auth.cluster_enabled {
-        tracing::debug!(
-            key = %key,
-            cache_id = ?request.cache_id,
-            "v2 finalize: cluster mode (peer forwarding wired in task 32)"
-        );
-    }
-    // The published entry is addressed by its artifact key (B5 commit). Fall
-    // back to the reservation `cache_id` for a backend that publishes under the
-    // reservation id instead.
-    let stat = match storage.stat(&key).await {
-        Ok(Some(stat)) => Some(stat),
-        Ok(None) => match request.cache_id.as_deref().filter(|id| !id.is_empty()) {
-            Some(cache_id) => match storage.stat(cache_id).await {
-                Ok(found) => found,
-                Err(err) => {
-                    tracing::error!(error = %err, "v2 finalize: stat failed");
-                    return ApiError::Internal.into_twirp_response();
-                }
-            },
-            None => None,
-        },
+    let stat = match stat_key_or_id(storage, &key, request.cache_id.as_deref()).await {
+        Ok(stat) => stat,
         Err(err) => {
             tracing::error!(error = %err, "v2 finalize: stat failed");
             return ApiError::Internal.into_twirp_response();
         }
     };
-    let Some(stat) = stat else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"ok": false, "message": "cache entry blob not found"})),
-        )
-            .into_response();
-    };
-    if let Some(size) = request.size_bytes
-        && size != stat.size
-    {
-        return Json(json!({"ok": false, "message": "size mismatch"})).into_response();
+    if let Some(stat) = stat {
+        if let Some(size) = request.size_bytes
+            && size != stat.size
+        {
+            return Json(json!({"ok": false, "message": "size mismatch"})).into_response();
+        }
+        return Json(json!({"ok": true})).into_response();
     }
-    Json(json!({"ok": true})).into_response()
+    // Not held locally: in cluster mode the owning node may be a peer, so fan
+    // the finalize out to the healthy owner(s) (plan task 32).
+    if let Some(relay) = state.relay.as_deref() {
+        match relay
+            .v2_finalize(&key, request.size_bytes, request.cache_id.as_deref())
+            .await
+        {
+            V2Finalize::Ok => return Json(json!({"ok": true})).into_response(),
+            V2Finalize::SizeMismatch => {
+                return Json(json!({"ok": false, "message": "size mismatch"})).into_response();
+            }
+            V2Finalize::Missing => {}
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"ok": false, "message": "cache entry blob not found"})),
+    )
+        .into_response()
+}
+
+/// Stat by artifact key, falling back to the reservation `cache_id` (the two
+/// places a backend may publish an entry under). Shared by the local finalize
+/// and the pin-gated peer finalize endpoint.
+pub(crate) async fn stat_key_or_id(
+    storage: &dyn StorageBackend,
+    key: &str,
+    cache_id: Option<&str>,
+) -> io::Result<Option<EntryStat>> {
+    if let Some(stat) = storage.stat(key).await? {
+        return Ok(Some(stat));
+    }
+    match cache_id.filter(|id| !id.is_empty()) {
+        Some(cache_id) => storage.stat(cache_id).await,
+        None => Ok(None),
+    }
 }
 
 /// `SupersedeCacheEntry` (plan task 26): delete the entry for the normalized
@@ -395,8 +460,9 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache.key_case);
-    if state.auth.cluster_enabled {
-        tracing::debug!(key = %key, "v2 supersede: cluster mode (peer forwarding wired in task 32)");
+    if let Some(relay) = state.relay.as_deref() {
+        relay.v2_supersede(&key).await;
+        return Json(json!({"ok": true})).into_response();
     }
     if let Err(err) = storage.delete(&key).await {
         tracing::error!(error = %err, "v2 supersede: delete failed");
@@ -415,8 +481,9 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
 /// `signed_download_url` (snake_case: the vendored client reads that exact
 /// key).
 ///
-/// Single-node: mints locally. In cluster mode task 32 forwards this to the
-/// owner (`POST B/_internal/peers/v2/getdownloadurl`).
+/// Single-node: mints locally. In cluster mode the entry node first checks
+/// locally (self-owned) and, on miss, fans out to the owner (task 32) — it
+/// never proxies the download body.
 async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response {
     let request: GetCacheEntryDownloadURLRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -432,9 +499,6 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache.key_case);
-    if state.auth.cluster_enabled {
-        tracing::debug!(key = %key, "v2 getdownloadurl: cluster mode (peer forwarding wired in task 32)");
-    }
     let mut lookup_keys = vec![key];
     if let Some(restore_keys) = &request.restore_keys {
         lookup_keys.extend(
@@ -464,18 +528,19 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
             complete: true,
         })
         .collect();
-    match lookup(
+    if let Some(entry) = lookup(
         &candidates,
         &lookup_keys,
         &Version::from(request.version.as_str()),
         state.cache.key_case,
     ) {
-        Some(entry) => {
+        {
             let matched_key = entry.key.clone();
             let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
+            let base = state.external_url.as_deref().unwrap_or_default();
             let signed = format!(
                 "{}{artifact_path}{}",
-                state.external_url.as_deref().unwrap_or_default(),
+                base,
                 urls::mint(
                     &artifact_path,
                     &matched_key,
@@ -485,15 +550,44 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
                 )
                 .query()
             );
-            Json(json!({
+            return Json(json!({
                 "ok": true,
                 "signed_download_url": signed,
                 "matched_key": matched_key,
             }))
-            .into_response()
+            .into_response();
         }
-        None => Json(json!({"ok": false, "signed_download_url": ""})).into_response(),
     }
+    // Local miss: fan out to owners (plan task 32). Only queries peers, never
+    // proxies the download body.
+    if let Some(relay) = state.relay.as_deref() {
+        let hits = relay.find(&lookup_keys, &request.version).await;
+        if let Some(hit) = relay::best_hit(&hits, &lookup_keys, state.cache.key_case) {
+            let matched_key = hit.key.clone();
+            let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
+            let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
+            let signed = format!(
+                "{}{artifact_path}{}",
+                base,
+                urls::mint(
+                    &artifact_path,
+                    &matched_key,
+                    super::signing_secret(state),
+                    state.cache.signed_url_ttl_seconds,
+                    auth::now_secs(),
+                )
+                .query()
+            );
+            tracing::debug!(owner = %hit.node_id, matched_key = %matched_key, "v2 getdownloadurl: owner hit");
+            return Json(json!({
+                "ok": true,
+                "signed_download_url": signed,
+                "matched_key": matched_key,
+            }))
+            .into_response();
+        }
+    }
+    Json(json!({"ok": false, "signed_download_url": ""})).into_response()
 }
 
 /// `FindMissingOrStaleCacheEntries` (plan task 26): report the requested
@@ -501,8 +595,7 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
 /// implicitly absent from `cache_entries`.
 ///
 /// Single-node: reports this node's entries. In cluster mode task 32 fans the
-/// query out across healthy peers and unions the responses
-/// (`POST B/_internal/peers/v2/findmissing`).
+/// query out across healthy peers and unions the responses.
 async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> Response {
     let request: FindMissingOrStaleCacheEntriesRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -513,9 +606,6 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             .into_twirp_response();
         }
     };
-    if state.auth.cluster_enabled {
-        tracing::debug!("v2 findmissing: cluster mode (peer fan-out wired in task 32)");
-    }
     let Some(storage) = state.storage.as_deref() else {
         return Json(json!({"cache_entries": []})).into_response();
     };
@@ -544,7 +634,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             .collect();
         if let Some(hit) = lookup(
             &candidates,
-            &[key],
+            std::slice::from_ref(&key),
             &Version::from(version.as_str()),
             state.cache.key_case,
         ) {
@@ -554,6 +644,20 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
                 "size": hit.size,
                 "creation_time": hit.created_at,
             }));
+            continue;
+        }
+        if let Some(relay) = state.relay.as_deref() {
+            let hits = relay.find(std::slice::from_ref(&key), &version).await;
+            if let Some(hit) =
+                relay::best_hit(&hits, std::slice::from_ref(&key), state.cache.key_case)
+            {
+                cache_entries.push(json!({
+                    "key": hit.key.clone(),
+                    "version": version,
+                    "size": hit.size,
+                    "creation_time": hit.created_at,
+                }));
+            }
         }
     }
     Json(json!({"cache_entries": cache_entries})).into_response()
