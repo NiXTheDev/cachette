@@ -159,7 +159,7 @@ async fn find_missing_with_static_token_returns_empty_cache_entries() {
     let headers = [bearer(STATIC_TOKEN), json_ct()];
     let (status, body) = call(app, FIND, &headers, r#"{"keyVersions":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body, json!({"cacheEntries": []}));
+    assert_eq!(body, json!({"cache_entries": []}));
 }
 
 #[tokio::test]
@@ -261,7 +261,7 @@ async fn unknown_json_fields_are_accepted_and_ignored() {
     let body = r#"{"keyVersions":[],"request_id":"abc","github_actor_id":7,"nested":{"x":1}}"#;
     let (status, value) = call(app, FIND, &headers, body).await;
     assert_eq!(status, StatusCode::OK, "body: {value}");
-    assert_eq!(value, json!({"cacheEntries": []}));
+    assert_eq!(value, json!({"cache_entries": []}));
 }
 
 #[tokio::test]
@@ -381,12 +381,14 @@ async fn create_cache_entry_returns_two_capability_urls_on_the_configured_host()
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["ok"], json!(true));
 
-    let cache_id = body["cacheId"].as_str().expect("cacheId present");
-    assert_eq!(cache_id.len(), 32, "cacheId is 32 hex chars: {cache_id}");
-    let upload = body["signedUploadUrl"].as_str().expect("signedUploadUrl");
-    let download = body["signedDownloadUrl"]
+    let cache_id = body["cache_id"].as_str().expect("cache_id present");
+    assert_eq!(cache_id.len(), 32, "cache_id is 32 hex chars: {cache_id}");
+    let upload = body["signed_upload_url"]
         .as_str()
-        .expect("signedDownloadUrl");
+        .expect("signed_upload_url");
+    let download = body["signed_download_url"]
+        .as_str()
+        .expect("signed_download_url");
     assert!(
         upload.starts_with("https://cache.example.com/v2/upload/"),
         "{upload}"
@@ -436,11 +438,11 @@ async fn create_cache_entry_open_reservation_is_a_duplicate_without_upload_url()
         "reason present: {second}"
     );
     assert!(
-        second.get("signedUploadUrl").is_none(),
+        second.get("signed_upload_url").is_none(),
         "duplicate must not carry an upload URL: {second}"
     );
     assert!(
-        second.get("signedDownloadUrl").is_none(),
+        second.get("signed_download_url").is_none(),
         "no download URL: {second}"
     );
 }
@@ -482,9 +484,9 @@ async fn create_cache_entry_signed_download_url_404s_before_content() {
         &create_body("pending-cache", "v1"),
     )
     .await;
-    let download = body["signedDownloadUrl"]
+    let download = body["signed_download_url"]
         .as_str()
-        .expect("signedDownloadUrl present");
+        .expect("signed_download_url present");
     let path_and_query = download.strip_prefix(HOST).expect("URL uses the host");
     assert!(path_and_query.starts_with("/v2/artifacts/"), "{download}");
 
@@ -508,5 +510,8 @@ async fn create_cache_entry_ignores_unknown_fields() {
     let (status, value) = call(app, CREATE, &headers, body).await;
     assert_eq!(status, StatusCode::OK, "body: {value}");
     assert_eq!(value["ok"], json!(true));
-    assert!(value["signedUploadUrl"].as_str().is_some(), "body: {value}");
+    assert!(
+        value["signed_upload_url"].as_str().is_some(),
+        "body: {value}"
+    );
 }

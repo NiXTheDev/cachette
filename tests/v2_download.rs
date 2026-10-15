@@ -11,7 +11,7 @@
 //! Failure cases covered: finalize with a wrong size is `ok:false` (NOT 500);
 //! finalize with no published blob is 500 (never `ok:true`); an unknown entry
 //! with a valid signature is 404; a missing/tampered signed URL is 403; a
-//! download-URL miss is `{"ok":false,"signedDownloadUrl":""}`.
+//! download-URL miss is `{"ok":false,"signed_download_url":""}`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -185,7 +185,7 @@ async fn finalize(
     cache_id: &str,
     size: Option<u64>,
 ) -> (StatusCode, Value) {
-    let mut body = json!({"key": key, "version": version, "cacheId": cache_id});
+    let mut body = json!({"key": key, "version": version, "cache_id": cache_id});
     if let Some(size) = size {
         body["sizeBytes"] = json!(size);
     }
@@ -228,8 +228,12 @@ async fn lifecycle_create_upload_finalize_download_supersede_findmissing() {
 
     // --- old entry: create → 3 blocks → blocklist → finalize -----------------
     let old = create_entry(app.clone(), "old-cache", "v1").await;
-    let old_cache_id = old["cacheId"].as_str().expect("cacheId").to_owned();
-    let old_upload = host_relative(old["signedUploadUrl"].as_str().expect("signedUploadUrl"));
+    let old_cache_id = old["cache_id"].as_str().expect("cache_id").to_owned();
+    let old_upload = host_relative(
+        old["signed_upload_url"]
+            .as_str()
+            .expect("signed_upload_url"),
+    );
     let old_payload = upload_and_commit(
         app.clone(),
         &old_upload,
@@ -249,8 +253,12 @@ async fn lifecycle_create_upload_finalize_download_supersede_findmissing() {
 
     // --- new entry ----------------------------------------------------------
     let new = create_entry(app.clone(), "new-cache", "v1").await;
-    let new_cache_id = new["cacheId"].as_str().expect("cacheId").to_owned();
-    let new_upload = host_relative(new["signedUploadUrl"].as_str().expect("signedUploadUrl"));
+    let new_cache_id = new["cache_id"].as_str().expect("cache_id").to_owned();
+    let new_upload = host_relative(
+        new["signed_upload_url"]
+            .as_str()
+            .expect("signed_upload_url"),
+    );
     let new_payload = upload_and_commit(
         app.clone(),
         &new_upload,
@@ -272,9 +280,9 @@ async fn lifecycle_create_upload_finalize_download_supersede_findmissing() {
     let (status, old_dl) = get_download_url(app.clone(), "old-cache", "v1", None).await;
     assert_eq!(status, StatusCode::OK, "old url: {old_dl}");
     assert_eq!(old_dl["ok"], json!(true));
-    let old_url = old_dl["signedDownloadUrl"]
+    let old_url = old_dl["signed_download_url"]
         .as_str()
-        .expect("signedDownloadUrl");
+        .expect("signed_download_url");
     assert!(
         old_url.starts_with(&format!("{HOST}/v2/artifacts/old-cache?")),
         "{old_url}"
@@ -283,14 +291,14 @@ async fn lifecycle_create_upload_finalize_download_supersede_findmissing() {
         old_url.contains("&exp=") && old_url.contains("&mac="),
         "{old_url}"
     );
-    assert_eq!(old_dl["matchedKey"], json!("old-cache"));
+    assert_eq!(old_dl["matched_key"], json!("old-cache"));
 
     let (status, new_dl) = get_download_url(app.clone(), "new-cache", "v1", None).await;
     assert_eq!(status, StatusCode::OK, "new url: {new_dl}");
     assert_eq!(new_dl["ok"], json!(true));
-    let new_url = new_dl["signedDownloadUrl"]
+    let new_url = new_dl["signed_download_url"]
         .as_str()
-        .expect("signedDownloadUrl");
+        .expect("signed_download_url");
     assert!(
         new_url.starts_with(&format!("{HOST}/v2/artifacts/new-cache?")),
         "{new_url}"
@@ -342,14 +350,16 @@ async fn lifecycle_create_upload_finalize_download_supersede_findmissing() {
     let (status, body) =
         find_missing(app.clone(), &[("old-cache", "v1"), ("new-cache", "v1")]).await;
     assert_eq!(status, StatusCode::OK, "findmissing: {body}");
-    let entries = body["cacheEntries"].as_array().expect("cacheEntries array");
+    let entries = body["cache_entries"]
+        .as_array()
+        .expect("cache_entries array");
     assert_eq!(entries.len(), 1, "only the new entry is present: {body}");
     assert_eq!(entries[0]["key"], json!("new-cache"));
     assert_eq!(entries[0]["version"], json!("v1"));
     assert_eq!(entries[0]["size"], json!(new_payload.len() as u64));
     assert!(
-        entries[0]["creationTime"].as_u64().is_some(),
-        "creationTime present: {body}"
+        entries[0]["creation_time"].as_u64().is_some(),
+        "creation_time present: {body}"
     );
 
     // --- storage-level confirmation -----------------------------------------
@@ -366,11 +376,11 @@ async fn finalize_size_mismatch_is_ok_false_not_500() {
     let app = routes::router(state);
 
     let created = create_entry(app.clone(), "size-cache", "v1").await;
-    let cache_id = created["cacheId"].as_str().expect("cacheId").to_owned();
+    let cache_id = created["cache_id"].as_str().expect("cache_id").to_owned();
     let upload = host_relative(
-        created["signedUploadUrl"]
+        created["signed_upload_url"]
             .as_str()
-            .expect("signedUploadUrl"),
+            .expect("signed_upload_url"),
     );
     let payload = upload_and_commit(app.clone(), &upload, &[block_body(0)]).await;
 
@@ -463,7 +473,7 @@ async fn get_download_url_miss_is_ok_false_with_empty_url() {
     let (status, body) = get_download_url(app, "no-such-cache", "v1", None).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["ok"], json!(false));
-    assert_eq!(body["signedDownloadUrl"], json!(""));
+    assert_eq!(body["signed_download_url"], json!(""));
 }
 
 #[tokio::test]
@@ -472,11 +482,11 @@ async fn get_download_url_restore_key_prefix_fallback_hits() {
     let app = routes::router(state);
 
     let created = create_entry(app.clone(), "prefix-cache-abc", "v1").await;
-    let cache_id = created["cacheId"].as_str().expect("cacheId").to_owned();
+    let cache_id = created["cache_id"].as_str().expect("cache_id").to_owned();
     let upload = host_relative(
-        created["signedUploadUrl"]
+        created["signed_upload_url"]
             .as_str()
-            .expect("signedUploadUrl"),
+            .expect("signed_upload_url"),
     );
     let payload = upload_and_commit(app.clone(), &upload, &[block_body(5)]).await;
     let (_, body) = finalize(
@@ -494,9 +504,9 @@ async fn get_download_url_restore_key_prefix_fallback_hits() {
         get_download_url(app, "prefix-cache-xyz", "v1", Some(&["prefix-cache"])).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["ok"], json!(true), "body: {body}");
-    assert_eq!(body["matchedKey"], json!("prefix-cache-abc"));
+    assert_eq!(body["matched_key"], json!("prefix-cache-abc"));
     assert!(
-        body["signedDownloadUrl"]
+        body["signed_download_url"]
             .as_str()
             .is_some_and(|url| url.starts_with(&format!("{HOST}/v2/artifacts/prefix-cache-abc?"))),
         "body: {body}"
@@ -525,8 +535,12 @@ async fn supersede_allows_recreating_and_replacing_the_same_key() {
 
     // First generation.
     let first = create_entry(app.clone(), "rolling-cache", "v1").await;
-    let first_cache_id = first["cacheId"].as_str().expect("cacheId").to_owned();
-    let first_upload = host_relative(first["signedUploadUrl"].as_str().expect("signedUploadUrl"));
+    let first_cache_id = first["cache_id"].as_str().expect("cache_id").to_owned();
+    let first_upload = host_relative(
+        first["signed_upload_url"]
+            .as_str()
+            .expect("signed_upload_url"),
+    );
     let first_payload = upload_and_commit(app.clone(), &first_upload, &[block_body(0)]).await;
     let (_, body) = finalize(
         app.clone(),
@@ -564,8 +578,12 @@ async fn supersede_allows_recreating_and_replacing_the_same_key() {
         json!(true),
         "recreate after supersede: {second}"
     );
-    let second_cache_id = second["cacheId"].as_str().expect("cacheId").to_owned();
-    let second_upload = host_relative(second["signedUploadUrl"].as_str().expect("signedUploadUrl"));
+    let second_cache_id = second["cache_id"].as_str().expect("cache_id").to_owned();
+    let second_upload = host_relative(
+        second["signed_upload_url"]
+            .as_str()
+            .expect("signed_upload_url"),
+    );
     let second_payload = upload_and_commit(
         app.clone(),
         &second_upload,
@@ -585,7 +603,11 @@ async fn supersede_allows_recreating_and_replacing_the_same_key() {
     assert_ne!(second_payload, first_payload);
 
     let (_, dl) = get_download_url(app.clone(), "rolling-cache", "v1", None).await;
-    let url = host_relative(dl["signedDownloadUrl"].as_str().expect("signedDownloadUrl"));
+    let url = host_relative(
+        dl["signed_download_url"]
+            .as_str()
+            .expect("signed_download_url"),
+    );
     let reply = send(app, "GET", &url, &[], Vec::new()).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -600,11 +622,11 @@ async fn ranged_download_unsatisfiable_range_is_416() {
     let app = routes::router(state);
 
     let created = create_entry(app.clone(), "range-cache", "v1").await;
-    let cache_id = created["cacheId"].as_str().expect("cacheId").to_owned();
+    let cache_id = created["cache_id"].as_str().expect("cache_id").to_owned();
     let upload = host_relative(
-        created["signedUploadUrl"]
+        created["signed_upload_url"]
             .as_str()
-            .expect("signedUploadUrl"),
+            .expect("signed_upload_url"),
     );
     let payload = upload_and_commit(app.clone(), &upload, &[block_body(0)]).await;
     let (_, body) = finalize(
@@ -618,7 +640,11 @@ async fn ranged_download_unsatisfiable_range_is_416() {
     assert_eq!(body["ok"], json!(true));
 
     let (_, dl) = get_download_url(app.clone(), "range-cache", "v1", None).await;
-    let url = host_relative(dl["signedDownloadUrl"].as_str().expect("signedDownloadUrl"));
+    let url = host_relative(
+        dl["signed_download_url"]
+            .as_str()
+            .expect("signed_download_url"),
+    );
     let reply = send(
         app,
         "GET",
@@ -641,5 +667,5 @@ async fn find_missing_absent_pairs_report_nothing() {
 
     let (status, body) = find_missing(app, &[("absent-a", "v1"), ("absent-b", "v2")]).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body, json!({"cacheEntries": []}));
+    assert_eq!(body, json!({"cache_entries": []}));
 }

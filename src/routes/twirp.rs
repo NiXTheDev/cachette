@@ -7,17 +7,24 @@
 //! answers with Twirp-shaped error envelopes. Real cache behaviour is deferred:
 //! tasks 24-26 replace the skeleton bodies.
 //!
-//! Method → (request fields, skeleton response body): the JSON names match the
+//! Method → (request fields, response body): the JSON names match the
 //! go-actions-cache `CacheService` contract (the vendored `.proto` is owned by
-//! task 22 and may not exist yet, so the field names live here as the record):
+//! task 22 and may not exist yet, so the field names live here as the record).
+//!
+//! **JSON casing**: Twirp marshals with the proto field names, which are
+//! `snake_case`; the vendored go-actions-cache client (`cache_v2.go`) reads
+//! `encoding/json` struct tags like `signed_upload_url`, `signed_download_url`,
+//! `matched_key`, `size_bytes`, `restore_keys`, `entry_id`. Responses therefore
+//! use `snake_case`. Requests accept BOTH spellings (`serde` `alias`) so a
+//! camelCase caller still parses.
 //!
 //! | method | request | response |
 //! |---|---|---|
-//! | `CreateCacheEntry` | `metadata`, `key`, `version`, `scope` | `{"ok","signedUploadUrl","signedDownloadUrl","cacheId"}` (task 24) |
-//! | `FinalizeCacheEntryUpload` | `metadata`, `key`, `sizeBytes`, `version`, `cacheId` | `{"ok":true}` or `{"ok":false,"message":"..."}` |
+//! | `CreateCacheEntry` | `metadata`, `key`, `version`, `scope` | `{"ok","signed_upload_url","signed_download_url","cache_id"}` (task 24) |
+//! | `FinalizeCacheEntryUpload` | `metadata`, `key`, `size_bytes`, `version`, `cache_id` | `{"ok":true}` or `{"ok":false,"message":"..."}` |
 //! | `SupersedeCacheEntry` | `metadata`, `key`, `version` | `{"ok":true}` |
-//! | `GetCacheEntryDownloadURL` | `metadata`, `key`, `restoreKeys`, `version` | `{"ok":true,"signedDownloadUrl":"...","matchedKey":"..."}` or `{"ok":false,"signedDownloadUrl":""}` |
-//! | `FindMissingOrStaleCacheEntries` | `keyVersions` | `{"cacheEntries":[{"key","version","size","creationTime"}]}` |
+//! | `GetCacheEntryDownloadURL` | `metadata`, `key`, `restore_keys`, `version` | `{"ok":true,"signed_download_url":"...","matched_key":"..."}` or `{"ok":false,"signed_download_url":""}` |
+//! | `FindMissingOrStaleCacheEntries` | `key_versions` | `{"cache_entries":[{"key","version","size","creation_time"}]}` |
 //!
 //! Auth policy on `/twirp/*` (mirrors the v1 handler matrix):
 //! * static tokens (`[auth] tokens` + the dynamic `TokenStore`) are accepted in
@@ -119,9 +126,10 @@ const ARTIFACT_PATH_PREFIX: &str = "/v2/artifacts/";
 // [`super::FALLBACK_SIGNING_SECRET`]) so minting and validation always agree.
 
 /// `FinalizeCacheEntryUpload` request (go-actions-cache proto fields `key`,
-/// `version`, `sizeBytes`, `cacheId`). Only `key`, `sizeBytes`, and `cacheId`
-/// are consumed: the published entry is addressed by its artifact key, and the
-/// proto's `metadata`/`version` are ignored (serde drops unknown fields).
+/// `version`, `size_bytes`, `cache_id`). Only `key`, `size_bytes`, and
+/// `cache_id` are consumed: the published entry is addressed by its artifact
+/// key, and the proto's `metadata`/`version` are ignored (serde drops unknown
+/// fields). Both `sizeBytes`/`cacheId` aliases are accepted for tolerance.
 #[derive(serde::Deserialize)]
 struct FinalizeCacheEntryUploadRequest {
     #[serde(default)]
@@ -285,11 +293,14 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         "{base}{download_path}{}",
         urls::mint(&download_path, &cache_id, secret, ttl, now).query()
     );
+    // `snake_case` proto/Twirp JSON names (see the module docs): the vendored
+    // go-actions-cache `cache_v2.go` reads `signed_upload_url` from this
+    // response, so camelCase would silently break its `Save`.
     Json(json!({
         "ok": true,
-        "signedUploadUrl": signed_upload,
-        "signedDownloadUrl": signed_download,
-        "cacheId": cache_id,
+        "signed_upload_url": signed_upload,
+        "signed_download_url": signed_download,
+        "cache_id": cache_id,
     }))
     .into_response()
 }
@@ -331,7 +342,7 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
         );
     }
     // The published entry is addressed by its artifact key (B5 commit). Fall
-    // back to the reservation `cacheId` for a backend that publishes under the
+    // back to the reservation `cache_id` for a backend that publishes under the
     // reservation id instead.
     let stat = match storage.stat(&key).await {
         Ok(Some(stat)) => Some(stat),
@@ -395,13 +406,14 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
 }
 
 /// `GetCacheEntryDownloadURL` (plan task 26): find a complete entry for `key`
-/// (falling back through `restoreKeys` in order, exactly like
+/// (falling back through `restore_keys` in order, exactly like
 /// [`v1::find`](super::v1)) and mint a signed download URL bound to
-/// `/v2/artifacts/{matchedKey}` on `server.external_url`.
+/// `/v2/artifacts/{matched_key}` on `server.external_url`.
 ///
-/// Hit → 200 `{"ok":true,"signedDownloadUrl":"...","matchedKey":"..."}`;
-/// miss → 200 `{"ok":false,"signedDownloadUrl":""}`. The proto field is
-/// `signedDownloadUrl`.
+/// Hit → 200 `{"ok":true,"signed_download_url":"...","matched_key":"..."}`;
+/// miss → 200 `{"ok":false,"signed_download_url":""}`. The proto field is
+/// `signed_download_url` (snake_case: the vendored client reads that exact
+/// key).
 ///
 /// Single-node: mints locally. In cluster mode task 32 forwards this to the
 /// owner (`POST B/_internal/peers/v2/getdownloadurl`).
@@ -475,18 +487,18 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
             );
             Json(json!({
                 "ok": true,
-                "signedDownloadUrl": signed,
-                "matchedKey": matched_key,
+                "signed_download_url": signed,
+                "matched_key": matched_key,
             }))
             .into_response()
         }
-        None => Json(json!({"ok": false, "signedDownloadUrl": ""})).into_response(),
+        None => Json(json!({"ok": false, "signed_download_url": ""})).into_response(),
     }
 }
 
 /// `FindMissingOrStaleCacheEntries` (plan task 26): report the requested
 /// key-version pairs that are PRESENT as complete entries. Missing pairs are
-/// implicitly absent from `cacheEntries`.
+/// implicitly absent from `cache_entries`.
 ///
 /// Single-node: reports this node's entries. In cluster mode task 32 fans the
 /// query out across healthy peers and unions the responses
@@ -505,7 +517,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
         tracing::debug!("v2 findmissing: cluster mode (peer fan-out wired in task 32)");
     }
     let Some(storage) = state.storage.as_deref() else {
-        return Json(json!({"cacheEntries": []})).into_response();
+        return Json(json!({"cache_entries": []})).into_response();
     };
     let finalized = match storage.list().await {
         Ok(entries) => entries,
@@ -540,17 +552,20 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
                 "key": hit.key.clone(),
                 "version": version,
                 "size": hit.size,
-                "creationTime": hit.created_at,
+                "creation_time": hit.created_at,
             }));
         }
     }
-    Json(json!({"cacheEntries": cache_entries})).into_response()
+    Json(json!({"cache_entries": cache_entries})).into_response()
 }
-/// Duplicate-entry body (plan task 24): HTTP 200 `{"ok":false,...}` with the
-/// `otherFields.duplicateKey` flag and a human reason — deliberately NOT 400.
+/// Duplicate-entry body (plan task 24): HTTP 200 `{"ok":false,...}` with a human
+/// `message` (the field the go-actions-cache `cache_v2.go` reads), the
+/// `reason`/`otherFields.duplicateKey` flag the plan records — deliberately NOT
+/// 400.
 fn duplicate_entry_response() -> Response {
     Json(json!({
         "ok": false,
+        "message": "a cache entry already exists for this key and version",
         "reason": "a cache entry already exists for this key and version",
         "otherFields": { "duplicateKey": true },
     }))

@@ -126,8 +126,10 @@ async fn create_entry(app: Router, key: &str, version: &str) -> Value {
 async fn signed_upload(app: Router, key: &str) -> (String, String) {
     let body = create_entry(app, key, "v1").await;
     assert_eq!(body["ok"], Value::Bool(true));
-    let cache_id = body["cacheId"].as_str().expect("cacheId").to_owned();
-    let upload = body["signedUploadUrl"].as_str().expect("signedUploadUrl");
+    let cache_id = body["cache_id"].as_str().expect("cache_id").to_owned();
+    let upload = body["signed_upload_url"]
+        .as_str()
+        .expect("signed_upload_url");
     let path_and_query = upload.strip_prefix(HOST).expect("host-relative URL");
     (path_and_query.to_owned(), cache_id)
 }
@@ -344,9 +346,9 @@ async fn tampered_signed_url_is_403() {
 async fn expired_signed_url_is_403() {
     let (state, _storage) = state();
     let app = routes::router(state);
-    let cache_id = create_entry(app.clone(), "expired-cache", "v1").await["cacheId"]
+    let cache_id = create_entry(app.clone(), "expired-cache", "v1").await["cache_id"]
         .as_str()
-        .expect("cacheId")
+        .expect("cache_id")
         .to_owned();
 
     // A genuinely minted URL whose exp is one second in the past.
