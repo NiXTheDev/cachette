@@ -1,0 +1,39 @@
+#!/bin/sh
+set -euxo pipefail
+
+# Ensure cargo is available
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: cargo not found in PATH (tried adding ~/.cargo/bin)"
+    exit 1
+fi
+
+# ---- Original sample checks ----
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    against=HEAD
+else
+    against=$(git hash-object -t tree /dev/null)
+fi
+
+allownonascii=$(git config --type=bool hooks.allownonascii 2>/dev/null) || allownonascii=false
+
+if [ "$allownonascii" != "true" ]; then
+    # Check for non-ASCII filenames
+    if git diff-index --cached --name-only --diff-filter=A -z $against |
+         tr '\0' '\n' |
+         LC_ALL=C grep -q '[^ -~]'; then
+        cat <<\EOF
+Error: Attempt to add a non-ASCII file name.
+EOF
+        exit 1
+    fi
+fi
+
+git diff-index --check --cached $against -- || exit 1
+
+# ---- Rust checks ----
+cargo fmt --check || exit 1
+cargo check --workspace || exit 1
+cargo clippy --all-targets -- -D warnings || exit 1
+cargo test --workspace || exit 1
+
+echo "All checks passed!"
