@@ -12,6 +12,7 @@
 //! task 23) is served by [`twirp`], which enforces its own bearer/JWT policy.
 //! Public routes and the 404/405 fallbacks never require a client cert.
 
+mod body_io;
 mod health;
 mod peer_relay;
 mod twirp;

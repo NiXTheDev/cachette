@@ -102,6 +102,7 @@ async fn start_server(pinned: &[&Identity]) -> (SocketAddr, Identity) {
         external_url: None,
         tls_cert: None,
         tls_key: None,
+        max_chunk_bytes: 64 * 1024 * 1024,
     };
     let config = tls::server_config(&section, &server).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");

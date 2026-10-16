@@ -49,6 +49,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
+use super::body_io::{BodyReader, LimitedReader};
 use crate::auth::{self, urls};
 use crate::cluster::relay::{self, RelayCommit, RelayReserve, RelayUpload};
 use crate::config::{AuthMode, KeyCase};
@@ -74,11 +75,6 @@ const ARTIFACT_PATH_PREFIX: &str = "/_apis/artifactcache/artifacts/";
 
 /// Error name carried in the duplicate-reserve body (GitHub v1 spec).
 const DUPLICATE_ERROR: &str = "ArtifactCacheItemAlreadyExistsException";
-
-/// Largest single PATCH chunk accepted (guards the in-memory read; the
-/// go-actions-cache fixture uses 32 MiB chunks, the toolkit 4 MiB). Shared with
-/// the peer upload route (plan task 31).
-pub(crate) const MAX_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `GET /_apis/artifactcache/cache` query parameters.
 #[derive(serde::Deserialize)]
@@ -323,28 +319,39 @@ pub async fn patch_chunk(
             .into_response();
     };
     let expected = range.len();
-    if expected > MAX_CHUNK_BYTES {
+    if expected > state.cache.max_chunk_bytes {
         return ApiError::BadRequest(String::from("chunk exceeds the maximum size"))
             .into_response();
     }
-    let limit = usize::try_from(expected).unwrap_or(usize::MAX);
-    let bytes = match to_bytes(body, limit).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return ApiError::BadRequest(String::from("chunk body could not be read"))
+    // Cluster relay (plan task 31): a `cacheId` reserved on a peer forwards the
+    // chunk to the owner. The hand-rolled peer client needs the bytes, so this
+    // is the one path that buffers a chunk — bounded by the cap just checked.
+    if let Some(relay) = state.relay.as_deref() {
+        let limit = usize::try_from(expected).unwrap_or(usize::MAX);
+        let bytes = match to_bytes(body, limit).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return ApiError::BadRequest(String::from("chunk body could not be read"))
+                    .into_response();
+            }
+        };
+        if bytes.len() as u64 != expected {
+            return ApiError::BadRequest(String::from("chunk length does not match Content-Range"))
                 .into_response();
         }
-    };
-    if bytes.len() as u64 != expected {
-        return ApiError::BadRequest(String::from("chunk length does not match Content-Range"))
-            .into_response();
-    }
-    // Cluster relay (plan task 31): a `cacheId` reserved on a peer forwards the
-    // chunk to the owner. Anything else — a self-owned reservation or a
-    // single-node deployment — writes locally exactly as before.
-    if let Some(relay) = state.relay.as_deref() {
         match relay.upload(&cache_id, range.start, &bytes).await {
-            RelayUpload::NoSession => {}
+            // No relay session: a self-owned or single-node reservation. Fall
+            // through to the local write with the bytes already in hand.
+            RelayUpload::NoSession => {
+                let chunk = Chunk {
+                    range,
+                    body: Box::pin(std::io::Cursor::new(bytes)),
+                };
+                return match LocalRelay.stream_to_owner(storage, &cache_id, chunk).await {
+                    Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                    Err(err) => chunk_error(err),
+                };
+            }
             RelayUpload::Written => return StatusCode::NO_CONTENT.into_response(),
             RelayUpload::NotFound => return ApiError::not_found().into_response(),
             RelayUpload::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
@@ -355,7 +362,10 @@ pub async fn patch_chunk(
             }
         }
     }
-    let stream: ByteStream<'_> = Box::pin(std::io::Cursor::new(bytes));
+    // Single-node (the common case): stream the body straight into storage. The
+    // body is never held whole; `LimitedReader` fails the copy if it runs past
+    // the declared `Content-Range`, and `write_chunk` rejects a short body.
+    let stream: ByteStream<'_> = Box::pin(LimitedReader::new(BodyReader::new(body), expected));
     let chunk = Chunk {
         range,
         body: stream,

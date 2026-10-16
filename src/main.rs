@@ -158,6 +158,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
         key_case: config.cache.key_case,
         signed_url_ttl_seconds: config.v1.signed_url_ttl_seconds,
+        max_chunk_bytes: config.server.max_chunk_bytes,
     };
     // Resolve the B3 `total` once at boot (plan task 31): the peer reserve
     // admission path must not do a blocking disk query per request.

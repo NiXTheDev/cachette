@@ -414,6 +414,7 @@ mod tests {
             Some("CHANGE_ME_MIN_16_CHARS")
         );
         assert_eq!(config.cache.reservation_ttl_seconds, 3600);
+        assert_eq!(config.server.max_chunk_bytes, 64 * 1024 * 1024);
         config.require_auth_secret().expect("fixture secret serves");
         let rendered = render_masked(&config).expect("example renders masked");
         assert!(!rendered.contains("CHANGE_ME_MIN_16_CHARS"));

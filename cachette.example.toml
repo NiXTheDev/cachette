@@ -21,6 +21,11 @@ listen = "0.0.0.0:8080"
 # tls_cert = "/etc/cachette/tls.crt"
 # tls_key  = "/etc/cachette/tls.key"
 
+# Largest single upload chunk / Azure block accepted, in bytes. Bounds the
+# memory one upload request can hold. Default 64 MiB (2x the largest chunk the
+# real go-actions-cache client sends).
+max_chunk_bytes = 67108864
+
 [storage]
 # Storage backend. Only "fs" is supported in v1.
 backend = "fs"

@@ -26,6 +26,9 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.cache.reservation_ttl_seconds == 0 {
         return Err(ConfigError::ZeroReservationTtl);
     }
+    if config.server.max_chunk_bytes == 0 {
+        return Err(ConfigError::ZeroMaxChunkBytes);
+    }
     if let Some(cert_path) = config.cluster.cert_path.as_ref()
         && *cert_path == config.storage.fs.path
     {
@@ -172,6 +175,17 @@ mod tests {
         let err = validate(&config).expect_err("zero ttl");
         assert!(
             matches!(err, ConfigError::ZeroReservationTtl),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn zero_max_chunk_bytes_is_rejected() {
+        let mut config = Config::default();
+        config.server.max_chunk_bytes = 0;
+        let err = validate(&config).expect_err("zero chunk cap");
+        assert!(
+            matches!(err, ConfigError::ZeroMaxChunkBytes),
             "unexpected error: {err:?}"
         );
     }

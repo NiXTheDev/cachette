@@ -140,6 +140,7 @@ fn state_with(
         reservation_ttl_seconds: 3600,
         key_case: KeyCase::Lower,
         signed_url_ttl_seconds: 900,
+        max_chunk_bytes: 64 * 1024 * 1024,
     };
     state.capacity_total = max_size;
     state
@@ -154,6 +155,7 @@ async fn serve(state: AppState, identity: &Identity) -> (SocketAddr, JoinHandle<
         external_url: None,
         tls_cert: None,
         tls_key: None,
+        max_chunk_bytes: 64 * 1024 * 1024,
     };
     let config = tls::server_config(&section, identity).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");

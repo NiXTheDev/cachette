@@ -899,7 +899,7 @@ async fn exchange_with(
         stream.write_all(body).await?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await?;
-        parse_response(&raw)
+        parse_response(raw)
     };
     match tokio::time::timeout(timeout, request).await {
         Ok(result) => result,
@@ -1054,31 +1054,30 @@ struct PeerResponse {
 
 /// Parse a raw HTTP/1.1 response into its status code and body. The peer sets
 /// `Content-Length` (JSON) or sends an empty body, so a plain head/body split
-/// is sufficient.
-fn parse_response(raw: &[u8]) -> io::Result<PeerResponse> {
-    let (head, body) = split_head_body(raw);
-    let head = String::from_utf8_lossy(head);
-    let status = head
+/// is sufficient. Takes ownership of `raw` and shifts the body down in place,
+/// so the received buffer is reused instead of copied (plan task 45).
+fn parse_response(mut raw: Vec<u8>) -> io::Result<PeerResponse> {
+    let body_start = head_body_split(&raw);
+    let status = String::from_utf8_lossy(&raw[..body_start])
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no HTTP status in response"))?;
-    Ok(PeerResponse {
-        status,
-        body: body.to_vec(),
-    })
+    raw.drain(..body_start);
+    Ok(PeerResponse { status, body: raw })
 }
 
-/// Split a raw response at the header/body separator (`\r\n\r\n`).
-fn split_head_body(raw: &[u8]) -> (&[u8], &[u8]) {
+/// Index just past the header/body separator (`\r\n\r\n`), or `raw.len()` when
+/// the response carries no separator.
+fn head_body_split(raw: &[u8]) -> usize {
     let mut index = 0;
     while index + 4 <= raw.len() {
         if &raw[index..index + 4] == b"\r\n\r\n" {
-            return (&raw[..index], &raw[index + 4..]);
+            return index + 4;
         }
         index += 1;
     }
-    (raw, &[])
+    raw.len()
 }
 
 /// Whether two peer records denote the same node (identity + dial address).
@@ -1099,7 +1098,7 @@ mod tests {
     #[test]
     fn parse_response_reads_status_and_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"a\":\"b\"}xx";
-        let parsed = parse_response(raw).expect("parses");
+        let parsed = parse_response(raw.to_vec()).expect("parses");
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body, b"{\"a\":\"b\"}xx");
     }
@@ -1107,17 +1106,15 @@ mod tests {
     #[test]
     fn parse_response_handles_a_bodyless_status() {
         let raw = b"HTTP/1.1 204 No Content\r\n\r\n";
-        let parsed = parse_response(raw).expect("parses");
+        let parsed = parse_response(raw.to_vec()).expect("parses");
         assert_eq!(parsed.status, 204);
         assert!(parsed.body.is_empty());
     }
 
     #[test]
-    fn split_head_body_without_separator_returns_no_body() {
+    fn head_body_split_without_separator_returns_the_whole_buffer() {
         let raw = b"HTTP/1.1 200 OK";
-        let (head, body) = split_head_body(raw);
-        assert_eq!(head, raw);
-        assert!(body.is_empty());
+        assert_eq!(head_body_split(raw), raw.len());
     }
 
     #[test]

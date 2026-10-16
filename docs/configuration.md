@@ -30,6 +30,7 @@ Closed sets (enums) are validated at parse time; structural rules (below) at
 | `external_url` | string | derived | Absolute base URL advertised to clients. When unset it is derived from `listen` as `http://<host>:<port>`, with a wildcard host mapped to loopback (`0.0.0.0` -> `127.0.0.1`, `::` -> `[::1]`). Set it explicitly to your public `https://...` when a reverse proxy terminates TLS, so the v1 `archiveLocation` and v2 capability URLs are absolute and correct. |
 | `tls_cert` | path | unset | PEM certificate. Must be set together with `tls_key`. |
 | `tls_key` | path | unset | PEM private key. Must be set together with `tls_cert`. |
+| `max_chunk_bytes` | integer | `67108864` (64 MiB) | Largest single upload chunk (v1 `PATCH`) or Azure block (v2) accepted. The request path streams uploads, so this bounds one in-flight request rather than the process; a body over the cap is rejected with 400. Must be at least as large as the biggest chunk your client sends (the go-actions-cache client uses 32 MiB). |
 
 When `tls_cert`/`tls_key` are unset, the server uses the node identity
 certificate minted on first boot (see [cluster.md](cluster.md)).

@@ -124,7 +124,7 @@ pub(crate) async fn upload(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let limit = usize::try_from(super::v1::MAX_CHUNK_BYTES).unwrap_or(usize::MAX);
+    let limit = usize::try_from(state.cache.max_chunk_bytes).unwrap_or(usize::MAX);
     let bytes = match to_bytes(body, limit).await {
         Ok(bytes) => bytes,
         Err(_) => {

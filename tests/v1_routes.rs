@@ -842,6 +842,24 @@ async fn patch_body_length_mismatch_returns_400() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 }
 
+/// Plan task 45: the chunk ceiling comes from config (`[server]
+/// max_chunk_bytes`), not a compile-time constant, and an over-cap body is
+/// rejected before it is written.
+#[tokio::test]
+async fn patch_over_the_configured_max_chunk_bytes_returns_400() {
+    let (mut state, _dir) = fs_state().await;
+    state.cache.max_chunk_bytes = 1024;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+
+    let over = patch(&app, &cache_id, 0, 2047, 2048, 7).await;
+    assert_eq!(over.status, StatusCode::BAD_REQUEST);
+
+    // Exactly at the cap still lands (the bound is inclusive).
+    let at_cap = patch(&app, &cache_id, 0, 1023, 1024, 7).await;
+    assert_eq!(at_cap.status, StatusCode::NO_CONTENT);
+}
+
 #[tokio::test]
 async fn commit_then_find_and_download_round_trip() {
     let (state, _dir) = fs_state().await;

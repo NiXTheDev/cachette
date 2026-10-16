@@ -54,11 +54,6 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::{ByteStream, StorageBackend};
 
-/// Largest request body buffered (a single Azure Put Block payload). Mirrors
-/// the v1 PATCH chunk cap; Azure's own Put Block limit is far larger, but the
-/// go-actions-cache client uses a few MiB per block.
-const MAX_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
-
 /// Azure response header echoing a per-request id.
 const REQUEST_ID_HEADER: &str = "x-ms-request-id";
 
@@ -87,11 +82,12 @@ pub async fn upload(
     if let Err(err) = urls::validate(&query, &path, secret, auth::now_secs()) {
         return ApiError::from(err).into_response();
     }
+    let max_bytes = usize::try_from(state.cache.max_chunk_bytes).unwrap_or(usize::MAX);
     match query.get("comp").map(String::as_str) {
-        Some("block") => stage_block(storage, &entry_id, &query, body).await,
-        Some("blocklist") => commit_block_list(storage, &entry_id, &query, body).await,
-        None => put_blob(storage, &entry_id, body).await,
-        Some(_) => unsupported_comp(body).await,
+        Some("block") => stage_block(storage, &entry_id, &query, body, max_bytes).await,
+        Some("blocklist") => commit_block_list(storage, &entry_id, &query, body, max_bytes).await,
+        None => put_blob(storage, &entry_id, body, max_bytes).await,
+        Some(_) => unsupported_comp(body, max_bytes).await,
     }
 }
 
@@ -101,6 +97,7 @@ async fn stage_block(
     entry_id: &str,
     query: &HashMap<String, String>,
     body: Body,
+    max_bytes: usize,
 ) -> Response {
     let Some(raw) = query.get("blockid").filter(|value| !value.is_empty()) else {
         return ApiError::BadRequest(String::from("blockid query parameter is required"))
@@ -116,7 +113,7 @@ async fn stage_block(
         .into_response();
     }
     let block_id = to_hex(&decoded);
-    let bytes = match read_body(body).await {
+    let bytes = match read_body(body, max_bytes).await {
         Ok(bytes) => bytes,
         Err(err) => return err.into_response(),
     };
@@ -137,10 +134,11 @@ async fn commit_block_list(
     entry_id: &str,
     query: &HashMap<String, String>,
     body: Body,
+    max_bytes: usize,
 ) -> Response {
     let xml = match query.get("blocklist").filter(|value| !value.is_empty()) {
         Some(xml) => xml.clone(),
-        None => match read_body(body).await {
+        None => match read_body(body, max_bytes).await {
             Ok(bytes) if bytes.is_empty() => {
                 return ApiError::BadRequest(String::from("blocklist query parameter is required"))
                     .into_response();
@@ -175,8 +173,13 @@ async fn commit_block_list(
 /// The body is staged under a synthetic block token and immediately assembled,
 /// so it publishes under the artifact key exactly like the block-list path.
 /// A bodiless request stays the historical 201 no-op.
-async fn put_blob(storage: &dyn StorageBackend, entry_id: &str, body: Body) -> Response {
-    let bytes = match read_body(body).await {
+async fn put_blob(
+    storage: &dyn StorageBackend,
+    entry_id: &str,
+    body: Body,
+    max_bytes: usize,
+) -> Response {
+    let bytes = match read_body(body, max_bytes).await {
         Ok(bytes) => bytes,
         Err(err) => return err.into_response(),
     };
@@ -199,8 +202,8 @@ async fn put_blob(storage: &dyn StorageBackend, entry_id: &str, body: Body) -> R
 
 /// Any `comp` other than `block`/`blocklist`: a request body makes it a
 /// protocol error (400); a bodyless no-op is accepted as 201.
-async fn unsupported_comp(body: Body) -> Response {
-    match read_body(body).await {
+async fn unsupported_comp(body: Body, max_bytes: usize) -> Response {
+    match read_body(body, max_bytes).await {
         Ok(bytes) if bytes.is_empty() => created(),
         Ok(_) => ApiError::BadRequest(String::from("unsupported comp carries a request body"))
             .into_response(),
@@ -208,9 +211,12 @@ async fn unsupported_comp(body: Body) -> Response {
     }
 }
 
-/// Buffer the request body (bounded by [`MAX_BLOCK_BYTES`]).
-async fn read_body(body: Body) -> Result<Bytes, ApiError> {
-    to_bytes(body, MAX_BLOCK_BYTES as usize)
+/// Buffer the request body, bounded by `limit` — the configured
+/// `[server] max_chunk_bytes` (plan task 45). The `blocklist` XML and
+/// `put_blob` bodies are inherently whole-document reads; `put_block` stages
+/// whatever buffer it is handed without a second copy.
+async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
+    to_bytes(body, limit)
         .await
         .map_err(|_| ApiError::BadRequest(String::from("request body could not be read")))
 }

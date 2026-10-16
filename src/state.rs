@@ -27,6 +27,10 @@ pub struct CacheLimits {
     pub key_case: KeyCase,
     /// `[v1] signed_url_ttl_seconds` for capability/signed URLs.
     pub signed_url_ttl_seconds: u64,
+    /// `[server] max_chunk_bytes` (plan task 45): the largest single PATCH
+    /// chunk / Azure block the request path accepts. One request can hold at
+    /// most this many bytes, so it bounds per-request memory.
+    pub max_chunk_bytes: u64,
 }
 
 impl Default for CacheLimits {
@@ -37,6 +41,7 @@ impl Default for CacheLimits {
             reservation_ttl_seconds: 3600,
             key_case: KeyCase::Preserve,
             signed_url_ttl_seconds: crate::config::V1Config::default().signed_url_ttl_seconds,
+            max_chunk_bytes: crate::config::ServerConfig::default().max_chunk_bytes,
         }
     }
 }

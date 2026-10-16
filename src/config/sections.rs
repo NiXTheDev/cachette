@@ -18,6 +18,10 @@ pub struct ServerConfig {
     pub external_url: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Largest single uploaded chunk/block accepted (bytes). Bounds how much
+    /// one request may occupy on the request path (plan task 45); the default
+    /// is 2x the largest chunk any real client (go-actions-cache) sends.
+    pub max_chunk_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +31,7 @@ impl Default for ServerConfig {
             external_url: None,
             tls_cert: None,
             tls_key: None,
+            max_chunk_bytes: 64 * 1024 * 1024,
         }
     }
 }

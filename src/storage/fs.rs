@@ -442,17 +442,25 @@ impl StorageBackend for FsStorage {
         mut source: ByteStream<'a>,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            // Buffer first so a cancelled future never reaches the
-            // filesystem; the only un-cancellable window is the final atomic
-            // rename, which stages complete bytes — never partial, never
-            // visible without a later finalize.
-            let mut data = Vec::new();
-            source.read_to_end(&mut data).await?;
-            let _gate = self.gate.write().await;
+            // Stream straight to the scratch file instead of buffering the
+            // whole body (plan task 45: this path used to be a latent
+            // whole-blob RAM bomb). The per-key lock keeps two concurrent puts
+            // of the same key off one scratch file; the guard drops a partial
+            // scratch file if the future is cancelled mid-copy.
+            let chunk_lock = self.chunk_lock(key);
+            let _chunk_guard = chunk_lock.lock().await;
             let id = entry_id(key);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
-            blocking(move || write_atomic(&tmp, &part, &data)).await
+            let guard = TmpGuard::new(tmp.clone());
+            stream_chunk_to_file(&tmp, &mut source).await?;
+            // The one un-cancellable window is the atomic rename under the
+            // write gate, which stages complete bytes — never partial, never
+            // visible without a later finalize.
+            let _gate = self.gate.write().await;
+            tokio::fs::rename(&tmp, &part).await?;
+            guard.disarm();
+            Ok(())
         })
     }
 
@@ -831,9 +839,11 @@ impl StorageBackend for FsStorage {
                 .root
                 .join("tmp")
                 .join(format!("{id}-{}.chunk.tmp", chunk.range.start));
+            // The guard drops the partial temp file if the copy errors or the
+            // request is cancelled mid-body (plan task 45).
+            let guard = TmpGuard::new(tmp.clone());
             let written = stream_chunk_to_file(&tmp, &mut chunk.body).await?;
             if written != chunk.range.len() {
-                let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(invalid_range(
                     "chunk body length does not match Content-Range",
                 ));
@@ -841,6 +851,7 @@ impl StorageBackend for FsStorage {
             let dest = dir.join(format!("{}.part", chunk.range.start));
             tokio::fs::create_dir_all(&dir).await?;
             tokio::fs::rename(&tmp, &dest).await?;
+            guard.disarm();
             Ok(ChunkOutcome::Written)
         })
     }
@@ -965,14 +976,11 @@ impl StorageBackend for FsStorage {
         mut source: ByteStream<'a>,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            // Buffer first so a cancelled future never reaches the filesystem
-            // (same cancel-safety rule as `put_stream`).
-            let mut data = Vec::new();
-            source.read_to_end(&mut data).await?;
-            let _gate = self.gate.write().await;
+            // Stream into the scratch file first: the block body is never held
+            // whole in memory (plan task 45). The guard drops the partial
+            // scratch file if the future is cancelled mid-copy.
             let res_id = entry_id(cache_id);
             let now = unix_now();
-            let conn = Arc::clone(&self.conn);
             let cache_id = cache_id.to_owned();
             let block_id = block_id.to_owned();
             let dir = self.root.join("parts").join(&cache_id).join("blocks");
@@ -981,35 +989,47 @@ impl StorageBackend for FsStorage {
                 .join("tmp")
                 .join(format!("{res_id}-{block_id}.block.tmp"));
             let dest = dir.join(format!("{block_id}.block"));
-            blocking(move || {
-                let status = {
-                    let conn = lock(&conn)?;
-                    let row: Option<(i64, Option<i64>)> = conn
-                        .query_row(
-                            "SELECT complete, reservation_expires_at FROM entries WHERE id = ?1",
-                            [&res_id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .optional()
-                        .map_err(sql)?;
-                    match row {
-                        None => ReservationState::Missing,
-                        Some((1, _)) => ReservationState::Complete,
-                        Some((0, Some(expires_at))) if expires_at <= now => {
-                            ReservationState::Missing
+            let guard = TmpGuard::new(tmp.clone());
+            stream_chunk_to_file(&tmp, &mut source).await?;
+            // Validate the reservation under the write gate, then publish with
+            // one atomic rename.
+            let _gate = self.gate.write().await;
+            let conn = Arc::clone(&self.conn);
+            {
+                let res_id = res_id.clone();
+                let cache_id = cache_id.clone();
+                blocking(move || {
+                    let status = {
+                        let conn = lock(&conn)?;
+                        let row: Option<(i64, Option<i64>)> = conn
+                            .query_row(
+                                "SELECT complete, reservation_expires_at FROM entries WHERE id = ?1",
+                                [&res_id],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .optional()
+                            .map_err(sql)?;
+                        match row {
+                            None => ReservationState::Missing,
+                            Some((1, _)) => ReservationState::Complete,
+                            Some((0, Some(expires_at))) if expires_at <= now => {
+                                ReservationState::Missing
+                            }
+                            Some(_) => ReservationState::Open,
                         }
-                        Some(_) => ReservationState::Open,
+                    };
+                    match status {
+                        ReservationState::Complete => Err(complete(&cache_id)),
+                        ReservationState::Missing => Err(not_found(&cache_id)),
+                        ReservationState::Open => Ok(()),
                     }
-                };
-                match status {
-                    ReservationState::Complete => return Err(complete(&cache_id)),
-                    ReservationState::Missing => return Err(not_found(&cache_id)),
-                    ReservationState::Open => {}
-                }
-                std::fs::create_dir_all(&dir)?;
-                write_atomic(&tmp, &dest, &data)
-            })
-            .await
+                })
+                .await?;
+            }
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::rename(&tmp, &dest).await?;
+            guard.disarm();
+            Ok(())
         })
     }
 
@@ -1180,6 +1200,35 @@ fn write_atomic(tmp: &Path, dest: &Path, data: &[u8]) -> io::Result<()> {
     drop(file);
     std::fs::rename(tmp, dest)?;
     Ok(())
+}
+
+/// Removes a scratch file when dropped, unless [`disarm`](Self::disarm)ed.
+///
+/// The streaming write paths (plan task 45) create the temp file before the
+/// bytes arrive, so a request dropped mid-copy would otherwise leave a partial
+/// scratch file behind. The guard makes that cleanup unconditional; the caller
+/// disarms it only once the temp file has been renamed into place.
+struct TmpGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Reservation gate result for [`FsStorage::write_chunk`].
@@ -2053,6 +2102,93 @@ mod storage_fs {
                 .is_none(),
             "cancelled put writes no blob"
         );
+    }
+
+    /// Plan task 45: a `PATCH` whose body copy is cancelled mid-flight leaves
+    /// no scratch file behind — the `TmpGuard` reaps the partial temp file, so
+    /// a dropped connection cannot leak `tmp/` entries.
+    #[tokio::test]
+    async fn aborting_a_write_chunk_mid_copy_leaves_no_scratch_file() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        /// Emits 64 KiB and then parks forever, so the future is guaranteed to
+        /// be cancelled while the scratch file is open on disk.
+        struct StallingStream {
+            emitted: usize,
+        }
+
+        impl AsyncRead for StallingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.emitted >= 64 * 1024 {
+                    return Poll::Pending;
+                }
+                let n = buf.remaining().min(4096);
+                buf.put_slice(&vec![0_u8; n]);
+                this.emitted += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let dir = TestDir::new();
+        let storage = Arc::new(FsStorage::open(dir.path()).expect("open"));
+        let expires_at = u64::try_from(unix_now()).expect("unix now") + 3600;
+        storage
+            .reserve("cache", "artifact-key", "v1", expires_at)
+            .await
+            .expect("reserve");
+
+        let scratch = dir
+            .path()
+            .join("tmp")
+            .join(format!("{}-0.chunk.tmp", entry_id("cache")));
+        let put = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move {
+                let chunk = Chunk {
+                    range: ChunkRange {
+                        start: 0,
+                        end: 128 * 1024 - 1,
+                    },
+                    body: Box::pin(StallingStream { emitted: 0 }),
+                };
+                storage.write_chunk("cache", chunk).await
+            }
+        });
+
+        for _ in 0..1_000 {
+            if scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(scratch.exists(), "write_chunk opened its scratch file");
+
+        put.abort();
+        let join = put.await.expect_err("aborted mid-copy");
+        assert!(join.is_cancelled());
+
+        assert!(!scratch.exists(), "cancelled copy removes its scratch file");
+        assert!(
+            std::fs::read_dir(dir.path().join("tmp"))
+                .expect("tmp dir")
+                .next()
+                .is_none(),
+            "cancelled copy leaves the tmp dir empty"
+        );
+        assert!(
+            std::fs::read_dir(dir.path().join("parts").join("cache")).is_err(),
+            "cancelled copy stages no part file"
+        );
+        assert_eq!(storage.used_bytes().await.expect("used"), 0);
+        assert_eq!(storage.stat("artifact-key").await.expect("stat"), None);
     }
 
     #[tokio::test]

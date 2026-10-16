@@ -56,6 +56,10 @@ pub enum ConfigError {
     #[error("cache.reservation_ttl_seconds must be greater than 0")]
     ZeroReservationTtl,
 
+    /// `[server] max_chunk_bytes` is zero.
+    #[error("server.max_chunk_bytes must be greater than 0")]
+    ZeroMaxChunkBytes,
+
     /// `[cluster] cert_path` collides with the storage root.
     #[error("cluster.cert_path must differ from storage.fs.path")]
     CertPathCollides,
