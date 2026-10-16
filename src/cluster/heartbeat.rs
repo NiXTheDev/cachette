@@ -1,7 +1,8 @@
 //! Outbound heartbeat sender + peer health maintenance (plan task 29 / M15).
 //!
 //! Every `heartbeat_interval_seconds` this node POSTs
-//! `/_internal/peers/heartbeat {node_id, used_bytes, total_bytes, ts}` to each
+//! `/_internal/peers/heartbeat {node_id, used_bytes, total_bytes, draining, ts}`
+//! to each
 //! discovered peer's `addr` over mTLS: the client presents this node's
 //! identity certificate, and the server certificate is accepted only when its
 //! SPKI fingerprint passes [`PeerPins`] (seeded or TOFU) — the mirror image of
@@ -15,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rustls::ClientConfig as RustlsClientConfig;
@@ -72,24 +74,54 @@ pub struct HeartbeatConfig {
     pub interval: Duration,
     /// `[cluster] peer_timeout_seconds`.
     pub timeout: Duration,
+    /// Graceful-drain flag (plan task 47): when true the outbound heartbeat
+    /// advertises `draining` so peers stop selecting this node for NEW
+    /// placements; the self record carries it too.
+    pub draining: Arc<AtomicBool>,
+}
+
+/// Handle to the spawned heartbeat task (plan task 47). Wraps the task's
+/// [`JoinHandle`](tokio::task::JoinHandle) plus the [`Notify`](tokio::sync::Notify)
+/// used to request an immediate send — `announce()` lets shutdown push a
+/// draining heartbeat to peers without waiting a full interval.
+pub struct HeartbeatHandle {
+    task: tokio::task::JoinHandle<()>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl HeartbeatHandle {
+    /// Ask the task to send one heartbeat immediately (called when draining
+    /// starts so peers learn within one round trip rather than one interval).
+    pub fn announce(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Stop the heartbeat task.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
 }
 
 /// Spawn the periodic heartbeat + health-sweep task (mirrors the task-34
 /// sweep task: `tokio::spawn` + `interval`; the first tick runs immediately,
 /// and self is registered synchronously before the task is even queued so the
-/// table always contains a healthy own node). Returns the handle so `serve()`
-/// can abort it during shutdown.
-pub fn spawn(config: HeartbeatConfig) -> tokio::task::JoinHandle<()> {
+/// table always contains a healthy own node). Returns a [`HeartbeatHandle`] so
+/// `serve()` can announce the drain and abort it during shutdown.
+pub fn spawn(config: HeartbeatConfig) -> HeartbeatHandle {
     let id = config.node_id.as_str();
     config
         .peer_table
         .hello(id, id, &config.advertise_addr, auth::now_secs() as u64);
-    tokio::spawn(run(config))
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let task = tokio::spawn(run(config, notify.clone()));
+    HeartbeatHandle { task, notify }
 }
 
 /// The tick loop: refresh self with live B3 values, sweep peer timeouts, then
-/// send a heartbeat to every other peer.
-async fn run(config: HeartbeatConfig) {
+/// send a heartbeat to every other peer. A [`Notify`](tokio::sync::Notify)
+/// announced via [`HeartbeatHandle::announce`] short-circuits the interval so a
+/// draining node reaches peers immediately (plan task 47).
+async fn run(config: HeartbeatConfig, notify: Arc<tokio::sync::Notify>) {
     let client = match client_config(&config) {
         Ok(client) => Some(client),
         Err(err) => {
@@ -103,11 +135,23 @@ async fn run(config: HeartbeatConfig) {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let id = config.node_id.as_str();
     loop {
-        ticker.tick().await;
+        // First iteration fires immediately via the interval's first tick; a
+        // drain `announce()` wakes the loop ahead of the next tick.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = notify.notified() => {}
+        }
         let now = auth::now_secs();
         let stats = live_capacity(&config).await;
         if let Some((used, total)) = stats {
-            config.peer_table.heartbeat(id, id, used, total, now as u64);
+            config.peer_table.heartbeat(
+                id,
+                id,
+                used,
+                total,
+                now as u64,
+                config.draining.load(Ordering::Relaxed),
+            );
         }
         let marked = config
             .peer_table
@@ -159,6 +203,7 @@ async fn send_all(
         "node_id": config.node_id,
         "used_bytes": used,
         "total_bytes": total,
+        "draining": config.draining.load(Ordering::Relaxed),
         "ts": now,
     });
     let body = serde_json::to_string(&payload).expect("heartbeat JSON is a fixed shape");

@@ -156,6 +156,7 @@ async fn serve(state: AppState, identity: &Identity) -> (SocketAddr, JoinHandle<
         tls_cert: None,
         tls_key: None,
         max_chunk_bytes: 64 * 1024 * 1024,
+        drain_grace_seconds: 30,
     };
     let config = tls::server_config(&section, identity).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");
@@ -177,7 +178,7 @@ async fn serve(state: AppState, identity: &Identity) -> (SocketAddr, JoinHandle<
 fn publish(table: &PeerTable, identity: &Identity, addr: SocketAddr, used: u64, total: u64) {
     let fingerprint = identity.fingerprint();
     table.observe_discovered(fingerprint, fingerprint, &addr.to_string(), NOW);
-    table.heartbeat(fingerprint, fingerprint, used, total, NOW);
+    table.heartbeat(fingerprint, fingerprint, used, total, NOW, false);
 }
 
 /// Build A's relay from its identity + state + peer table.

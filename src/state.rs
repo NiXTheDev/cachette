@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::auth::{AuthPolicy, TokenStore};
 use crate::cluster::PeerTable;
@@ -92,6 +93,11 @@ pub struct AppState {
     pub capacity_total: u64,
     /// Hand-counted request-path counters exposed by `GET /metrics` (task 35).
     pub metrics: Arc<Metrics>,
+    /// Graceful-drain flag (plan task 47): set on SIGTERM/SIGINT. While true the
+    /// node advertises `draining` via heartbeat, reports not-ready on `/readyz`,
+    /// and refuses NEW uploads with `503` while still serving in-flight
+    /// requests (PATCH chunks, finalize, downloads).
+    pub draining: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -112,6 +118,7 @@ impl AppState {
             relay: None,
             capacity_total: 0,
             metrics: Arc::new(Metrics::default()),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 }

@@ -192,12 +192,14 @@ pub fn place(
     rng: &mut SeededRng,
     cursors: &mut HashMap<String, usize>,
 ) -> Option<PeerRecord> {
-    // Step 1 — capacity filter over healthy peers only. `Capacity::resolve`
-    // pins `total` to `max_size` when set (homogeneous v1 cluster), else to the
-    // peer's heartbeat `total_bytes`, and resolves the `min_free` floor.
+    // Step 1 — capacity filter over healthy, non-draining peers only. A
+    // draining peer (plan task 47) still serves downloads/finalize but must
+    // receive no NEW placements. `Capacity::resolve` pins `total` to
+    // `max_size` when set (homogeneous v1 cluster), else to the peer's
+    // heartbeat `total_bytes`, and resolves the `min_free` floor.
     let mut admitted: Vec<(&PeerRecord, Capacity)> = peers
         .iter()
-        .filter(|peer| peer.healthy)
+        .filter(|peer| peer.healthy && !peer.draining)
         .filter_map(|peer| {
             let capacity = Capacity::resolve(min_free, max_size, peer.total_bytes, peer.used_bytes);
             capacity.admits(size).then_some((peer, capacity))
@@ -334,6 +336,7 @@ mod tests {
             used_bytes: used,
             total_bytes: total,
             healthy: true,
+            draining: false,
             last_hello: 1,
         }
     }
@@ -442,6 +445,45 @@ mod tests {
                 .place(&peers, None, MinFree::Fraction(0.2), 0)
                 .expect("place");
             assert!(picked.node_id == "B" || picked.node_id == "C", "{picked:?}");
+        }
+    }
+
+    #[test]
+    fn draining_peers_are_never_chosen_even_when_least_loaded() {
+        // D would be the global least-loaded (0% fill) but is draining; it must
+        // never be returned, and when it is the ONLY healthy peer placement
+        // yields None (its capacity is real but it accepts no new placements).
+        for tiebreak in [
+            Tiebreak::Random,
+            Tiebreak::RoundRobin,
+            Tiebreak::Progressive,
+        ] {
+            let mut peers = fixture();
+            let mut draining = peer("D", 0, 100);
+            draining.draining = true;
+            peers.push(draining);
+            let placement = Placement::with_seed(tiebreak, 13);
+            for _ in 0..50 {
+                let picked = placement
+                    .place(&peers, None, MinFree::Fraction(0.2), 0)
+                    .expect("place");
+                assert!(
+                    picked.node_id == "B" || picked.node_id == "C",
+                    "draining D must never be chosen, got {picked:?}"
+                );
+            }
+
+            let only_draining = vec![{
+                let mut record = peer("D", 0, 100);
+                record.draining = true;
+                record
+            }];
+            assert!(
+                placement
+                    .place(&only_draining, None, MinFree::Fraction(0.2), 0)
+                    .is_none(),
+                "a lone draining peer admits no new placement"
+            );
         }
     }
 

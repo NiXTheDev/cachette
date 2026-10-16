@@ -190,7 +190,10 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 
     // Heartbeat + health (plan task 29 / M15): self-record with live B3
-    // values, peer timeout sweep, and mTLS heartbeat sends to every peer.
+    // values, peer timeout sweep, and mTLS heartbeat sends to every peer. The
+    // draining flag (task 47) is shared with the shutdown path so this node
+    // (and an on-demand announce) advertises the drain to peers.
+    let draining = state.draining.clone();
     let heartbeat_task = config.cluster.enabled.then(|| {
         heartbeat::spawn(heartbeat::HeartbeatConfig {
             node_id: state.node_id.clone(),
@@ -210,6 +213,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             max_size: config.cache.max_size,
             interval: Duration::from_secs(config.cluster.heartbeat_interval_seconds),
             timeout: Duration::from_secs(config.cluster.peer_timeout_seconds),
+            draining: draining.clone(),
         })
     });
 
@@ -266,13 +270,22 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // (POSIX), or the documented test-only trigger. The first signal starts a
     // graceful drain; a second aborts with exit 1.
     let (shutdown_notify, mut signals) = shutdown::listen();
+    let drain_grace = Duration::from_secs(config.server.drain_grace_seconds);
+    let serve_draining = draining.clone();
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<tls::PeerCert>(),
     )
     .with_graceful_shutdown(async move {
         shutdown_notify.notified().await;
-        tracing::info!("shutdown: draining in-flight transfers (10s grace)");
+        // Advertise the drain (plan task 47): peers stop selecting this node
+        // for NEW placements and `/readyz` reports not-ready while in-flight
+        // transfers finish.
+        serve_draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            grace_s = drain_grace.as_secs(),
+            "shutdown: draining in-flight transfers"
+        );
     });
     let mut serve = Box::pin(serve.into_future());
 
@@ -288,12 +301,20 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             // Drain: `with_graceful_shutdown` has stopped accepting new
             // connections; wait for in-flight transfers, bounded by the grace
             // window, racing a second signal.
+            //
+            // Set the flag and announce here too (before the serve future is
+            // polled) so the draining heartbeat is authoritative and reaches
+            // peers immediately rather than after a full interval.
+            draining.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = heartbeat_task.as_ref() {
+                handle.announce();
+            }
             tokio::select! {
                 biased;
                 result = &mut serve => {
                     result?;
                 }
-                () = tokio::time::sleep(shutdown::DRAIN_GRACE) => {
+                () = tokio::time::sleep(drain_grace) => {
                     tracing::warn!("shutdown: grace window elapsed; exiting with transfers in flight");
                 }
                 Some(()) = signals.recv() => {
@@ -308,8 +329,8 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // then drop the storage handle. SQLite runs in WAL mode with
     // `synchronous=NORMAL`, so the committed final sweep is durable.
     sweep_task.abort();
-    if let Some(task) = heartbeat_task {
-        task.abort();
+    if let Some(handle) = heartbeat_task {
+        handle.abort();
     }
     match reaper.sweep_once(&storage).await {
         Ok(report) => tracing::info!(
@@ -330,8 +351,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
 ///
 /// Production path: the first SIGINT (Ctrl+C on Windows and POSIX) or SIGTERM
 /// (POSIX only) starts a drain — the listener stops accepting new connections,
-/// in-flight transfers get [`DRAIN_GRACE`] to finish, SQLite is flushed, and
-/// the process exits 0. A second signal during the drain exits 1 immediately.
+/// in-flight transfers get `[server] drain_grace_seconds` to finish, SQLite is
+/// flushed, and the process exits 0. A second signal during the drain exits 1
+/// immediately.
 ///
 /// Test-only trigger: when `CACHETTE_TEST_SHUTDOWN_AFTER_MS` is set to a
 /// millisecond count, the same drain path fires once after that delay. It
@@ -345,9 +367,6 @@ mod shutdown {
     use std::time::Duration;
 
     use tokio::sync::{Notify, mpsc};
-
-    /// Grace window for in-flight transfers before the process exits anyway.
-    pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
     /// Test-only trigger (see module docs): milliseconds after startup.
     const TEST_TRIGGER_ENV: &str = "CACHETTE_TEST_SHUTDOWN_AFTER_MS";

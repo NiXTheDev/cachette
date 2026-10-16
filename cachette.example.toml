@@ -26,6 +26,11 @@ listen = "0.0.0.0:8080"
 # real go-actions-cache client sends).
 max_chunk_bytes = 67108864
 
+# Graceful-shutdown drain window in seconds. On SIGTERM/SIGINT the node
+# advertises draining, refuses new uploads with 503 + Retry-After, keeps
+# serving in-flight requests, and exits after at most this long.
+drain_grace_seconds = 30
+
 [storage]
 # Storage backend. Only "fs" is supported in v1.
 backend = "fs"

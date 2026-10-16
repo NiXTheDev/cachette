@@ -21,12 +21,13 @@ mod v2_download;
 mod v2_upload;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::Router;
 use axum::body::HttpBody;
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::{Uri, request::Parts};
+use axum::http::{HeaderValue, Method, Uri, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
@@ -89,6 +90,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v2/artifacts/{entryId}", get(v2_download::download));
     Router::new()
         .route("/health", get(health::health))
+        .route("/healthz", get(health::health))
+        .route("/readyz", get(health::readyz))
         .route("/metrics", get(metrics))
         .merge(peer_routes)
         .merge(admin_routes)
@@ -98,6 +101,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .fallback(fallback_404)
         .method_not_allowed_fallback(fallback_405)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            refuse_uploads_while_draining,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -139,6 +146,50 @@ async fn record_metrics(State(state): State<AppState>, request: Request, next: N
     state.metrics.add_bytes_in(bytes_in);
     state.metrics.add_bytes_out(bytes_out);
     Response::from_parts(parts, body)
+}
+
+/// Refuse NEW uploads with `503 + Retry-After` while the node is draining
+/// (plan task 47). In-flight work must complete: only the two "start a new
+/// upload" requests are refused —
+///
+/// * `POST /_apis/artifactcache/caches` (v1 reserve), and
+/// * `POST /twirp/.../<method>` where `<method>` ends with `CreateCacheEntry`
+///   (v2 create).
+///
+/// PATCH chunk uploads, commit/finalize, downloads, find, and the v2
+/// `/v2/upload/{entryId}` PUT all pass through untouched, so a reservation that
+/// started before the drain still finishes.
+async fn refuse_uploads_while_draining(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.draining.load(Ordering::Relaxed) && starts_new_upload(&request) {
+        let mut response = ApiError::Unavailable(String::from("draining")).into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return response;
+    }
+    next.run(request).await
+}
+
+/// Whether this request starts a NEW upload (see [`refuse_uploads_while_draining`]).
+fn starts_new_upload(request: &Request) -> bool {
+    if request.method() != Method::POST {
+        return false;
+    }
+    let path = request.uri().path();
+    if path == "/_apis/artifactcache/caches" {
+        return true;
+    }
+    match path.strip_prefix("/twirp/") {
+        Some(rest) => rest
+            .rsplit('/')
+            .next()
+            .is_some_and(|method| method.ends_with("CreateCacheEntry")),
+        None => false,
+    }
 }
 
 /// Parse a `Content-Length` header, if present and well-formed.
@@ -277,6 +328,7 @@ async fn peer_heartbeat(State(state): State<AppState>, request: Request) -> Resp
         beat.used_bytes,
         beat.total_bytes,
         now as u64,
+        beat.draining,
     );
     Json(serde_json::json!({ "accepted": true })).into_response()
 }
@@ -297,6 +349,7 @@ async fn peer_list(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "used_bytes": peer.used_bytes,
                 "total_bytes": peer.total_bytes,
                 "healthy": peer.healthy,
+                "draining": peer.draining,
                 "last_hello": peer.last_hello,
             })
         })
@@ -314,12 +367,16 @@ struct HelloBody {
 }
 
 /// Heartbeat body: the sender's identity plus its live B3 stats and a Unix
-/// seconds timestamp checked against this node's clock (±10s).
+/// seconds timestamp checked against this node's clock (±10s). `draining`
+/// (plan task 47) advertises the sender's graceful-drain state and defaults to
+/// `false` for older/standalone peers.
 #[derive(serde::Deserialize)]
 struct HeartbeatBody {
     node_id: Option<String>,
     used_bytes: u64,
     total_bytes: u64,
+    #[serde(default)]
+    draining: bool,
     ts: i64,
 }
 
@@ -396,6 +453,7 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
                 "last_hello": peer.last_hello,
                 "used_bytes": peer.used_bytes,
                 "total_bytes": peer.total_bytes,
+                "draining": peer.draining,
             })
         })
         .collect();

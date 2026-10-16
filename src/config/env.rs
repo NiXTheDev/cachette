@@ -41,6 +41,7 @@ const FIELDS: &[Field] = &[
     field(&["server"], "tls_cert", Kind::Str),
     field(&["server"], "tls_key", Kind::Str),
     field(&["server"], "max_chunk_bytes", Kind::U64),
+    field(&["server"], "drain_grace_seconds", Kind::U64),
     field(&["storage"], "backend", Kind::Str),
     field(&["storage", "fs"], "path", Kind::Str),
     field(&["storage", "fs"], "min_free", Kind::MinFree),

@@ -31,6 +31,7 @@ Closed sets (enums) are validated at parse time; structural rules (below) at
 | `tls_cert` | path | unset | PEM certificate. Must be set together with `tls_key`. |
 | `tls_key` | path | unset | PEM private key. Must be set together with `tls_cert`. |
 | `max_chunk_bytes` | integer | `67108864` (64 MiB) | Largest single upload chunk (v1 `PATCH`) or Azure block (v2) accepted. The request path streams uploads, so this bounds one in-flight request rather than the process; a body over the cap is rejected with 400. Must be at least as large as the biggest chunk your client sends (the go-actions-cache client uses 32 MiB). |
+| `drain_grace_seconds` | integer | `30` | Graceful-shutdown drain window. On SIGTERM/SIGINT the node advertises `draining` (heartbeat + `/readyz`), refuses new uploads with `503` + `Retry-After`, keeps serving in-flight requests, and exits after at most this many seconds. |
 
 When `tls_cert`/`tls_key` are unset, the server uses the node identity
 certificate minted on first boot (see [cluster.md](cluster.md)).

@@ -1133,6 +1133,7 @@ mod tests {
             used_bytes: 0,
             total_bytes: 0,
             healthy: true,
+            draining: false,
             last_hello: 1,
         }
     }

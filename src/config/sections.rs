@@ -22,6 +22,10 @@ pub struct ServerConfig {
     /// one request may occupy on the request path (plan task 45); the default
     /// is 2x the largest chunk any real client (go-actions-cache) sends.
     pub max_chunk_bytes: u64,
+    /// Graceful-shutdown drain window (plan task 47): on SIGTERM/SIGINT the
+    /// node advertises `draining`, refuses new uploads with `503`, and keeps
+    /// serving in-flight requests for up to this many seconds before exiting.
+    pub drain_grace_seconds: u64,
 }
 
 impl Default for ServerConfig {
@@ -32,6 +36,7 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             max_chunk_bytes: 64 * 1024 * 1024,
+            drain_grace_seconds: 30,
         }
     }
 }

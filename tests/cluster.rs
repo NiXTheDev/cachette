@@ -306,6 +306,46 @@ async fn heartbeat_refreshes_stats_and_freshness_through_the_router() {
 }
 
 #[tokio::test]
+async fn heartbeat_advertises_draining_through_the_router() {
+    // Plan task 47: a heartbeat body carrying `draining` flips the peer record,
+    // so peers stop selecting it within one heartbeat.
+    let state = router_with("FBBB", &[]);
+    state
+        .peer_table
+        .observe_discovered("node-b", "FBBB", "127.0.0.1:9001", 100);
+    assert!(!state.peer_table.snapshot()[0].draining);
+
+    let body = Request::builder()
+        .method("POST")
+        .uri("/_internal/peers/heartbeat")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "node_id": "node-b",
+                "used_bytes": 40,
+                "total_bytes": 100,
+                "draining": true,
+                "ts": unix_now(),
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = routes::router(state.clone())
+        .oneshot(pinned(body, "FBBB"))
+        .await
+        .expect("heartbeat");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let peers = state.peer_table.snapshot();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert!(peers[0].draining, "draining must be recorded: {peers:?}");
+
+    // The peer list surfaces the flag for operators too.
+    let listed = peers_json(&state).await;
+    assert_eq!(listed["peers"][0]["draining"], true, "{listed}");
+}
+
+#[tokio::test]
 async fn heartbeat_with_a_stale_timestamp_is_ignored() {
     let state = router_with("FBBB", &[]);
     state
@@ -414,6 +454,7 @@ async fn heartbeat_spawn_registers_the_own_node_immediately() {
         max_size: 0,
         interval: Duration::from_secs(3600),
         timeout: Duration::from_secs(7200),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     // Registration is synchronous, so the record exists before any tick runs.
     let peers = table.snapshot();

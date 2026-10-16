@@ -25,6 +25,7 @@ fn peer(node_id: &str, used: u64, total: u64) -> PeerRecord {
         used_bytes: used,
         total_bytes: total,
         healthy: true,
+        draining: false,
         last_hello: 1,
     }
 }

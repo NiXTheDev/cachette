@@ -45,6 +45,9 @@ pub struct PeerRecord {
     pub total_bytes: u64,
     /// Alive and eligible for placement; false after a peer timeout.
     pub healthy: bool,
+    /// Graceful-drain flag (plan task 47): true while the peer is shutting down
+    /// and must not receive NEW placements. Still served for downloads/finalize.
+    pub draining: bool,
     /// Unix seconds of the last hello/heartbeat; 0 = never identified.
     pub last_hello: u64,
 }
@@ -58,6 +61,7 @@ impl PeerRecord {
             used_bytes: 0,
             total_bytes: 0,
             healthy: true,
+            draining: false,
             last_hello: 0,
         }
     }
@@ -106,6 +110,9 @@ impl PeerTable {
     }
 
     /// Heartbeat (task 29): update capacity stats and freshness by identity.
+    /// `draining` carries the sender's current shutdown state (plan task 47),
+    /// so a peer that starts draining is excluded from placement within one
+    /// heartbeat.
     pub fn heartbeat(
         &self,
         node_id: &str,
@@ -113,6 +120,7 @@ impl PeerTable {
         used_bytes: u64,
         total_bytes: u64,
         now: u64,
+        draining: bool,
     ) -> bool {
         let mut peers = self
             .inner
@@ -127,6 +135,7 @@ impl PeerTable {
         record.used_bytes = used_bytes;
         record.total_bytes = total_bytes;
         record.healthy = true;
+        record.draining = draining;
         record.last_hello = now;
         true
     }
@@ -409,13 +418,30 @@ mod tests {
     fn heartbeat_updates_stats_and_mark_unhealthy_flips_health() {
         let table = PeerTable::new();
         table.observe_discovered("node-b", "FBBB", "127.0.0.1:9001", 100);
-        assert!(table.heartbeat("node-b", "FBBB", 40, 100, 200));
+        assert!(table.heartbeat("node-b", "FBBB", 40, 100, 200, false));
         let peers = table.snapshot();
         assert_eq!(peers[0].used_bytes, 40);
         assert_eq!(peers[0].total_bytes, 100);
         assert!(table.mark_unhealthy("node-b", "FBBB"));
         assert!(table.healthy_sorted().is_empty());
-        assert!(!table.heartbeat("ghost", "NOPE", 0, 0, 0));
+        assert!(!table.heartbeat("ghost", "NOPE", 0, 0, 0, false));
+    }
+
+    #[test]
+    fn heartbeat_carries_the_draining_flag() {
+        let table = PeerTable::new();
+        table.observe_discovered("node-b", "FBBB", "127.0.0.1:9001", 100);
+        assert!(!table.snapshot()[0].draining, "starts not draining");
+        assert!(table.heartbeat("node-b", "FBBB", 40, 100, 200, true));
+        assert!(
+            table.snapshot()[0].draining,
+            "heartbeat advertises draining"
+        );
+        assert!(table.heartbeat("node-b", "FBBB", 40, 100, 201, false));
+        assert!(
+            !table.snapshot()[0].draining,
+            "a later non-draining heartbeat clears it"
+        );
     }
 
     #[test]
