@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::cli::{CacheCommand, ClusterCommand, Command, Scope, TokenCommand};
+use crate::cli::{CacheCommand, ClusterCommand, Command, IdentityCommand, Scope, TokenCommand};
 use crate::config::{Config, split_host_port};
 use crate::identity::Identity;
 use crate::storage::StorageBackend;
@@ -119,7 +119,7 @@ impl Drop for DataDirLock {
 /// command); a command that ran but found problems returns `Ok(1)` instead.
 pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
     match command {
-        Command::Identity => identity(config),
+        Command::Identity { action } => identity(action.as_ref(), config),
         Command::Verify => block_on(verify(config)),
         Command::Cache { action } => block_on(cache(action, config)),
         Command::Gc => block_on(gc(config)),
@@ -139,15 +139,25 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// `cachette identity` — print the fingerprint and cert path (plan task 13).
-fn identity(config: &Config) -> Result<i32, Box<dyn Error>> {
-    let identity = Identity::load_or_generate(
-        &config.cert_path(),
-        config.cluster.node_id.as_deref(),
-        config.cluster.advertise_addr.as_deref(),
-    )?;
+/// `cachette identity [rotate]` — print the fingerprint and cert path (plan
+/// task 13); with `rotate`, first re-issue the certificate for the same key
+/// (plan task 48). A missing/invalid identity is a hard error (exit code 2):
+/// `rotate` never mints a new key, because a new key would change the pinned
+/// fingerprint and partition the cluster.
+fn identity(action: Option<&IdentityCommand>, config: &Config) -> Result<i32, Box<dyn Error>> {
+    let dir = config.cert_path();
+    let node_id = config.cluster.node_id.as_deref();
+    let advertise_addr = config.cluster.advertise_addr.as_deref();
+    let identity = match action {
+        Some(IdentityCommand::Rotate) => Identity::renew(&dir, node_id, advertise_addr)?,
+        // Bare `cachette identity` mints on first run, exactly as before.
+        None => Identity::load_or_generate(&dir, node_id, advertise_addr)?,
+    };
     println!("fingerprint: {}", identity.fingerprint());
     println!("cert_path: {}", identity.cert_path().display());
+    if action.is_some() {
+        println!("certificate renewed (same key; fingerprint unchanged)");
+    }
     Ok(0)
 }
 

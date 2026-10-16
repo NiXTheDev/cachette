@@ -188,6 +188,7 @@ cachette [OPTIONS] [COMMAND]
 
 Commands:
   identity            Print the node fingerprint and identity certificate path
+  identity rotate     Renew the certificate for the same key (fingerprint unchanged)
   verify              Recompute every published entry's digest and report mismatches
   cache list          List finalized cache entries (--json for machine output)
   cache prune         Delete entries not accessed within --older-than <dur>
@@ -209,6 +210,13 @@ Options:
 - `cachette identity` prints the node fingerprint and the identity certificate
   path, minting the identity on first run. Use it to collect
   `cluster.seed_fingerprints` values.
+- `cachette identity rotate` re-issues the identity certificate for the *same*
+  key with a refreshed validity window, then prints the (unchanged) fingerprint
+  and cert path. Because a pin is the key's SPKI fingerprint — not the
+  certificate, whose validity window peers ignore — every existing
+  `cluster.seed_fingerprints` entry stays valid: no re-seed, no cluster
+  coordination. It exits non-zero when the identity is missing; it never mints
+  a new key, which would change the fingerprint.
 - `cachette verify` re-hashes every published blob against the digest recorded at
   publish time (plan task 50) and exits non-zero, naming each corrupt / missing /
   size-mismatched entry.

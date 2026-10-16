@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use cachette::config::ServerConfig;
-use cachette::identity::Identity;
+use cachette::identity::{Identity, fingerprint_spki};
 use cachette::routes;
 use cachette::state::AppState;
 use cachette::tls::{self, PeerCert, PeerPins};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -86,10 +89,10 @@ fn client_config(server: &Identity, client: Option<&Identity>) -> Arc<rustls::Cl
     Arc::new(config)
 }
 
-/// Bind the TLS listener on an ephemeral port and serve the router on a task.
-async fn start_server(pinned: &[&Identity]) -> (SocketAddr, Identity) {
-    let root = TestDir::new();
-    let server = mint(root.path(), "server");
+/// Bind the TLS listener on an ephemeral port serving `server`'s identity and
+/// pinning `pinned` peers, and serve the router on a task for the test's
+/// lifetime. Returns the bound address.
+async fn serve(server: &Identity, pinned: &[&Identity]) -> SocketAddr {
     let mut seed = BTreeMap::new();
     for (index, peer) in pinned.iter().enumerate() {
         seed.insert(format!("peer-{index}"), peer.fingerprint().to_owned());
@@ -105,7 +108,7 @@ async fn start_server(pinned: &[&Identity]) -> (SocketAddr, Identity) {
         max_chunk_bytes: 64 * 1024 * 1024,
         drain_grace_seconds: 30,
     };
-    let config = tls::server_config(&section, &server).expect("TLS config builds");
+    let config = tls::server_config(&section, server).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");
     let addr = listener.bind_addr().expect("bound addr");
     let app = routes::router(state);
@@ -117,7 +120,78 @@ async fn start_server(pinned: &[&Identity]) -> (SocketAddr, Identity) {
         .await
         .expect("serve runs");
     });
+    addr
+}
+
+/// Mint a fresh server identity and serve it (see [`serve`]).
+async fn start_server(pinned: &[&Identity]) -> (SocketAddr, Identity) {
+    let root = TestDir::new();
+    let server = mint(root.path(), "server");
+    let addr = serve(&server, pinned).await;
     (addr, server)
+}
+
+/// A peer-side verifier that trusts the server iff the certificate's SPKI
+/// fingerprint is pinned, ignoring the validity window — the same trust
+/// decision as production's `PinnedServerCert`, which a rotation must preserve.
+#[derive(Debug)]
+struct PinnedByFingerprint {
+    pins: Arc<PeerPins>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedByFingerprint {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let parsed = rustls::server::ParsedCertificate::try_from(end_entity)
+            .map_err(|err| RustlsError::General(format!("peer certificate unusable: {err}")))?;
+        let fingerprint = fingerprint_spki(parsed.subject_public_key_info().as_ref());
+        if self.pins.authorize(&fingerprint) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        Err(RustlsError::General(format!(
+            "peer certificate not pinned: {fingerprint}"
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// A client pinned to `pins` by SPKI fingerprint (no client certificate).
+fn pinned_client(pins: Arc<PeerPins>) -> Arc<rustls::ClientConfig> {
+    let algs = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedByFingerprint { pins, algs }))
+            .with_no_client_auth(),
+    )
 }
 
 /// One HTTP/1.1 exchange over a fresh TLS connection; returns (status, text).
@@ -209,4 +283,41 @@ async fn no_client_cert_serves_health_but_not_peer_routes() {
     .await;
     assert_eq!(peer_status, 403, "body: {body}");
     assert!(body.contains("peer auth required"), "body: {body}");
+}
+
+/// Plan task 48: a peer that pinned the node BEFORE a certificate rotation
+/// keeps accepting it. Renewal re-issues the certificate for the same key, so
+/// the SPKI fingerprint — and every pin — is unchanged.
+#[tokio::test]
+async fn peer_pinned_to_old_fingerprint_accepts_a_renewed_certificate() {
+    let root = TestDir::new();
+    let dir = root.path().join("server");
+    let server = Identity::load_or_generate(&dir, Some("server"), Some("127.0.0.1"))
+        .expect("identity mints");
+    let old_fingerprint = server.fingerprint().to_owned();
+    // The peer's trust: a single pin collected (and seeded) BEFORE rotation.
+    let pins = Arc::new(PeerPins::new(
+        &BTreeMap::from([(String::from("server"), old_fingerprint.clone())]),
+        false,
+    ));
+
+    // Baseline: the pinned peer completes a handshake with the original cert.
+    let before = serve(&server, &[]).await;
+    let (status, body) = request(before, pinned_client(pins.clone()), "GET", "/health").await;
+    assert_eq!(status, 200, "baseline handshake: {body}");
+
+    // Rotate in place: same key, fresh certificate on a refreshed window.
+    let renewed = Identity::renew(&dir, Some("server"), Some("127.0.0.1")).expect("renew");
+    assert_eq!(renewed.fingerprint(), old_fingerprint, "pin is invariant");
+    assert_ne!(renewed.cert_pem(), server.cert_pem(), "certificate changed");
+
+    // A server restarted with the renewed certificate: the peer still holds
+    // ONLY the old pin and still completes the handshake — no re-seed, no
+    // cluster coordination.
+    let after = serve(&renewed, &[]).await;
+    let (status, body) = request(after, pinned_client(pins), "GET", "/health").await;
+    assert_eq!(
+        status, 200,
+        "pinned peer accepts the renewed certificate: {body}"
+    );
 }

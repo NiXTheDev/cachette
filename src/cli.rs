@@ -30,7 +30,12 @@ pub struct Cli {
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum Command {
     /// Print the node fingerprint and identity certificate path (plan task 13).
-    Identity,
+    /// With `rotate`, re-issue the certificate for the same key.
+    Identity {
+        /// `rotate` renews the certificate; omitted, only prints.
+        #[command(subcommand)]
+        action: Option<IdentityCommand>,
+    },
     /// Recompute every published entry's stored digest and report mismatches.
     Verify,
     /// Inspect or prune cached entries (offline; takes the data-dir lock).
@@ -55,6 +60,14 @@ pub enum Command {
         #[command(subcommand)]
         action: ClusterCommand,
     },
+}
+
+/// `cachette identity <action>`.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum IdentityCommand {
+    /// Re-issue the certificate for the SAME key: the fingerprint — and so
+    /// every peer pin — is unchanged (plan task 48).
+    Rotate,
 }
 
 /// `cachette cache <action>`.
@@ -122,7 +135,7 @@ mod tests {
     #[test]
     fn identity_subcommand_parses_alongside_print_config() {
         let cli = Cli::try_parse_from(["cachette", "identity"]).expect("subcommand parses");
-        assert_eq!(cli.command, Some(Command::Identity));
+        assert_eq!(cli.command, Some(Command::Identity { action: None }));
         assert!(!cli.print_config);
 
         let cli = Cli::try_parse_from(["cachette", "--print-config"]).expect("flag parses");
@@ -132,7 +145,29 @@ mod tests {
         let cli = Cli::try_parse_from(["cachette", "--config", "x.toml", "identity"])
             .expect("flag + subcommand combine");
         assert_eq!(cli.config, Some(PathBuf::from("x.toml")));
-        assert_eq!(cli.command, Some(Command::Identity));
+        assert_eq!(cli.command, Some(Command::Identity { action: None }));
+    }
+
+    #[test]
+    fn identity_rotate_parses_and_takes_the_global_config() {
+        assert_eq!(
+            Cli::try_parse_from(["cachette", "identity", "rotate"])
+                .unwrap()
+                .command,
+            Some(Command::Identity {
+                action: Some(IdentityCommand::Rotate)
+            })
+        );
+        // `--config` is global, so it is accepted after the nested subcommand.
+        let cli = Cli::try_parse_from(["cachette", "identity", "rotate", "--config", "x.toml"])
+            .expect("global flag after nested subcommand");
+        assert_eq!(cli.config, Some(PathBuf::from("x.toml")));
+        assert_eq!(
+            cli.command,
+            Some(Command::Identity {
+                action: Some(IdentityCommand::Rotate)
+            })
+        );
     }
 
     #[test]

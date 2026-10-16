@@ -68,6 +68,21 @@ key, 64 characters. Print it with:
 Use `cachette identity` on each node to collect the fingerprints you put in
 `cluster.seed_fingerprints`.
 
+### Certificate rotation
+
+`cachette identity rotate` renews the node certificate: it re-issues a
+self-signed certificate for the **same key** with a fresh validity window. The
+fingerprint is the SHA-256 of the key's public key (the SPKI), not of the
+certificate, and the pinned verifiers ignore the certificate's `notAfter`, so
+every `cluster.seed_fingerprints` entry — and every TOFU-learned pin — stays
+valid across a renewal. Rotation is therefore purely **local**: no re-seed, no
+cluster coordination, no restart ordering. The command refuses to run when the
+identity is missing, because minting a new key would change the fingerprint.
+
+Only rotating the **key pair** would change the fingerprint, which requires
+re-seeding every peer's `cluster.seed_fingerprints`. That is out of scope for
+`identity rotate`.
+
 ## Seeds
 
 `cluster.seeds` is a list of `host:port` addresses. A missing port defaults to

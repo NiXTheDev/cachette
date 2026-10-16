@@ -14,6 +14,14 @@
 //! identity: restarts and storage-dir wipes never change it, because the files
 //! live at `cluster.cert_path`, outside the storage root.
 //!
+//! **Renewal** (plan task 48): [`Identity::renew`] re-issues the certificate
+//! for the existing key with a refreshed validity window. The fingerprint is
+//! the SPKI of the *key pair*, not of the certificate, and the pinned verifiers
+//! ignore `notAfter`, so a renewal leaves the fingerprint — and therefore every
+//! peer pin — unchanged: a peer that pinned the node before rotation keeps
+//! accepting it, with no re-seed and no cluster coordination. Only rotating the
+//! *key* would change the fingerprint (out of scope; it requires re-seeding).
+//!
 //! Loading is idempotent: an intact key/cert pair is read, never regenerated
 //! (silent regeneration would silently change the node's identity). Only a
 //! missing or partial pair triggers generation; a corrupt pair is reported as
@@ -24,7 +32,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519, date_time_ymd};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -134,14 +142,7 @@ impl Identity {
         fs::create_dir_all(dir).map_err(|source| io_error(dir, source))?;
         restrict_dir(dir)?;
         let key_pair = KeyPair::generate_for(&PKCS_ED25519)?;
-        let mut params = CertificateParams::new(advertise_san(advertise_addr))?;
-        // Replace rcgen's placeholder CN ("rcgen self signed cert"); an empty
-        // subject is intentional when no node_id is configured.
-        let mut subject = DistinguishedName::new();
-        if let Some(node_id) = node_id.filter(|value| !value.is_empty()) {
-            subject.push(DnType::CommonName, node_id);
-        }
-        params.distinguished_name = subject;
+        let params = cert_params(node_id, advertise_addr)?;
         let cert = params.self_signed(&key_pair)?;
         let key_pem = key_pair.serialize_pem();
         let cert_pem = cert.pem();
@@ -149,6 +150,73 @@ impl Identity {
         write_private(dir, KEY_FILE, key_pem.as_bytes())?;
         write_private(dir, CERT_FILE, cert_pem.as_bytes())?;
         tracing::info!(dir = %dir.display(), "first-boot Ed25519 identity generated");
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            fingerprint,
+            cert_pem,
+            key_pem,
+        })
+    }
+
+    /// Renew the certificate for the SAME key pair (plan task 48): re-issue a
+    /// fresh self-signed certificate with a refreshed validity window, keeping
+    /// the private key and therefore the SPKI fingerprint unchanged. The write
+    /// is atomic and touches ONLY `cert.pem`; the key file is never rewritten.
+    ///
+    /// The cluster pin is the SHA-256 of the key pair's `SubjectPublicKeyInfo`,
+    /// not of the certificate, and the pinned verifiers ignore `notAfter`. A
+    /// peer holding the pre-rotation fingerprint therefore keeps accepting this
+    /// node across a renewal, with no re-seed and no cluster coordination. Only
+    /// rotating the *key* would change the fingerprint.
+    ///
+    /// * `node_id` / `advertise_addr` — the CN and SAN inputs, resolved exactly
+    ///   as in [`Self::generate`] (the shared [`cert_params`]).
+    ///
+    /// # Errors
+    /// [`IdentityError::Invalid`] when `key.pem` is missing or is not a
+    /// parseable private key: renewal never mints a new key, because doing so
+    /// would change the fingerprint and partition the cluster.
+    pub fn renew(
+        dir: &Path,
+        node_id: Option<&str>,
+        advertise_addr: Option<&str>,
+    ) -> Result<Self, IdentityError> {
+        let key_path = dir.join(KEY_FILE);
+        let key_pem = fs::read_to_string(&key_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                IdentityError::Invalid {
+                    dir: dir.to_path_buf(),
+                    reason: format!(
+                        "{KEY_FILE} is missing; refusing to mint a new key (it would change \
+                         the fingerprint). Start the server once to create the identity"
+                    ),
+                }
+            } else {
+                io_error(&key_path, source)
+            }
+        })?;
+        let key_pair = KeyPair::from_pem(&key_pem).map_err(|_| IdentityError::Invalid {
+            dir: dir.to_path_buf(),
+            reason: format!("{KEY_FILE} is not a parseable PEM private key"),
+        })?;
+        let mut params = cert_params(node_id, advertise_addr)?;
+        // Refresh the validity window: now → ten years from now. rcgen
+        // re-exports `date_time_ymd`, so the `time` crate stays indirect.
+        let (year, month, day) = civil_from_unix(crate::auth::now_secs());
+        params.not_before = date_time_ymd(year, month, day);
+        let (expiry_year, expiry_month, expiry_day) = renewal_expiry(year, month, day);
+        params.not_after = date_time_ymd(expiry_year, expiry_month, expiry_day);
+        let cert = params.self_signed(&key_pair)?;
+        let cert_pem = cert.pem();
+        let fingerprint = fingerprint_spki(&key_pair.public_key_der());
+        // Only the certificate changes; the key file is left byte-for-byte
+        // intact (renewal must not perturb the pinned identity).
+        write_private(dir, CERT_FILE, cert_pem.as_bytes())?;
+        tracing::info!(
+            dir = %dir.display(),
+            %fingerprint,
+            "identity certificate renewed (same key; fingerprint unchanged)"
+        );
         Ok(Self {
             dir: dir.to_path_buf(),
             fingerprint,
@@ -194,6 +262,24 @@ pub fn fingerprint_spki(spki_der: &[u8]) -> String {
         let _ = write!(fingerprint, "{byte:02X}");
     }
     fingerprint
+}
+
+/// Certificate parameters shared by first boot ([`Identity::generate`]) and
+/// renewal ([`Identity::renew`]): SANs from the `advertise_addr` host and a CN
+/// from a non-empty `node_id` (empty subject otherwise).
+fn cert_params(
+    node_id: Option<&str>,
+    advertise_addr: Option<&str>,
+) -> Result<CertificateParams, IdentityError> {
+    let mut params = CertificateParams::new(advertise_san(advertise_addr))?;
+    // Replace rcgen's placeholder CN ("rcgen self signed cert"); an empty
+    // subject is intentional when no node_id is configured.
+    let mut subject = DistinguishedName::new();
+    if let Some(node_id) = node_id.filter(|value| !value.is_empty()) {
+        subject.push(DnType::CommonName, node_id);
+    }
+    params.distinguished_name = subject;
+    Ok(params)
 }
 
 /// Subject alternative names for the certificate: the `advertise_addr` host
@@ -293,6 +379,52 @@ fn io_error(path: &Path, source: std::io::Error) -> IdentityError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// Civil date `(year, month, day)` in UTC for a Unix timestamp — the head of
+/// the renewal validity window. Uses Howard Hinnant's `civil_from_days`
+/// algorithm so `time` stays an indirect dependency (rcgen only re-exports
+/// `date_time_ymd`, not the date type itself).
+fn civil_from_unix(secs: i64) -> (i32, u8, u8) {
+    civil_from_days(secs.div_euclid(86_400))
+}
+
+/// Days since 1970-01-01 → civil date `(year, month, day)` in the proleptic
+/// Gregorian calendar (negative days are pre-epoch and handled by the floor
+/// division in the algorithm).
+fn civil_from_days(days: i64) -> (i32, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (
+        i32::try_from(year).expect("year fits in i32"),
+        u8::try_from(month).expect("month in 1..=12"),
+        u8::try_from(day).expect("day in 1..=31"),
+    )
+}
+
+/// End of the renewal validity window: the same civil day ten years on, with
+/// Feb 29 clamped to Feb 28 when the target year is not a leap year so
+/// [`date_time_ymd`] can never be handed an invalid date.
+fn renewal_expiry(year: i32, month: u8, day: u8) -> (i32, u8, u8) {
+    let end_year = year + 10;
+    let day = if month == 2 && day == 29 && !is_leap_year(end_year) {
+        28
+    } else {
+        day
+    };
+    (end_year, month, day)
+}
+
+/// Gregorian leap-year test.
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -435,6 +567,96 @@ mod tests {
         // The files are untouched — regeneration would change identity.
         assert_eq!(fs::read(dir.join(KEY_FILE)).expect("key"), b"garbage");
         assert_eq!(fs::read(dir.join(CERT_FILE)).expect("cert"), b"garbage");
+    }
+
+    #[test]
+    fn renew_keeps_the_fingerprint_and_changes_the_certificate() {
+        let root = TestDir::new();
+        let dir = root.path().join("identity");
+        let first = Identity::load_or_generate(&dir, Some("node-a"), Some("cache-a:8080"))
+            .expect("first boot");
+        let key_before = fs::read(dir.join(KEY_FILE)).expect("key bytes");
+        let cert_before = fs::read(dir.join(CERT_FILE)).expect("cert bytes");
+
+        let renewed =
+            Identity::renew(&dir, Some("node-a"), Some("cache-a:8080")).expect("renew succeeds");
+
+        // The fingerprint pins the KEY, so renewal leaves it — and every peer
+        // pin — untouched; only the certificate is re-issued.
+        assert_eq!(
+            renewed.fingerprint(),
+            first.fingerprint(),
+            "fingerprint is invariant across renewal"
+        );
+        assert_eq!(renewed.key_pem(), first.key_pem(), "key PEM unchanged");
+        assert_ne!(
+            renewed.cert_pem(),
+            first.cert_pem(),
+            "certificate is re-issued"
+        );
+        assert_eq!(
+            fs::read(dir.join(KEY_FILE)).expect("key bytes"),
+            key_before,
+            "key file untouched"
+        );
+        assert_ne!(
+            fs::read(dir.join(CERT_FILE)).expect("cert bytes"),
+            cert_before,
+            "cert file rewritten"
+        );
+
+        // The renewed pair still loads (so the cert embeds the key's SPKI) and
+        // still yields the same fingerprint.
+        let reloaded = Identity::load_or_generate(&dir, Some("node-a"), Some("cache-a:8080"))
+            .expect("reload after renewal");
+        assert_eq!(reloaded.fingerprint(), first.fingerprint());
+        assert_eq!(reloaded.cert_pem(), renewed.cert_pem());
+    }
+
+    #[test]
+    fn renew_without_an_identity_refuses_to_mint_a_new_key() {
+        let root = TestDir::new();
+        let dir = root.path().join("identity");
+
+        let err = Identity::renew(&dir, Some("node-a"), None).expect_err("missing identity errors");
+        assert!(matches!(err, IdentityError::Invalid { .. }), "{err:?}");
+        // Nothing is created: a freshly minted key would change the fingerprint.
+        assert!(
+            !dir.exists(),
+            "renew must not create the identity directory"
+        );
+    }
+
+    #[test]
+    fn renew_with_a_corrupt_key_is_rejected_and_untouched() {
+        let root = TestDir::new();
+        let dir = root.path().join("identity");
+        fs::create_dir_all(&dir).expect("identity dir");
+        fs::write(dir.join(KEY_FILE), b"garbage").expect("key file");
+
+        let err = Identity::renew(&dir, Some("node-a"), None).expect_err("corrupt key errors");
+        assert!(matches!(err, IdentityError::Invalid { .. }), "{err:?}");
+        assert_eq!(fs::read(dir.join(KEY_FILE)).expect("key"), b"garbage");
+        assert!(!dir.join(CERT_FILE).exists(), "no certificate is written");
+    }
+
+    #[test]
+    fn civil_from_unix_matches_known_dates() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1));
+        assert_eq!(civil_from_unix(1_000_000_000), (2001, 9, 9));
+        assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14));
+        assert_eq!(civil_from_unix(2_000_000_000), (2033, 5, 18));
+        // A leap day, which the +10y expiry must clamp in a non-leap year.
+        assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29));
+    }
+
+    #[test]
+    fn renewal_expiry_clamps_feb_29_in_non_leap_years() {
+        assert_eq!(renewal_expiry(2024, 2, 29), (2034, 2, 28));
+        assert_eq!(renewal_expiry(2000, 2, 29), (2010, 2, 28));
+        assert_eq!(renewal_expiry(2024, 2, 28), (2034, 2, 28));
+        assert_eq!(renewal_expiry(2023, 11, 14), (2033, 11, 14));
+        assert!(is_leap_year(2024) && !is_leap_year(2034));
     }
 
     #[test]

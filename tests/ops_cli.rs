@@ -296,6 +296,51 @@ fn doctor_ok_on_fixture_and_nonzero_on_bad_config() {
 }
 
 #[test]
+fn identity_rotate_keeps_the_fingerprint_and_rewrites_only_the_certificate() {
+    let dir = TestDir::new("rotate");
+    let config = write_config(dir.path(), "127.0.0.1:0", false);
+
+    // Bare `identity` mints the pair and prints fingerprint + cert path.
+    let (code, out) = run_cli(&config, &["identity"]);
+    assert_eq!(code, 0, "{out}");
+    let fingerprint = header_value(&out, "fingerprint").expect("fingerprint line");
+    let cert_path = PathBuf::from(header_value(&out, "cert_path").expect("cert_path line"));
+    let key_path = cert_path.join("key.pem");
+    let cert_before = std::fs::read(cert_path.join("cert.pem")).expect("cert bytes");
+    let key_before = std::fs::read(&key_path).expect("key bytes");
+
+    let (code, out) = run_cli(&config, &["identity", "rotate"]);
+    assert_eq!(code, 0, "rotate ok: {out}");
+    assert!(
+        out.contains(&format!("fingerprint: {fingerprint}")),
+        "fingerprint unchanged: {out}"
+    );
+    assert!(out.contains("certificate renewed"), "{out}");
+    assert_eq!(
+        std::fs::read(&key_path).expect("key bytes"),
+        key_before,
+        "key file untouched"
+    );
+    assert_ne!(
+        std::fs::read(cert_path.join("cert.pem")).expect("cert bytes"),
+        cert_before,
+        "certificate rewritten"
+    );
+
+    // A missing identity is a hard error (exit 2) and is NOT minted: a fresh
+    // key would change the pinned fingerprint.
+    let fresh = TestDir::new("rotate-missing");
+    let fresh_config = write_config(fresh.path(), "127.0.0.1:0", false);
+    let (code, out) = run_cli(&fresh_config, &["identity", "rotate"]);
+    assert_eq!(code, 2, "missing identity exits 2: {out}");
+    assert!(out.contains("is missing"), "{out}");
+    assert!(
+        !fresh.path().join("data").join("identity").exists(),
+        "no identity minted: {out}"
+    );
+}
+
+#[test]
 fn token_mint_prints_headers() {
     let dir = TestDir::new("token");
     let config = write_config(dir.path(), "127.0.0.1:0", false);
