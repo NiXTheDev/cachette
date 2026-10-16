@@ -22,7 +22,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use cachette::auth::{AuthPolicy, urls};
-use cachette::config::AuthMode;
+use cachette::config::{AuthMode, KeyCase};
 use cachette::routes;
 use cachette::state::AppState;
 use cachette::storage::fs::FsStorage;
@@ -519,8 +519,10 @@ async fn reserve_repeat_after_completion_returns_409() {
 }
 
 #[tokio::test]
-async fn reserve_duplicate_detection_folds_key_case() {
-    let app = routes::router(fixture_state().await);
+async fn reserve_duplicate_detection_folds_key_case_when_lower() {
+    let mut state = fixture_state().await;
+    state.cache.key_case = KeyCase::Lower;
+    let app = routes::router(state);
     let requested = "NGINX-SRC-1.30.5";
     let reply = call(
         &app,
@@ -533,6 +535,25 @@ async fn reserve_duplicate_detection_folds_key_case() {
     .await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(json_body_of(&reply)["key"], requested);
+}
+
+/// The default is `preserve` (GitHub parity): keys are case-sensitive, so a
+/// differently-cased reserve must NOT collide with the seeded lowercase key.
+#[tokio::test]
+async fn reserve_key_case_defaults_to_preserve_and_is_case_sensitive() {
+    let state = fixture_state().await;
+    assert_eq!(state.cache.key_case, KeyCase::Preserve);
+    let app = routes::router(state);
+    let reply = call(
+        &app,
+        "POST",
+        "/_apis/artifactcache/caches",
+        Some(TOKEN),
+        &[("content-type", "application/json")],
+        json_body(serde_json::json!({"key": "NGINX-SRC-1.30.5", "version": "2"})),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
 }
 
 /// Temp dir removed on drop; unique per test so parallel runs never collide.

@@ -46,8 +46,9 @@ max_size = 0
 # "none" refuses new reservations when below free-space floor
 eviction = "lru"
 
-# Key normalization: "lower" or "preserve"
-key_case = "lower"
+# Key normalization: "preserve" (GitHub parity - keys are case-sensitive) or
+# "lower" (Forgejo-style case-insensitive fold)
+key_case = "preserve"
 
 # Reservation TTL in seconds (must be > 0)
 reservation_ttl_seconds = 3600

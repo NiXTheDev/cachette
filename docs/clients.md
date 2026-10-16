@@ -77,12 +77,13 @@ use?" question:
   go-actions-cache `CacheService` fixture (see `tests/v2_real_clients.rs`) as the
   v2 conformance baseline.
 
-One repeat-export caveat was found at the same time: with the default
-`cache.key_case = "lower"`, buildkit's **second** export to the same scope fails,
-because `go-actions-cache` reads the stored index key back and `Atoi`s the
-generation suffix after `TrimPrefix`. cachette lowercased the key, so the prefix
-no longer matched. Set `cache.key_case = "preserve"` (GitHub keys are
-case-sensitive anyway) to avoid it.
+One repeat-export caveat was found at the same time, and it is why the default
+`cache.key_case` is `preserve`: with `cache.key_case = "lower"`, buildkit's
+**second** export to the same scope fails, because `go-actions-cache` reads the
+stored index key back and `Atoi`s the generation suffix after `TrimPrefix`.
+cachette lowercased the key, so the prefix no longer matched. GitHub cache keys
+are case-sensitive, so `preserve` is both the GitHub-parity behaviour and the
+safe default; set `cache.key_case = "lower"` only for Forgejo-style folding.
 
 buildx requires a token: pass `token=` in the `--cache-to`/`--cache-from`
 spec, or set `ACTIONS_RUNTIME_TOKEN`. Example against the v1 path:

@@ -58,7 +58,7 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 |---|---|---|---|
 | `max_size` | integer | `0` | Maximum cache size in bytes; `0` means unlimited (the disk total is used for capacity). |
 | `eviction` | `lru` / `oldest` / `none` | `lru` | `lru` and `oldest` reclaim space down to the free-space floor; `none` refuses a new reservation when below the floor instead. |
-| `key_case` | `lower` / `preserve` | `lower` | Key normalization before exact and prefix matching. |
+| `key_case` | `lower` / `preserve` | `preserve` | Key normalization before exact and prefix matching. |
 | `reservation_ttl_seconds` | integer | `3600` | Reservation lifetime; must be greater than `0`. Expired reservations and their partial chunk files are reaped. |
 
 ### `[auth]`, `[v1]`, `[v2]`
@@ -167,7 +167,7 @@ min_free = "2GiB"
 [cache]
 max_size = 0
 eviction = "lru"
-key_case = "lower"
+key_case = "preserve"
 reservation_ttl_seconds = 3600
 
 [auth]

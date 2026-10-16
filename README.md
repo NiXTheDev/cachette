@@ -124,7 +124,7 @@ reference, valid-value notes, and examples.
 | `storage.fs` | `min_free` | fraction (`0.2`), percent (`"20%"`), or bytesize (`"2GiB"`/`"2GB"`, 1024-based) | `0.2` |
 | `cache` | `max_size` | bytes, `0` = unlimited | `0` |
 | `cache` | `eviction` | `lru`, `oldest`, `none` | `lru` |
-| `cache` | `key_case` | `lower`, `preserve` | `lower` |
+| `cache` | `key_case` | `lower`, `preserve` | `preserve` |
 | `cache` | `reservation_ttl_seconds` | seconds, must be `> 0` | `3600` |
 | `auth` | `mode` | `hmac`, `bearer`, `merge` | `merge` |
 | `auth` | `secret` | 16+ characters, required to serve | unset |

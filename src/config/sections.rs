@@ -89,7 +89,7 @@ impl Default for CacheConfig {
         Self {
             max_size: 0,
             eviction: Eviction::Lru,
-            key_case: KeyCase::Lower,
+            key_case: KeyCase::Preserve,
             reservation_ttl_seconds: 3600,
         }
     }
@@ -105,11 +105,15 @@ pub enum Eviction {
     None,
 }
 
-/// Key normalization before exact/prefix matching (M11).
+/// Key normalization before exact/prefix matching (M11). GitHub cache keys are
+/// case-sensitive, so `preserve` is the default (GitHub parity); `lower` is the
+/// Forgejo-style fold and is opt-in.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyCase {
+    /// Fold keys to lowercase before matching (Forgejo-style).
     Lower,
+    /// Match keys byte-exactly, as GitHub does (default).
     Preserve,
 }
 

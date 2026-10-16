@@ -35,7 +35,7 @@ impl Default for CacheLimits {
             max_size: 0,
             min_free: MinFree::Fraction(0.2),
             reservation_ttl_seconds: 3600,
-            key_case: KeyCase::Lower,
+            key_case: KeyCase::Preserve,
             signed_url_ttl_seconds: crate::config::V1Config::default().signed_url_ttl_seconds,
         }
     }
