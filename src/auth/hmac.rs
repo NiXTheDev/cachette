@@ -71,6 +71,31 @@ pub fn verify(policy: &AuthPolicy, headers: &HeaderMap) -> bool {
     mac.verify_slice(&provided).is_ok()
 }
 
+/// Mint the hex `Forgejo-Cache-MAC` over `repo`, `run`, `timestamp`, and
+/// `isolation` for `secret` — the exact inverse of [`verify`]'s payload
+/// assembly, so `cachette token mint` (plan task 46) never hand-rolls the
+/// signature. A timestamp in the future (beyond the 5s skew) or older than
+/// `[auth] hmac_max_age_seconds` is rejected by the server, exactly as for a
+/// runner-minted token.
+#[must_use]
+pub fn mint(secret: &str, repo: &str, run: u64, timestamp: i64, isolation: &str) -> String {
+    let payload = format!("{repo}>{run}>{timestamp}>{isolation}");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+/// Lowercase hex of `bytes` (the wire form of the MAC header).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
@@ -94,5 +119,66 @@ fn hex_val(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    /// A minted MAC round-trips through [`verify`] and rejects when any signed
+    /// field changes (plan task 46: `token mint` shares verify's payload).
+    #[test]
+    fn mint_round_trips_through_verify() {
+        let policy = AuthPolicy {
+            secret: Some(String::from("super-secret-key-16")),
+            ..AuthPolicy::default()
+        };
+        let ts = now_secs();
+        let mac = mint("super-secret-key-16", "owner/repo", 42, ts, "owner/repo");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_REPO, HeaderValue::from_static("owner/repo"));
+        headers.insert(HEADER_RUN, HeaderValue::from_static("42"));
+        headers.insert(HEADER_TS, HeaderValue::from_str(&ts.to_string()).unwrap());
+        headers.insert(
+            HEADER_WRITE_ISOLATION,
+            HeaderValue::from_static("owner/repo"),
+        );
+        headers.insert(HEADER_MAC, HeaderValue::from_str(&mac).unwrap());
+        assert!(verify(&policy, &headers), "freshly minted MAC verifies");
+
+        // A read-scope token (no isolation header) also verifies.
+        let read_mac = mint("super-secret-key-16", "owner/repo", 42, ts, "");
+        let mut read_headers = HeaderMap::new();
+        read_headers.insert(HEADER_REPO, HeaderValue::from_static("owner/repo"));
+        read_headers.insert(HEADER_RUN, HeaderValue::from_static("42"));
+        read_headers.insert(HEADER_TS, HeaderValue::from_str(&ts.to_string()).unwrap());
+        read_headers.insert(HEADER_MAC, HeaderValue::from_str(&read_mac).unwrap());
+        assert!(verify(&policy, &read_headers), "read-scope MAC verifies");
+
+        // Tampering with the run invalidates it.
+        headers.insert(HEADER_RUN, HeaderValue::from_static("43"));
+        assert!(!verify(&policy, &headers), "changed run rejects");
+    }
+
+    #[test]
+    fn mint_matches_a_hand_computed_mac() {
+        // Independent computation (not via `verify`) for a known vector.
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(b"o/r>7>1700000000>iso");
+        let expected: String =
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .fold(String::new(), |mut acc, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(acc, "{byte:02x}");
+                    acc
+                });
+        assert_eq!(mint("secret", "o/r", 7, 1_700_000_000, "iso"), expected);
     }
 }

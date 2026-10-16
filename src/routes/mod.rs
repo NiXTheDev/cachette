@@ -66,7 +66,8 @@ pub fn router(state: AppState) -> Router {
         ));
     let admin_routes = Router::new()
         .route("/_internal/register", post(register_token))
-        .route("/_internal/revoke", post(revoke_token));
+        .route("/_internal/revoke", post(revoke_token))
+        .route("/_internal/cluster", get(cluster_status));
     let v1_routes = Router::new()
         .route("/_apis/artifactcache/cache", get(v1::find))
         .route("/_apis/artifactcache/caches", post(v1::reserve))
@@ -372,6 +373,38 @@ async fn revoke_token(
             ApiError::Internal.into_response()
         }
     }
+}
+
+/// `GET /_internal/cluster` — the live member table behind `cachette cluster
+/// status` (plan task 46). Admin-gated exactly like the token routes (Bearer
+/// `auth.secret`, or loopback-only when `[cluster] enabled` is false). It reads
+/// the in-memory peer table, so it never touches the (locked) data directory.
+async fn cluster_status(State(state): State<AppState>, request: Request) -> Response {
+    if !admin_authorized(&state, &request) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let peers: Vec<serde_json::Value> = state
+        .peer_table
+        .snapshot()
+        .into_iter()
+        .map(|peer| {
+            serde_json::json!({
+                "node_id": peer.node_id,
+                "fingerprint": peer.fingerprint,
+                "addr": peer.addr,
+                "healthy": peer.healthy,
+                "last_hello": peer.last_hello,
+                "used_bytes": peer.used_bytes,
+                "total_bytes": peer.total_bytes,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "node_id": state.node_id,
+        "cluster_enabled": state.auth.cluster_enabled,
+        "peers": peers,
+    }))
+    .into_response()
 }
 
 /// Admin gate for the token routes: `Authorization: Bearer <auth.secret>`, or

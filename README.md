@@ -187,7 +187,14 @@ export CACHETTE__AUTH__SECRET="change-me-to-16-plus-chars"
 cachette [OPTIONS] [COMMAND]
 
 Commands:
-  identity    Print the node fingerprint and identity certificate path
+  identity            Print the node fingerprint and identity certificate path
+  verify              Recompute every published entry's digest and report mismatches
+  cache list          List finalized cache entries (--json for machine output)
+  cache prune         Delete entries not accessed within --older-than <dur>
+  gc                  Run the reservation reaper + orphan-blob sweep once, then exit
+  doctor              Check config, storage, SQLite, identity, seeds, and disk
+  token mint          Print a Forgejo artifactcache HMAC token for the secret
+  cluster status      Print the live cluster member table from a running server
 
 Options:
   --config <path>   Path to a TOML config file (overrides the platform default)
@@ -202,6 +209,26 @@ Options:
 - `cachette identity` prints the node fingerprint and the identity certificate
   path, minting the identity on first run. Use it to collect
   `cluster.seed_fingerprints` values.
+- `cachette verify` re-hashes every published blob against the digest recorded at
+  publish time (plan task 50) and exits non-zero, naming each corrupt / missing /
+  size-mismatched entry.
+- `cachette cache list [--json]` and `cachette cache prune --older-than 7d`
+  inspect and selectively evict entries through the same storage path the server
+  uses. `--dry-run` reports without deleting.
+- `cachette gc` runs one TTL-reaper + orphan-blob sweep (the same pass the server
+  runs periodically) and exits.
+- `cachette doctor` is a read-only health check: config, writable data dir,
+  SQLite `PRAGMA integrity_check`, identity fingerprint, seed reachability, and
+  disk headroom. It exits non-zero when any check fails.
+- `cachette token mint --scope read|write [--repo owner/repo] [--run N]` prints
+  the `Forgejo-Cache-*` header values for the configured `auth.secret`, so an
+  operator never hand-rolls the HMAC.
+- `cachette cluster status [--watch]` reads the live member table from a running
+  server over a loopback admin endpoint. It is the only subcommand that needs a
+  live server.
+- `verify`, `cache`, and `gc` take an exclusive lock on the data directory and
+  refuse with a clear message while a server (or another ops command) holds it.
+  `doctor` and `token mint` never touch the data directory and do not lock.
 - `cachette --version` prints `cachette 0.1.0`.
 - A configuration error exits with status `2`.
 

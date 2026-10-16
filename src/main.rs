@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cachette::auth::{AuthPolicy, TokenStore};
-use cachette::cli::{Cli, Command};
+use cachette::cli::Cli;
 use cachette::cluster::heartbeat;
 use cachette::cluster::relay::{ClusterRelay, RelayConfig};
 use cachette::config::{self, Config};
@@ -39,18 +39,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    if matches!(cli.command, Some(Command::Identity)) {
-        let result = Identity::load_or_generate(
-            &config.cert_path(),
-            config.cluster.node_id.as_deref(),
-            config.cluster.advertise_addr.as_deref(),
-        );
-        match result {
-            Ok(identity) => {
-                println!("fingerprint: {}", identity.fingerprint());
-                println!("cert_path: {}", identity.cert_path().display());
-                std::process::exit(0);
-            }
+    if let Some(command) = cli.command.as_ref() {
+        match cachette::ops::run(command, &config) {
+            Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("cachette: {err}");
                 std::process::exit(2);
@@ -83,6 +74,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let mut state = AppState::new();
     state.config_path = cli.config;
+    // One process owns the data directory (plan task 46): the server holds an
+    // exclusive lock for its whole lifetime so offline ops commands (`verify`,
+    // `cache`, `gc`) can detect a live server and refuse instead of racing it.
+    // A second server on the same directory is likewise rejected here.
+    let _data_lock = cachette::ops::DataDirLock::acquire(&config.storage.fs.path)?;
     // First boot mints the Ed25519 identity at `cluster.cert_path`; later
     // boots reuse it, so the fingerprint survives restarts and storage wipes
     // (plan task 13). It also becomes the `/health` node_id.
