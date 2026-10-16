@@ -41,7 +41,7 @@ RUN apk add --no-cache gcc musl-dev file
 
 # Optional crates.io source replacement for restricted networks (CI needs NONE;
 # GitHub runners reach crates.io directly):
-#   --build-arg CARGO_MIRROR=sparse+https://mirror.nju.edu.cn/crates.io-index/
+#   --build-arg CARGO_MIRROR=sparse+https://<registry-host>/crates.io-index/
 ARG CARGO_MIRROR=
 RUN if [ -n "$CARGO_MIRROR" ]; then \
       printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
