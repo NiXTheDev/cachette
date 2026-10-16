@@ -7,11 +7,23 @@
 //! - `PUT /v2/upload/{entryId}?comp=block&blockid=<base64>` — stage one named
 //!   block. `blockid` base64-decodes to exactly 48 or 64 bytes; anything else
 //!   is a 400. 201 with an empty body.
-//! - `PUT /v2/upload/{entryId}?comp=blocklist&blocklist=<urlencoded XML>` —
-//!   assemble the listed blocks in document order into the final blob and
-//!   publish it (B5 ordering: blob file, then the index row). 201 with an
-//!   empty body and a non-empty `x-ms-request-id`.
-//! - Any other `comp` with a request body — 400 (a body on an unsupported
+//! - `PUT /v2/upload/{entryId}?comp=blocklist` — assemble the listed blocks in
+//!   document order into the final blob and publish it (B5 ordering: blob
+//!   file, then the index row). 201 with an empty body and a non-empty
+//!   `x-ms-request-id`. The `<BlockList>` XML is accepted from EITHER the
+//!   `blocklist=<urlencoded XML>` query parameter (the cachette-native form
+//!   task 25 minted) OR the request BODY: the real Azure SDK /
+//!   go-actions-cache client sends `comp=blocklist` with the XML in the body
+//!   (and no `blocklist` query parameter — see `azblob`
+//!   `commitBlockListCreateRequest`). Body form takes effect only when the
+//!   query parameter is absent, so the existing contract is unchanged.
+//! - `PUT /v2/upload/{entryId}` with no `comp` (Azure "Put Blob") — the whole
+//!   blob in one request. This is what the real client uses for payloads
+//!   smaller than one 1 MiB block. The body is staged as a single synthetic
+//!   block and immediately assembled, so the entry publishes under the
+//!   artifact key just like the block-list path. A bodiless no-comp PUT stays
+//!   the historical 201 no-op.
+//! - Any OTHER `comp` with a request body — 400 (a body on an unsupported
 //!   `comp` is a protocol error). A bodyless no-op is accepted as 201.
 //!
 //! Every request is authorized by the signed capability URL alone (the path
@@ -53,6 +65,10 @@ const REQUEST_ID_HEADER: &str = "x-ms-request-id";
 /// A block id must base64-decode to exactly this many bytes (Azure spec).
 const BLOCK_ID_LENGTHS: [usize; 2] = [48, 64];
 
+/// Synthetic block token under which a bare Azure "Put Blob" body (no `comp`)
+/// is staged before being assembled in one shot.
+const PUT_BLOB_BLOCK_ID: &str = "putblob";
+
 /// `PUT /v2/upload/{entryId}` — Azure block-blob upload emulation.
 pub async fn upload(
     State(state): State<AppState>,
@@ -73,8 +89,9 @@ pub async fn upload(
     }
     match query.get("comp").map(String::as_str) {
         Some("block") => stage_block(storage, &entry_id, &query, body).await,
-        Some("blocklist") => commit_block_list(storage, &entry_id, &query).await,
-        _ => unsupported_comp(body).await,
+        Some("blocklist") => commit_block_list(storage, &entry_id, &query, body).await,
+        None => put_blob(storage, &entry_id, body).await,
+        Some(_) => unsupported_comp(body).await,
     }
 }
 
@@ -111,16 +128,34 @@ async fn stage_block(
 }
 
 /// `comp=blocklist`: assemble the listed blocks (in order) and publish.
+///
+/// The `<BlockList>` XML comes from the `blocklist` query parameter when
+/// present (cachette-native form) and otherwise from the request BODY — the
+/// shape the real Azure SDK / go-actions-cache v2 client sends.
 async fn commit_block_list(
     storage: &dyn StorageBackend,
     entry_id: &str,
     query: &HashMap<String, String>,
+    body: Body,
 ) -> Response {
-    let Some(xml) = query.get("blocklist").filter(|value| !value.is_empty()) else {
-        return ApiError::BadRequest(String::from("blocklist query parameter is required"))
-            .into_response();
+    let xml = match query.get("blocklist").filter(|value| !value.is_empty()) {
+        Some(xml) => xml.clone(),
+        None => match read_body(body).await {
+            Ok(bytes) if bytes.is_empty() => {
+                return ApiError::BadRequest(String::from("blocklist query parameter is required"))
+                    .into_response();
+            }
+            Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
+                Ok(xml) => xml,
+                Err(_) => {
+                    return ApiError::BadRequest(String::from("blocklist XML is not valid UTF-8"))
+                        .into_response();
+                }
+            },
+            Err(err) => return err.into_response(),
+        },
     };
-    let block_ids = match parse_block_list(xml) {
+    let block_ids = match parse_block_list(&xml) {
         Ok(ids) if !ids.is_empty() => ids,
         Ok(_) => {
             return ApiError::BadRequest(String::from("blocklist lists no blocks")).into_response();
@@ -130,6 +165,33 @@ async fn commit_block_list(
         }
     };
     match storage.assemble_blocks(entry_id, &block_ids).await {
+        Ok(_size) => created(),
+        Err(err) => storage_error(err),
+    }
+}
+
+/// Bare `PUT /v2/upload/{entryId}` (Azure "Put Blob"): the whole blob in one
+/// request, which the real client uses for payloads under one 1 MiB block.
+/// The body is staged under a synthetic block token and immediately assembled,
+/// so it publishes under the artifact key exactly like the block-list path.
+/// A bodiless request stays the historical 201 no-op.
+async fn put_blob(storage: &dyn StorageBackend, entry_id: &str, body: Body) -> Response {
+    let bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(err) => return err.into_response(),
+    };
+    if bytes.is_empty() {
+        return created();
+    }
+    let block_id = PUT_BLOB_BLOCK_ID.to_owned();
+    let stream: ByteStream<'_> = Box::pin(std::io::Cursor::new(bytes));
+    if let Err(err) = storage.put_block(entry_id, &block_id, stream).await {
+        return storage_error(err);
+    }
+    match storage
+        .assemble_blocks(entry_id, std::slice::from_ref(&block_id))
+        .await
+    {
         Ok(_size) => created(),
         Err(err) => storage_error(err),
     }

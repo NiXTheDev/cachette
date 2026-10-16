@@ -9,6 +9,13 @@
 //	go run . save    <key> <payload-path>
 //	go run . restore <key> <payload-path>
 //
+// The client is constructed with the upstream env-aware `TryEnv`, so the
+// fixture drives whichever protocol the environment selects:
+//
+//	v1 (default):     ACTIONS_CACHE_URL + ACTIONS_RUNTIME_TOKEN
+//	v2 (CacheService): ACTIONS_CACHE_SERVICE_V2=true (or
+//	                  ACTIONS_CACHE_API_FORCE_VERSION=v2) + ACTIONS_RESULTS_URL
+//
 // The last stdout line is a machine-readable marker the Rust test parses:
 //
 //	__CACHETTE_JSON__{"command":...,"key":...,"result":...}
@@ -43,8 +50,8 @@ func fail(payload map[string]any, err error) {
 }
 
 func newClient() (*actionscache.Cache, error) {
-	token := os.Getenv("ACTIONS_RUNTIME_TOKEN")
-	cacheURL := os.Getenv("ACTIONS_CACHE_URL")
+	// Construct via the upstream env-aware `TryEnv` so the fixture exercises
+	// exactly the v1/v2 selection logic buildx and the actions toolkit use.
 	// The upstream client parses+validates the bearer token as a JWT before it
 	// ever issues a request, so the fixture needs a real (well-formed) token.
 	opt := actionscache.Opt{
@@ -61,7 +68,14 @@ func newClient() (*actionscache.Cache, error) {
 			},
 		}
 	}
-	return actionscache.New(token, cacheURL, false, opt)
+	c, err := actionscache.TryEnv(opt)
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, fmt.Errorf("no cache token in the environment (set ACTIONS_RUNTIME_TOKEN)")
+	}
+	return c, nil
 }
 
 func sha256File(path string) (string, int64, error) {

@@ -10,9 +10,13 @@
 //!   `/v2/artifacts/{entryId}` is bound into the MAC); a missing, tampered, or
 //!   expired URL maps to 403 `{"error":"invalid or expired url"}`;
 //! - a missing (or not-yet-complete) entry maps to 404;
-//! - no `Range` → 200 with the full body; `Range: bytes=a-b` → 206 with the
-//!   exact slice and `Content-Range: bytes a-b/<size>`; an unsatisfiable range
-//!   → 416 with `Content-Range: bytes */<size>`.
+//! - no range → 200 with the full body; a byte range → 206 with the exact
+//!   slice and `Content-Range: bytes a-b/<size>`; an unsatisfiable range
+//!   → 416 with `Content-Range: bytes */<size>`. Both the standard `Range`
+//!   header and Azure's `x-ms-range` are honoured (`x-ms-range` wins when both
+//!   are present, matching the Azure Blob service): the Azure SDK /
+//!   go-actions-cache v2 client sets `x-ms-range`, NOT `Range`, on every
+//!   ranged `DownloadStream`.
 //!
 //! Cluster seam (plan tasks 31/32): single-node serving reads local storage; in
 //! cluster mode the owning node may be a peer and task 32 forwards/replicates
@@ -66,8 +70,11 @@ pub async fn download(
             return ApiError::Internal.into_response();
         }
     };
+    // Prefer Azure's `x-ms-range` (what the SDK sends) and fall back to the
+    // standard `Range`. Azure uses `x-ms-range` when both are present.
     let range = headers
-        .get(header::RANGE)
+        .get("x-ms-range")
+        .or_else(|| headers.get(header::RANGE))
         .and_then(|value| value.to_str().ok());
     match range {
         None => match read_range(storage, &entry_id, 0..size).await {
