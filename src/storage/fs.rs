@@ -277,6 +277,19 @@ impl FsStorage {
         )
     }
 
+    /// Drop per-key chunk locks nobody holds any more (plan T52: bound idle
+    /// RSS). Without this the map grows one entry per cache key ever staged
+    /// and never shrinks. Race-free: a lock is only removable while its `Arc`
+    /// has no other clones, and this check, like [`Self::chunk_lock`]'s clone,
+    /// happens under the map mutex, so a sweep can never remove a lock that a
+    /// task is holding or waiting on.
+    pub fn sweep_chunk_locks(&self) -> u64 {
+        let mut locks = self.chunk_locks.lock().expect("chunk lock map poisoned");
+        let before = locks.len();
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        (before - locks.len()) as u64
+    }
+
     /// Plan B5 boot reconciliation: drop index rows whose blob file is
     /// gone, recompute accounting from the survivors, discard leftover
     /// scratch. Rowless blob files stay put for the task-11 reaper.
@@ -1196,6 +1209,38 @@ mod storage_fs {
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.expect("read stream");
         out
+    }
+
+    /// T52: the per-key chunk-lock map must not grow without bound. Idle locks
+    /// (no live clone) are swept; a lock a task still holds survives.
+    #[test]
+    fn chunk_lock_sweep_prunes_idle_entries_and_keeps_held_ones() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let len = |storage: &FsStorage| {
+            storage
+                .chunk_locks
+                .lock()
+                .expect("chunk lock map poisoned")
+                .len()
+        };
+
+        // Idle locks accumulate one per key ...
+        for i in 0..64 {
+            drop(storage.chunk_lock(&format!("staged-{i}")));
+        }
+        assert_eq!(len(&storage), 64);
+        // ... and one sweep drops every one of them.
+        assert_eq!(storage.sweep_chunk_locks(), 64);
+        assert_eq!(len(&storage), 0);
+
+        // A lock a task is still holding (or waiting on) survives the sweep.
+        let held = storage.chunk_lock("in-flight");
+        assert_eq!(storage.sweep_chunk_locks(), 0);
+        assert_eq!(len(&storage), 1);
+        drop(held);
+        assert_eq!(storage.sweep_chunk_locks(), 1);
+        assert_eq!(len(&storage), 0);
     }
 
     #[tokio::test]

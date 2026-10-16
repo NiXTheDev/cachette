@@ -240,10 +240,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         loop {
             ticker.tick().await;
             match reaper.sweep_once(&sweep_storage).await {
-                Ok(report) if report.reservations_reaped > 0 || report.orphan_blobs_swept > 0 => {
+                Ok(report)
+                    if report.reservations_reaped > 0
+                        || report.orphan_blobs_swept > 0
+                        || report.chunk_locks_swept > 0 =>
+                {
                     tracing::info!(
                         reservations = report.reservations_reaped,
                         orphans = report.orphan_blobs_swept,
+                        chunk_locks = report.chunk_locks_swept,
                         "periodic sweep reclaimed storage"
                     );
                 }

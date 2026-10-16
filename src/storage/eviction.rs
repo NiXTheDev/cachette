@@ -400,6 +400,8 @@ pub struct ReapReport {
     pub reservations_reaped: u64,
     /// Rowless blob files older than [`ORPHAN_BLOB_GRACE`] deleted.
     pub orphan_blobs_swept: u64,
+    /// Idle per-key chunk locks dropped (T52): unbounded otherwise.
+    pub chunk_locks_swept: u64,
 }
 
 impl Reaper {
@@ -417,16 +419,18 @@ impl Reaper {
     }
 
     /// One pass: reap reservations whose `reservation_expires_at` has
-    /// passed, then sweep rowless blobs older than
-    /// [`ORPHAN_BLOB_GRACE`].
+    /// passed, sweep rowless blobs older than [`ORPHAN_BLOB_GRACE`], and drop
+    /// idle chunk locks so that map cannot grow without bound.
     pub async fn sweep_once(&self, storage: &FsStorage) -> std::io::Result<ReapReport> {
         let now = super::unix_now();
         let reservations_reaped = storage.reap_expired_reservations(now).await?;
         let cutoff = now.saturating_sub(ORPHAN_BLOB_GRACE.as_secs());
         let orphan_blobs_swept = storage.sweep_orphan_blobs(cutoff).await?;
+        let chunk_locks_swept = storage.sweep_chunk_locks();
         Ok(ReapReport {
             reservations_reaped,
             orphan_blobs_swept,
+            chunk_locks_swept,
         })
     }
 }
