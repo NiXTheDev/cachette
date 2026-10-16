@@ -55,6 +55,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cachette::auth::{AuthPolicy, jwt, urls};
@@ -83,14 +84,24 @@ struct Scratch {
     root: PathBuf,
 }
 
+/// Process-wide disambiguator for scratch dirs. The nanosecond stamp alone is
+/// not enough: Windows `SystemTime::now()` granularity lets two tests that
+/// start together read the same value, which would make them share one
+/// scratch - and therefore one server storage dir and one client work dir.
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl Scratch {
     fn new(tag: &str) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut root = std::env::temp_dir();
-        root.push(format!("cachette-t22-{tag}-{}-{nanos}", std::process::id()));
+        root.push(format!(
+            "cachette-t22-{tag}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("create scratch dir");
         Self { root }
     }
