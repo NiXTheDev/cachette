@@ -45,6 +45,7 @@ use tokio::sync::RwLock;
 
 use super::{
     BoxFuture, ByteStream, Chunk, ChunkOutcome, ChunkRange, EntryStat, StorageBackend, complete,
+    digest::{self, DigestWriter},
     invalid_range, not_found,
 };
 
@@ -62,7 +63,8 @@ const SCHEMA: &str = "
         complete                INTEGER NOT NULL DEFAULT 0,
         owner_node              TEXT NOT NULL DEFAULT '',
         reservation_expires_at  INTEGER,
-        artifact_key            TEXT NOT NULL DEFAULT ''
+        artifact_key            TEXT NOT NULL DEFAULT '',
+        digest                  TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS entries_key_idx ON entries(key);
     CREATE TABLE IF NOT EXISTS accounting (used_bytes INTEGER NOT NULL);
@@ -74,6 +76,51 @@ const SCHEMA: &str = "
 /// mutex per reservation key so sequential chunks from one client never race,
 /// while different reservations write concurrently.
 type ChunkLocks = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Health of one published blob, as reported by [`FsStorage::verify_all`]
+/// (plan task 50).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EntryHealth {
+    /// The on-disk bytes hash to the digest recorded at publish time.
+    Ok,
+    /// The index has a complete row but `blobs/{id}.blob` is gone.
+    MissingBlob,
+    /// The row predates task 50 and carries no digest to check against.
+    MissingDigest,
+    /// Size on disk disagrees with the size committed in the index.
+    SizeMismatch {
+        /// Size recorded when the entry was published.
+        expected: u64,
+        /// Size of the blob file now.
+        actual: u64,
+    },
+    /// Byte count matches but the content no longer hashes to the digest.
+    DigestMismatch {
+        /// Digest recorded when the entry was published.
+        expected: String,
+        /// Digest of the blob file now.
+        actual: String,
+    },
+}
+
+/// One entry's integrity verdict from [`FsStorage::verify_all`] (plan task 50).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyReport {
+    /// Artifact key the entry is published under.
+    pub key: String,
+    /// Size committed in the index.
+    pub size: u64,
+    /// What the on-disk blob looks like now.
+    pub health: EntryHealth,
+}
+
+impl VerifyReport {
+    /// Whether the entry needs no attention.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.health == EntryHealth::Ok
+    }
+}
 
 /// Node-local blob store: raw files for payloads plus one SQLite file for
 /// the metadata index. Share behind `Arc`: SQLite access is funnelled
@@ -121,6 +168,68 @@ impl FsStorage {
         };
         storage.reconcile()?;
         Ok(storage)
+    }
+
+    /// Re-hash every published blob and compare it with the digest recorded
+    /// when the entry was committed (plan task 50). Blocking: it reads each
+    /// blob in bounded chunks, so call it from an ops command (`cachette
+    /// verify`, task 46) or the periodic scrub, never the request path.
+    ///
+    /// `Err` is reserved for real I/O failures (for example an unreadable
+    /// blob); a blob that has gone missing or was modified comes back as an
+    /// [`EntryHealth`] that is not [`EntryHealth::Ok`].
+    pub fn verify_all(&self) -> io::Result<Vec<VerifyReport>> {
+        let rows: Vec<(String, String, i64, String)> = {
+            let conn = lock(&self.conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, key, size, digest FROM entries \
+                     WHERE complete = 1 ORDER BY key",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(sql)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
+        };
+        let mut reports = Vec::with_capacity(rows.len());
+        for (id, key, size, stored) in rows {
+            let recorded = u64::try_from(size).unwrap_or(0);
+            let blob = self.blob_path(&id);
+            let health = match std::fs::metadata(&blob) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => EntryHealth::MissingBlob,
+                Err(err) => return Err(err),
+                Ok(meta) => {
+                    let on_disk = meta.len();
+                    if on_disk != recorded {
+                        EntryHealth::SizeMismatch {
+                            expected: recorded,
+                            actual: on_disk,
+                        }
+                    } else if stored.is_empty() {
+                        EntryHealth::MissingDigest
+                    } else {
+                        let actual = digest::hash_file(&blob)?;
+                        if actual == stored {
+                            EntryHealth::Ok
+                        } else {
+                            EntryHealth::DigestMismatch {
+                                expected: stored,
+                                actual,
+                            }
+                        }
+                    }
+                }
+            };
+            reports.push(VerifyReport {
+                key,
+                size: recorded,
+                health,
+            });
+        }
+        Ok(reports)
     }
 
     /// Reservation TTL reaper (plan task 11 / M4): delete staged
@@ -528,6 +637,11 @@ impl StorageBackend for FsStorage {
                     };
                 }
                 let created_at = modified_unix(&part)?;
+                // Task 50: `finalize` has no streaming write to fold the hash
+                // into (the part is already on disk), so read it back in
+                // bounded chunks. The chunk and block publish paths hash while
+                // they copy instead.
+                let digest = digest::hash_file(&part)?;
                 // B5 ordering: blob file first, index commit second.
                 std::fs::rename(&part, &blob)?;
                 let size = std::fs::metadata(&blob)?.len();
@@ -553,15 +667,15 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '') \
+                          owner_node, artifact_key, digest) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6) \
                          ON CONFLICT(id) DO UPDATE SET \
                              key = excluded.key, version = excluded.version, \
                              size = excluded.size, \
                              created_at = excluded.created_at, \
                              accessed_at = excluded.accessed_at, complete = 1, \
-                             artifact_key = ''",
-                    params![id, key, version, size, created_at],
+                             artifact_key = '', digest = excluded.digest",
+                    params![id, key, version, size, created_at, digest],
                 )
                 .map_err(sql)?;
                 let used: i64 = tx
@@ -783,14 +897,16 @@ impl StorageBackend for FsStorage {
                 let blob_id = entry_id(&artifact_key);
                 let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
-                {
-                    let mut out = File::create(&tmp)?;
+                let digest = {
+                    let mut out = DigestWriter::new(File::create(&tmp)?);
                     for (_start, _len, path) in &parts {
                         let mut input = File::open(path)?;
                         std::io::copy(&mut input, &mut out)?;
                     }
-                    out.sync_all()?;
-                }
+                    let (file, digest) = out.finish()?;
+                    file.sync_all()?;
+                    digest
+                };
                 // B5 ordering: blob file first, index commit second, so a crash
                 // in between leaves a rowless blob for the reaper.
                 std::fs::rename(&tmp, &blob)?;
@@ -809,14 +925,15 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL) \
+                          owner_node, artifact_key, reservation_expires_at, digest) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6) \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
-                         artifact_key = '', reservation_expires_at = NULL",
-                    params![blob_id, artifact_key, version, size, now],
+                         artifact_key = '', reservation_expires_at = NULL, \
+                         digest = excluded.digest",
+                    params![blob_id, artifact_key, version, size, now, digest],
                 )
                 .map_err(sql)?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
@@ -934,8 +1051,8 @@ impl StorageBackend for FsStorage {
                 let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
                 let mut total = 0_u64;
-                {
-                    let mut out = File::create(&tmp)?;
+                let digest = {
+                    let mut out = DigestWriter::new(File::create(&tmp)?);
                     for block_id in &ordered {
                         let path = blocks.join(format!("{block_id}.block"));
                         let mut input = File::open(&path).map_err(|err| {
@@ -947,8 +1064,10 @@ impl StorageBackend for FsStorage {
                         })?;
                         total = total.saturating_add(std::io::copy(&mut input, &mut out)?);
                     }
-                    out.sync_all()?;
-                }
+                    let (file, digest) = out.finish()?;
+                    file.sync_all()?;
+                    digest
+                };
                 // B5 ordering: blob file first, index commit second, so a crash
                 // in between leaves a rowless blob for the reaper.
                 std::fs::rename(&tmp, &blob)?;
@@ -967,14 +1086,15 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL) \
+                          owner_node, artifact_key, reservation_expires_at, digest) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6) \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
-                         artifact_key = '', reservation_expires_at = NULL",
-                    params![blob_id, artifact_key, version, size, now],
+                         artifact_key = '', reservation_expires_at = NULL, \
+                         digest = excluded.digest",
+                    params![blob_id, artifact_key, version, size, now, digest],
                 )
                 .map_err(sql)?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
@@ -1014,7 +1134,8 @@ fn entry_id(key: &str) -> String {
 /// Bring a pre-task-21 index up to the current schema: `artifact_key` lets a
 /// reservation carry the artifact key it will publish under while `key` stays
 /// the reservation's own `cacheId` (so the reaper's `parts/{key}/` cleanup
-/// still applies).
+/// still applies), and `digest` (task 50) carries the entry's content hash so
+/// `cachette verify` can detect a later mutation of the blob.
 fn migrate(conn: &Connection) -> io::Result<()> {
     let present: i64 = conn
         .query_row(
@@ -1026,6 +1147,23 @@ fn migrate(conn: &Connection) -> io::Result<()> {
     if present == 0 {
         conn.execute(
             "ALTER TABLE entries ADD COLUMN artifact_key TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(sql)?;
+    }
+    // Task 50: content digest for `cachette verify`. Rows written before the
+    // column existed keep the '' default and are reported as
+    // `EntryHealth::MissingDigest` until they are rewritten.
+    let has_digest: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'digest'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if has_digest == 0 {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN digest TEXT NOT NULL DEFAULT ''",
             [],
         )
         .map_err(sql)?;
@@ -2255,6 +2393,150 @@ mod storage_fs {
             storage.stat("artifact-key").await.expect("stat"),
             None,
             "a failed assemble publishes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_chunks_records_a_digest_and_verify_flags_changed_bytes() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("cache-id", "artifact-key", "v1", now + 3600)
+            .await
+            .expect("reserve");
+
+        let body = b"bitrot me";
+        storage
+            .write_chunk(
+                "cache-id",
+                Chunk {
+                    range: ChunkRange {
+                        start: 0,
+                        end: (body.len() - 1) as u64,
+                    },
+                    body: bytes(body),
+                },
+            )
+            .await
+            .expect("write chunk");
+        storage
+            .commit_chunks("cache-id", body.len() as u64)
+            .await
+            .expect("commit");
+
+        let report = storage.verify_all().expect("verify");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].key, "artifact-key");
+        assert_eq!(report[0].size, body.len() as u64);
+        assert_eq!(report[0].health, EntryHealth::Ok);
+        assert!(report[0].is_ok());
+
+        // Flip one byte in the published blob: verify must flag the entry, and
+        // the recorded digest is still the digest of the untampered body.
+        let blob = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.blob", entry_id("artifact-key")));
+        let mut on_disk = std::fs::read(&blob).expect("read blob");
+        on_disk[0] ^= 0x01;
+        std::fs::write(&blob, &on_disk).expect("rewrite blob");
+
+        let report = storage.verify_all().expect("verify again");
+        assert_eq!(report.len(), 1);
+        match &report[0].health {
+            EntryHealth::DigestMismatch { expected, actual } => {
+                assert_eq!(expected, &digest::hash_bytes(body));
+                assert_ne!(actual, expected);
+            }
+            other => panic!("expected a digest mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_blocks_records_a_digest_and_verify_flags_a_truncated_blob() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let now = u64::try_from(unix_now()).expect("positive clock");
+        storage
+            .reserve("cache-id", "artifact-key", "v1", now + 3600)
+            .await
+            .expect("reserve");
+        storage
+            .put_block("cache-id", "aa", bytes(b"first"))
+            .await
+            .expect("put block aa");
+        storage
+            .put_block("cache-id", "bb", bytes(b"second"))
+            .await
+            .expect("put block bb");
+        let ordered = vec!["aa".to_owned(), "bb".to_owned()];
+        storage
+            .assemble_blocks("cache-id", &ordered)
+            .await
+            .expect("assemble");
+
+        let report = storage.verify_all().expect("verify");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].size, 11);
+        assert_eq!(report[0].health, EntryHealth::Ok);
+
+        // Truncate the blob: the size check fires before any hashing.
+        let blob = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.blob", entry_id("artifact-key")));
+        std::fs::write(&blob, b"firs").expect("truncate blob");
+
+        let report = storage.verify_all().expect("verify again");
+        assert_eq!(
+            report[0].health,
+            EntryHealth::SizeMismatch {
+                expected: 11,
+                actual: 4
+            }
+        );
+    }
+
+    #[test]
+    fn migration_adds_the_digest_column_to_a_pre_t50_database() {
+        let dir = TestDir::new();
+        // Build a legacy index by hand: the entries table as it looked before
+        // task 50, with no digest column.
+        {
+            let conn =
+                Connection::open(dir.path().join("cachette.sqlite3")).expect("open legacy index");
+            conn.execute_batch(
+                "CREATE TABLE entries (\
+                     id TEXT PRIMARY KEY, \
+                     key TEXT NOT NULL, \
+                     version TEXT NOT NULL DEFAULT '', \
+                     size INTEGER NOT NULL, \
+                     created_at INTEGER NOT NULL, \
+                     accessed_at INTEGER NOT NULL, \
+                     complete INTEGER NOT NULL DEFAULT 0, \
+                     owner_node TEXT NOT NULL DEFAULT '', \
+                     reservation_expires_at INTEGER, \
+                     artifact_key TEXT NOT NULL DEFAULT '');\
+                 CREATE TABLE accounting (used_bytes INTEGER NOT NULL);\
+                 INSERT INTO accounting (used_bytes) VALUES (0);",
+            )
+            .expect("legacy schema");
+        }
+
+        let storage = FsStorage::open(dir.path()).expect("open migrates the legacy index");
+        let conn = lock(&storage.conn).expect("lock");
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('entries')")
+            .expect("prepare");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect columns");
+        assert!(
+            columns.iter().any(|name| name == "digest"),
+            "digest column missing after migration: {columns:?}"
         );
     }
 

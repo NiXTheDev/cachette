@@ -32,6 +32,7 @@ use tokio::sync::RwLock;
 
 use crate::config::KeyCase;
 
+pub mod digest;
 pub mod eviction;
 pub mod fs;
 
