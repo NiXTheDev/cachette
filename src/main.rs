@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // environment concurrently.
         unsafe { std::env::set_var("RUST_LOG", config.log.level.as_str()) };
     }
-    logging::init(config.log.format.into());
+    logging::init(config.log.format.into(), config.log.file.clone());
     tracing::debug!(config_path = ?cli.config, "command line parsed");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -219,7 +219,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
 
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
-    let app = routes::router(state).layer(TraceLayer::new_for_http());
+    let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
     // Single TLS listener (plan task 14 / B1): every route is served over
     // HTTPS; client certs are optional at the TLS layer and gated per-route.
     let tls_config = tls::server_config(&config.server, &identity)?;
@@ -234,6 +234,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // the reaper documents. The first tick is immediate and skipped — the
     // startup sweep already ran.
     let sweep_storage = storage.clone();
+    let sweep_metrics = state.metrics.clone();
     let sweep_interval = reaper.interval();
     let sweep_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sweep_interval);
@@ -241,19 +242,25 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         loop {
             ticker.tick().await;
             match reaper.sweep_once(&sweep_storage).await {
-                Ok(report)
+                Ok(report) => {
+                    if report.reservations_reaped > 0 {
+                        sweep_metrics.add_reservations(-(report.reservations_reaped as i64));
+                    }
+                    if let Ok(used) = sweep_storage.used_bytes().await {
+                        sweep_metrics.set_storage_used(used);
+                    }
                     if report.reservations_reaped > 0
                         || report.orphan_blobs_swept > 0
-                        || report.chunk_locks_swept > 0 =>
-                {
-                    tracing::info!(
-                        reservations = report.reservations_reaped,
-                        orphans = report.orphan_blobs_swept,
-                        chunk_locks = report.chunk_locks_swept,
-                        "periodic sweep reclaimed storage"
-                    );
+                        || report.chunk_locks_swept > 0
+                    {
+                        tracing::info!(
+                            reservations = report.reservations_reaped,
+                            orphans = report.orphan_blobs_swept,
+                            chunk_locks = report.chunk_locks_swept,
+                            "periodic sweep reclaimed storage"
+                        );
+                    }
                 }
-                Ok(_) => {}
                 Err(err) => tracing::warn!(error = %err, "periodic sweep failed"),
             }
         }

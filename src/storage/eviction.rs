@@ -277,6 +277,9 @@ pub struct EvictionService {
     policy: Eviction,
     leases: Arc<LeaseSet>,
     budget: Duration,
+    /// Optional metrics sink (plan task 35): when set, each evicted entry
+    /// bumps `evictions_total`.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl EvictionService {
@@ -288,7 +291,15 @@ impl EvictionService {
             policy,
             leases,
             budget: DEFAULT_SWEEP_BUDGET,
+            metrics: None,
         }
+    }
+
+    /// Attach a metrics sink so every evicted entry bumps `evictions_total`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Override the per-sweep time budget (tests use a large budget for
@@ -344,6 +355,9 @@ impl EvictionService {
             }
             storage.delete(&entry.key).await?;
             capacity.note_evicted(entry.size);
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.inc_evictions();
+            }
             report.bytes_freed += entry.size;
             report.evicted.push(entry.key.clone());
         }

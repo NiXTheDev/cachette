@@ -101,6 +101,7 @@ pub(crate) async fn reserve(
         tracing::error!(error = %err, "peer reserve: staging reservation failed");
         return ApiError::Internal.into_response();
     }
+    state.metrics.add_reservations(1);
     let cache_size = state.cache.max_size.saturating_sub(used);
     Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
@@ -175,7 +176,13 @@ pub(crate) async fn commit(
             .into_response();
     };
     match storage.commit_chunks(&cache_id, body.size).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.metrics.add_reservations(-1);
+            if let Ok(used) = storage.used_bytes().await {
+                state.metrics.set_storage_used(used);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // Idempotency: a repeat forward after B already published the entry
             // finds no reservation but a size-matched finalized entry under the
@@ -319,6 +326,7 @@ pub(crate) async fn v2_reserve(
         tracing::error!(error = %err, "peer v2 reserve: staging reservation failed");
         return ApiError::Internal.into_response();
     }
+    state.metrics.add_reservations(1);
     Json(json!({
         "ok": true,
         "externalUrl": state.external_url,

@@ -120,3 +120,8 @@ level = "info"
 
 # Log format: "text" or "json"
 format = "text"
+
+# Optional. When set, cachette writes its own log file here (parent
+# directories are created, the file is appended to) instead of stderr.
+# Leave unset to log to stderr (the default).
+# file = "/var/log/cachette/cachette.log"

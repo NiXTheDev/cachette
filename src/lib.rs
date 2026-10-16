@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod logging;
+pub mod metrics;
 pub mod routes;
 pub mod state;
 pub mod storage;

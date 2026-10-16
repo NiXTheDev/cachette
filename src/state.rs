@@ -7,6 +7,7 @@ use crate::auth::{AuthPolicy, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
 use crate::config::{KeyCase, MinFree};
+use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
 
@@ -89,6 +90,8 @@ pub struct AppState {
     /// path re-checks live admission without a blocking disk query on the
     /// request path.
     pub capacity_total: u64,
+    /// Hand-counted request-path counters exposed by `GET /metrics` (task 35).
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -108,6 +111,7 @@ impl AppState {
             external_url: None,
             relay: None,
             capacity_total: 0,
+            metrics: Arc::new(Metrics::default()),
         }
     }
 }

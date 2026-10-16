@@ -298,6 +298,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
             return ApiError::Internal.into_twirp_response();
         }
     };
+    state.metrics.set_storage_used(used);
     if state.cache.max_size > 0 {
         let capacity = Capacity::resolve(state.cache.min_free, state.cache.max_size, 0, used);
         if !capacity.admits(None) {
@@ -317,6 +318,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         tracing::error!(error = %err, "v2 create: staging reservation failed");
         return ApiError::Internal.into_twirp_response();
     }
+    state.metrics.add_reservations(1);
     let scope = request
         .scope
         .or_else(|| request.metadata.and_then(|metadata| metadata.scope));

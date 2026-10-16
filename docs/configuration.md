@@ -95,6 +95,7 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 |---|---|---|---|
 | `level` | `trace` / `debug` / `info` / `warn` / `error` | `info` | The default tracing filter. An explicitly set `RUST_LOG` still wins. |
 | `format` | `text` / `json` | `text` | `json` emits one JSON object per line for log shippers. |
+| `file` | path | unset | When set, cachette writes its own log file at this path (parent directories created, file appended to) instead of stderr. No supervisor redirection needed. |
 
 ## Environment overrides
 

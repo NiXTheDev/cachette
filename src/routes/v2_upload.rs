@@ -85,8 +85,8 @@ pub async fn upload(
     let max_bytes = usize::try_from(state.cache.max_chunk_bytes).unwrap_or(usize::MAX);
     match query.get("comp").map(String::as_str) {
         Some("block") => stage_block(storage, &entry_id, &query, body, max_bytes).await,
-        Some("blocklist") => commit_block_list(storage, &entry_id, &query, body, max_bytes).await,
-        None => put_blob(storage, &entry_id, body, max_bytes).await,
+        Some("blocklist") => commit_block_list(&state, &entry_id, &query, body, max_bytes).await,
+        None => put_blob(&state, &entry_id, body, max_bytes).await,
         Some(_) => unsupported_comp(body, max_bytes).await,
     }
 }
@@ -130,12 +130,16 @@ async fn stage_block(
 /// present (cachette-native form) and otherwise from the request BODY — the
 /// shape the real Azure SDK / go-actions-cache v2 client sends.
 async fn commit_block_list(
-    storage: &dyn StorageBackend,
+    state: &AppState,
     entry_id: &str,
     query: &HashMap<String, String>,
     body: Body,
     max_bytes: usize,
 ) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     let xml = match query.get("blocklist").filter(|value| !value.is_empty()) {
         Some(xml) => xml.clone(),
         None => match read_body(body, max_bytes).await {
@@ -163,7 +167,13 @@ async fn commit_block_list(
         }
     };
     match storage.assemble_blocks(entry_id, &block_ids).await {
-        Ok(_size) => created(),
+        Ok(_size) => {
+            state.metrics.add_reservations(-1);
+            if let Ok(used) = storage.used_bytes().await {
+                state.metrics.set_storage_used(used);
+            }
+            created()
+        }
         Err(err) => storage_error(err),
     }
 }
@@ -173,12 +183,11 @@ async fn commit_block_list(
 /// The body is staged under a synthetic block token and immediately assembled,
 /// so it publishes under the artifact key exactly like the block-list path.
 /// A bodiless request stays the historical 201 no-op.
-async fn put_blob(
-    storage: &dyn StorageBackend,
-    entry_id: &str,
-    body: Body,
-    max_bytes: usize,
-) -> Response {
+async fn put_blob(state: &AppState, entry_id: &str, body: Body, max_bytes: usize) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     let bytes = match read_body(body, max_bytes).await {
         Ok(bytes) => bytes,
         Err(err) => return err.into_response(),
@@ -195,7 +204,13 @@ async fn put_blob(
         .assemble_blocks(entry_id, std::slice::from_ref(&block_id))
         .await
     {
-        Ok(_size) => created(),
+        Ok(_size) => {
+            state.metrics.add_reservations(-1);
+            if let Ok(used) = storage.used_bytes().await {
+                state.metrics.set_storage_used(used);
+            }
+            created()
+        }
         Err(err) => storage_error(err),
     }
 }

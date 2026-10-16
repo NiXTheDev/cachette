@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::body::HttpBody;
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{Uri, request::Parts};
 use axum::middleware::{self, Next};
@@ -87,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v2/artifacts/{entryId}", get(v2_download::download));
     Router::new()
         .route("/health", get(health::health))
+        .route("/metrics", get(metrics))
         .merge(peer_routes)
         .merge(admin_routes)
         .merge(v1_routes)
@@ -95,7 +97,55 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone())
         .fallback(fallback_404)
         .method_not_allowed_fallback(fallback_405)
-        .layer(middleware::from_fn_with_state(state, auth::require_auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .layer(middleware::from_fn_with_state(state, record_metrics))
+}
+
+/// `GET /metrics` — Prometheus text exposition of the six hand-counted
+/// counters (plan task 35). Always on; values are read straight off atomics.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.metrics.render_prometheus(),
+    )
+}
+
+/// Count one request into `requests_total{route,code}` and the byte counters
+/// (sizes only — request/response BODIES are never logged or buffered here).
+///
+/// `bytes_in`/`bytes_out` prefer the `Content-Length` header, then fall back to
+/// the body's exact size hint (accurate for buffered bodies even when no header
+/// is present, e.g. proxied or in-process). A truly streaming/unknown-length
+/// body contributes 0 — still a sane, non-negative counter.
+async fn record_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let bytes_in = declared_len(request.headers())
+        .or_else(|| request.body().size_hint().exact())
+        .unwrap_or(0);
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let bytes_out = declared_len(&parts.headers)
+        .or_else(|| body.size_hint().exact())
+        .unwrap_or(0);
+    let code = parts.status.as_u16();
+    state.metrics.record_request(&path, code);
+    state.metrics.add_bytes_in(bytes_in);
+    state.metrics.add_bytes_out(bytes_out);
+    Response::from_parts(parts, body)
+}
+
+/// Parse a `Content-Length` header, if present and well-formed.
+fn declared_len(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// HMAC secret for v2 capability URLs (task 24 mints, tasks 25/26 validate).

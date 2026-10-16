@@ -238,6 +238,8 @@ pub async fn reserve(
             return ApiError::Internal.into_response();
         }
     };
+    // Refresh the storage gauge off the value we just read (task 35).
+    state.metrics.set_storage_used(used);
     // B3 admission estimate: at reserve time the artifact size is unknown
     // (`PATCH` carries no `Content-Length` contract), so admission is judged
     // against the `min_free` floor; the eviction service is not on the request
@@ -289,6 +291,7 @@ pub async fn reserve(
         tracing::error!(error = %err, "v1 reserve: staging reservation failed");
         return ApiError::Internal.into_response();
     }
+    state.metrics.add_reservations(1);
     Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
 
@@ -414,7 +417,13 @@ pub async fn commit(
         }
     }
     match storage.commit_chunks(&cache_id, request.size).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.metrics.add_reservations(-1);
+            if let Ok(used) = storage.used_bytes().await {
+                state.metrics.set_storage_used(used);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => commit_error(err),
     }
 }

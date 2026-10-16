@@ -67,6 +67,7 @@ const FIELDS: &[Field] = &[
     field(&["cluster"], "peer_timeout_seconds", Kind::U64),
     field(&["log"], "level", Kind::Str),
     field(&["log"], "format", Kind::Str),
+    field(&["log"], "file", Kind::Str),
 ];
 
 /// Overlay every `CACHETTE__*` pair onto the merged config document.

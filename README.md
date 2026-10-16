@@ -75,6 +75,14 @@ and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
    # {"version":"0.1.0","node_id":"<64-hex fingerprint>"}
    ```
 
+   `GET /metrics` on the same listener returns the Prometheus text-format
+   counters (`requests_total{route,code}`, `bytes_in`, `bytes_out`,
+   `evictions_total`, `reservations_active`, `storage_used_bytes`):
+
+   ```bash
+   curl -k https://127.0.0.1:8080/metrics
+   ```
+
    On Windows, `curl.exe` uses Schannel, which cannot complete a handshake
    against the built-in Ed25519 identity (`SEC_E_ILLEGAL_MESSAGE`, curl error
    35). Supply an RSA certificate through `server.tls_cert`/`server.tls_key`, or

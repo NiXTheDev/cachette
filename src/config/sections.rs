@@ -238,6 +238,7 @@ pub enum Tiebreak {
 pub struct LogConfig {
     pub level: LogLevel,
     pub format: LogFormat,
+    pub file: Option<PathBuf>,
 }
 
 impl Default for LogConfig {
@@ -245,6 +246,7 @@ impl Default for LogConfig {
         Self {
             level: LogLevel::Info,
             format: LogFormat::Text,
+            file: None,
         }
     }
 }
