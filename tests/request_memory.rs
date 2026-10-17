@@ -136,7 +136,7 @@ fn rss_bytes() -> Option<u64> {
 fn app_state(storage: Arc<FsStorage>) -> AppState {
     let mut state = AppState::new();
     state.storage = Some(storage);
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

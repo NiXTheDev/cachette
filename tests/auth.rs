@@ -85,7 +85,7 @@ fn state_with(root: &Path) -> AppState {
     let mut state = AppState::new();
     state.tokens =
         Arc::new(TokenStore::open(&root.join("cachette.sqlite3")).expect("token store opens"));
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Merge,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

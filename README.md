@@ -181,6 +181,18 @@ export CACHETTE__AUTH__SECRET="change-me-to-16-plus-chars"
 - A `CACHETTE__*` variable that maps to no known key is a hard error that names
   the offending variable; non-`CACHETTE` variables are ignored.
 
+### Live reload
+
+`cachette serve` re-reads the config file on `SIGHUP` (Unix) without dropping
+connections. Reloadable: `[auth]` (`mode`, `secret`, `tokens`,
+`hmac_max_age_seconds`), the per-request `[cache]`/`[storage.fs]` admission
+numbers (`max_size`, `min_free`, `reservation_ttl_seconds`, `key_case`,
+`signed_url_ttl_seconds`, `max_chunk_bytes`), and `[log] level`. Boot-only
+(listener, storage backend and data directory, cluster wiring, `[v2]` JWT
+secret) — restart to change. A malformed file is rejected and the previous
+config stays in effect. See
+[docs/configuration.md](docs/configuration.md#live-reload).
+
 ## CLI usage
 
 ```text

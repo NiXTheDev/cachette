@@ -53,16 +53,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
     // `[log] level` becomes the default tracing directive; an explicitly set
-    // RUST_LOG still wins (logging::init parses it with from_env_lossy).
-    if std::env::var_os("RUST_LOG").is_none()
-        && config.log.level != cachette::config::LogLevel::Info
-    {
-        // SAFETY: runs on the main thread before the tokio runtime (the
-        // process's first thread pool) is created, so nothing can observe the
-        // environment concurrently.
-        unsafe { std::env::set_var("RUST_LOG", config.log.level.as_str()) };
-    }
-    logging::init(config.log.format.into(), config.log.file.clone());
+    // RUST_LOG still wins (logging::init parses it with from_env_lossy). The
+    // level is passed directly (plan task 49) so a SIGHUP reload can swap it
+    // through the installed reload handle without touching the environment.
+    logging::init(
+        config.log.format.into(),
+        config.log.file.clone(),
+        config.log.level,
+    );
     tracing::debug!(config_path = ?cli.config, "command line parsed");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -122,6 +120,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             pins: state.peers.clone(),
             placement: runtime.placement().clone(),
             peer_table: state.peer_table.clone(),
+            metrics: state.metrics.clone(),
             min_free: config.storage.fs.min_free,
             max_size: config.cache.max_size,
             reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
@@ -141,21 +140,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     state.tokens = Arc::new(TokenStore::open(
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
-    state.auth = Arc::new(AuthPolicy::from_config(&config));
+    state.set_auth(AuthPolicy::from_config(&config));
     // Runner-visible base URL for capability URLs (`/v2/*`); the config
     // resolver always derives it from `listen` when `external_url` is unset.
     state.external_url = config.server.external_url.clone();
     // Cache limits (plan task 19): the reserve handler reports capacity and
     // stamps reservation expiry from these numbers, so thread `[cache]` /
-    // `[storage.fs]` onto the request path.
-    state.cache = CacheLimits {
-        max_size: config.cache.max_size,
-        min_free: config.storage.fs.min_free,
-        reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
-        key_case: config.cache.key_case,
-        signed_url_ttl_seconds: config.v1.signed_url_ttl_seconds,
-        max_chunk_bytes: config.server.max_chunk_bytes,
-    };
+    // `[storage.fs]` onto the request path. `from_config` builds the same
+    // snapshot the SIGHUP reload path (plan task 49) uses.
+    state.set_cache_limits(CacheLimits::from_config(&config));
     // Resolve the B3 `total` once at boot (plan task 31): the peer reserve
     // admission path must not do a blocking disk query per request.
     state.capacity_total = Capacity::from_disk(
@@ -181,12 +174,18 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // Startup sweep, before the listener binds: rowless blobs older than the
     // 1h grace and reservations whose TTL has passed (plan task 34).
     match reaper.sweep_once(&storage).await {
-        Ok(report) => tracing::info!(
-            reservations = report.reservations_reaped,
-            orphans = report.orphan_blobs_swept,
-            "startup sweep complete"
-        ),
-        Err(err) => tracing::warn!(error = %err, "startup sweep failed"),
+        Ok(report) => {
+            state.set_storage_ok(true);
+            tracing::info!(
+                reservations = report.reservations_reaped,
+                orphans = report.orphan_blobs_swept,
+                "startup sweep complete"
+            );
+        }
+        Err(err) => {
+            state.set_storage_ok(false);
+            tracing::warn!(error = %err, "startup sweep failed");
+        }
     }
 
     // Heartbeat + health (plan task 29 / M15): self-record with live B3
@@ -235,6 +234,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // startup sweep already ran.
     let sweep_storage = storage.clone();
     let sweep_metrics = state.metrics.clone();
+    let sweep_storage_ok = state.storage_ok.clone();
     let sweep_interval = reaper.interval();
     let sweep_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sweep_interval);
@@ -243,6 +243,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             ticker.tick().await;
             match reaper.sweep_once(&sweep_storage).await {
                 Ok(report) => {
+                    sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
                     if report.reservations_reaped > 0 {
                         sweep_metrics.add_reservations(-(report.reservations_reaped as i64));
                     }
@@ -261,7 +262,33 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                         );
                     }
                 }
-                Err(err) => tracing::warn!(error = %err, "periodic sweep failed"),
+                Err(err) => {
+                    sweep_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(error = %err, "periodic sweep failed");
+                }
+            }
+        }
+    });
+
+    // Live config reload (plan task 49): SIGHUP on POSIX (plus the documented
+    // test-only trigger) re-reads the config file and applies the reloadable
+    // subset — the auth policy, the cache limits, and the log level — in place.
+    // Connections are never dropped and boot-only knobs (listen addresses, the
+    // data directory, the storage backend, cluster wiring) are untouched. A
+    // parse error is logged and the previous config is kept.
+    let mut reload_signals = reload::listen();
+    let reload_state = state.clone();
+    let reload_task = tokio::spawn(async move {
+        while reload_signals.recv().await.is_some() {
+            match config::load(reload_state.config_path.clone()) {
+                Ok(new_config) => {
+                    reload_state.apply_reload(&new_config);
+                    logging::reload_level(new_config.log.level);
+                    tracing::info!("config reloaded (reloadable subset applied)");
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "config reload failed; keeping previous config");
+                }
             }
         }
     });
@@ -329,6 +356,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // then drop the storage handle. SQLite runs in WAL mode with
     // `synchronous=NORMAL`, so the committed final sweep is durable.
     sweep_task.abort();
+    reload_task.abort();
     if let Some(handle) = heartbeat_task {
         handle.abort();
     }
@@ -424,6 +452,93 @@ mod shutdown {
 
     #[cfg(not(unix))]
     async fn terminate(_term: &mut TermStream) {
+        std::future::pending::<()>().await
+    }
+
+    fn test_trigger_delay() -> Option<Duration> {
+        std::env::var(TEST_TRIGGER_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    }
+
+    /// One-shot test trigger: sleeps `delay` once, then never resolves again.
+    async fn test_trigger(pending: &mut Option<Duration>) {
+        match pending.take() {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Live config reload plumbing (plan task 49).
+///
+/// Production path: `SIGHUP` (POSIX only) signals the server to re-read its
+/// config file and apply the reloadable subset in place. The server never drops
+/// a connection and never restarts the listener.
+///
+/// Test-only trigger: when `CACHETTE_TEST_RELOAD_AFTER_MS` is set to a
+/// millisecond count, one reload fires after that delay — mirroring
+/// [`shutdown`]'s `CACHETTE_TEST_SHUTDOWN_AFTER_MS` for the same reason
+/// (delivering a real SIGHUP is impractical on Windows CI). The variable is
+/// read only here, is never part of the default config, and is never set by the
+/// server itself. The real signal handler stays wired in production.
+mod reload {
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    /// Test-only trigger (see module docs): milliseconds after startup.
+    const TEST_TRIGGER_ENV: &str = "CACHETTE_TEST_RELOAD_AFTER_MS";
+
+    /// Start listening for reload signals. Returns a channel that yields one
+    /// token per delivered signal (SIGHUP, or the one-shot test trigger).
+    pub fn listen() -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut hup = make_hup();
+            let mut test_pending = test_trigger_delay();
+            loop {
+                tokio::select! {
+                    _ = hangup(&mut hup) => {}
+                    _ = test_trigger(&mut test_pending) => {}
+                }
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    /// SIGHUP stream on POSIX; a never-resolving placeholder elsewhere.
+    #[cfg(unix)]
+    type HupStream = Option<tokio::signal::unix::Signal>;
+    #[cfg(not(unix))]
+    struct HupStream;
+
+    #[cfg(unix)]
+    fn make_hup() -> HupStream {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok()
+    }
+
+    #[cfg(not(unix))]
+    fn make_hup() -> HupStream {
+        HupStream
+    }
+
+    #[cfg(unix)]
+    async fn hangup(hup: &mut HupStream) {
+        match hup {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn hangup(_hup: &mut HupStream) {
         std::future::pending::<()>().await
     }
 

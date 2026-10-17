@@ -122,6 +122,9 @@ pub struct RelayConfig {
     pub placement: Arc<Placement>,
     /// Shared peer table: the candidate owner set.
     pub peer_table: Arc<PeerTable>,
+    /// Hand-counted metrics (plan task 49): peer-exchange latency is observed
+    /// here on every control/fan-out exchange.
+    pub metrics: Arc<crate::metrics::Metrics>,
     /// `[storage.fs] min_free` — part of A's placement capacity model.
     pub min_free: MinFree,
     /// `[cache] max_size`; 0 = unlimited.
@@ -282,6 +285,7 @@ pub struct ClusterRelay {
     client: Arc<RustlsClientConfig>,
     placement: Arc<Placement>,
     peer_table: Arc<PeerTable>,
+    metrics: Arc<crate::metrics::Metrics>,
     min_free: MinFree,
     max_size: u64,
     reservation_ttl_seconds: u64,
@@ -300,6 +304,7 @@ impl ClusterRelay {
             client,
             placement: config.placement,
             peer_table: config.peer_table,
+            metrics: config.metrics,
             min_free: config.min_free,
             max_size: config.max_size,
             reservation_ttl_seconds: config.reservation_ttl_seconds,
@@ -513,12 +518,14 @@ impl ClusterRelay {
         let mut set = JoinSet::new();
         for peer in peers {
             let client = self.client.clone();
+            let metrics = self.metrics.clone();
             let method = method.to_owned();
             let path = path.to_owned();
             let content_type = content_type.to_owned();
             let body = body.to_vec();
             set.spawn(async move {
                 let addr = peer.addr.clone();
+                let started = Instant::now();
                 let outcome = exchange_with(
                     client,
                     &addr,
@@ -529,6 +536,7 @@ impl ClusterRelay {
                     FANOUT_TIMEOUT,
                 )
                 .await;
+                metrics.observe_peer_latency(started.elapsed().as_secs_f64());
                 (peer, outcome)
             });
         }
@@ -835,7 +843,8 @@ impl ClusterRelay {
         body: &[u8],
         timeout: Duration,
     ) -> io::Result<PeerResponse> {
-        exchange_with(
+        let started = Instant::now();
+        let result = exchange_with(
             self.client.clone(),
             addr,
             method,
@@ -844,7 +853,13 @@ impl ClusterRelay {
             body,
             timeout,
         )
-        .await
+        .await;
+        // Observe round-trip time regardless of outcome (plan task 49): a
+        // timeout is a latency signal too, and the histogram's +Inf bucket
+        // absorbs the slowest attempts without float formatting.
+        self.metrics
+            .observe_peer_latency(started.elapsed().as_secs_f64());
+        result
     }
 }
 

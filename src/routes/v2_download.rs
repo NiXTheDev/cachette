@@ -48,15 +48,16 @@ pub async fn download(
     // The MAC binds the exact resource path, reconstructed from the route param
     // (so a traversal-style path can never spoof it).
     let path = format!("/v2/artifacts/{entry_id}");
+    let policy = state.auth();
     if let Err(err) = urls::validate(
         &query,
         &path,
-        super::signing_secret(&state),
+        super::signing_secret(&policy),
         auth::now_secs(),
     ) {
         return ApiError::from(err).into_response();
     }
-    if state.auth.cluster_enabled {
+    if policy.cluster_enabled {
         tracing::debug!(
             entry_id = %entry_id,
             "v2 download: cluster mode (peer forwarding wired in task 32)"

@@ -112,9 +112,22 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state, record_metrics))
 }
 
-/// `GET /metrics` — Prometheus text exposition of the six hand-counted
-/// counters (plan task 35). Always on; values are read straight off atomics.
+/// `GET /metrics` — Prometheus text exposition of the hand-counted counters and
+/// gauges (plan task 35, extended by task 49). Always on; values are read
+/// straight off atomics, except the gauge snapshots (drain state, peer counts)
+/// which are refreshed from the live `AppState` on each scrape.
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .metrics
+        .set_draining(state.draining.load(Ordering::Relaxed));
+    let peers = state.peer_table.snapshot();
+    let healthy = peers.iter().filter(|peer| peer.healthy).count() as u64;
+    let known = peers.len() as u64;
+    let direct = peers
+        .iter()
+        .filter(|peer| !peer.fingerprint.is_empty())
+        .count() as u64;
+    state.metrics.set_peers(healthy, known, direct);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -206,13 +219,11 @@ fn declared_len(headers: &axum::http::HeaderMap) -> Option<u64> {
 /// `--print-config` boots); production always serves with a real secret.
 pub(crate) const FALLBACK_SIGNING_SECRET: &str = "cachette-v2-route";
 
-/// Resolve the signing secret for a v2 capability URL.
-pub(crate) fn signing_secret(state: &AppState) -> &str {
-    state
-        .auth
-        .secret
-        .as_deref()
-        .unwrap_or(FALLBACK_SIGNING_SECRET)
+/// Resolve the signing secret for a v2 capability URL from a live auth policy
+/// snapshot (plan task 49: callers bind `let policy = state.auth();` so a
+/// reloaded secret is picked up per request).
+pub(crate) fn signing_secret(auth: &crate::auth::AuthPolicy) -> &str {
+    auth.secret.as_deref().unwrap_or(FALLBACK_SIGNING_SECRET)
 }
 
 /// Runner-visible base URL of a remote owner B (plan task 32 / M12): B's
@@ -457,9 +468,10 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
             })
         })
         .collect();
+    let cluster_enabled = state.auth().cluster_enabled;
     Json(serde_json::json!({
         "node_id": state.node_id,
-        "cluster_enabled": state.auth.cluster_enabled,
+        "cluster_enabled": cluster_enabled,
         "peers": peers,
     }))
     .into_response()
@@ -468,8 +480,9 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
 /// Admin gate for the token routes: `Authorization: Bearer <auth.secret>`, or
 /// loopback-only when `[cluster] enabled` is false (standalone node).
 fn admin_authorized(state: &AppState, request: &Request) -> bool {
+    let policy = state.auth();
     let secret_ok = match (
-        state.auth.secret.as_deref(),
+        policy.secret.as_deref(),
         auth::bearer_token(request.headers()),
     ) {
         (Some(secret), Some(token)) => auth::constant_time_eq(token.as_bytes(), secret.as_bytes()),
@@ -479,7 +492,7 @@ fn admin_authorized(state: &AppState, request: &Request) -> bool {
         return true;
     }
     match request.extensions().get::<ConnectInfo<PeerCert>>() {
-        Some(ConnectInfo(peer)) => !state.auth.cluster_enabled && peer.remote.ip().is_loopback(),
+        Some(ConnectInfo(peer)) => !policy.cluster_enabled && peer.remote.ip().is_loopback(),
         None => false,
     }
 }

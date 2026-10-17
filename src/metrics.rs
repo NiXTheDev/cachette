@@ -29,8 +29,52 @@ const CODES: &[u16] = &[
 const CODE_BUCKETS: usize = CODES.len() + 1;
 const ROUTE_COUNT: usize = ROUTES.len();
 
-/// The six hand-counted counters. Cheap: the request matrix is a fixed array
-/// of atomics; the scalar counters are plain atomics. Zero background work.
+/// Relay failure causes for `cachette_relay_failures_total{reason}` (plan task
+/// 49): a peer relay that could not be reached (surfaced as `502`) and an owner
+/// that refused on capacity (surfaced as `503`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelayFailure {
+    /// Owner unreachable / errored (HTTP `502`).
+    Unreachable,
+    /// Owner below its free-space floor (HTTP `503`).
+    Capacity,
+}
+
+impl RelayFailure {
+    /// Every reason, in render order.
+    const ALL: [RelayFailure; 2] = [RelayFailure::Unreachable, RelayFailure::Capacity];
+
+    const fn index(self) -> usize {
+        match self {
+            RelayFailure::Unreachable => 0,
+            RelayFailure::Capacity => 1,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            RelayFailure::Unreachable => "unreachable",
+            RelayFailure::Capacity => "capacity",
+        }
+    }
+}
+
+/// Upper bounds (seconds) of the `cachette_peer_latency_seconds` histogram
+/// (plan task 49) — aggregate over peer exchanges. Labels are fixed strings so
+/// rendering never float-formats.
+const PEER_LATENCY_BOUNDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+const PEER_LATENCY_LABELS: &[&str] = &[
+    "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10",
+];
+
+/// Upper bounds (hops) of the `cachette_relay_hops` histogram (plan task 49).
+const RELAY_HOP_LABELS: &[&str] = &["0", "1", "2", "3", "4"];
+
+/// The hand-counted counters. Cheap: the request matrix is a fixed array of
+/// atomics, the histograms are fixed arrays of atomics, and the scalars are
+/// plain atomics. Zero background work, no per-request heap allocation.
 #[derive(Debug)]
 pub struct Metrics {
     /// `requests_total{route,code}` — `[route_index][code_index]`.
@@ -45,6 +89,28 @@ pub struct Metrics {
     reservations_active: AtomicU64,
     /// Bytes currently occupied in storage.
     storage_used_bytes: AtomicU64,
+    /// `1` while the node is draining, else `0` (plan task 49).
+    draining: AtomicU64,
+    /// Healthy peers in the cluster table (plan task 49).
+    peers_healthy: AtomicU64,
+    /// Known peers (healthy or not) in the cluster table.
+    peers_known: AtomicU64,
+    /// Peers discovered directly (identity known: mDNS/hello), not bare seeds.
+    peers_direct: AtomicU64,
+    /// `relay_failures_total{reason}` — indexed by [`RelayFailure::index`].
+    relay_failures: [AtomicU64; 2],
+    /// `peer_latency_seconds` histogram buckets + over+inf slot.
+    peer_latency_buckets: [AtomicU64; PEER_LATENCY_BOUNDS.len() + 1],
+    /// Sum of observed peer latencies, in microseconds (integer accumulation).
+    peer_latency_micros: AtomicU64,
+    /// Number of observed peer exchanges.
+    peer_latency_count: AtomicU64,
+    /// `relay_hops` histogram buckets + over+inf slot.
+    relay_hop_buckets: [AtomicU64; RELAY_HOP_LABELS.len() + 1],
+    /// Sum of observed hop counts.
+    relay_hops_sum: AtomicU64,
+    /// Number of observed relay placements.
+    relay_hops_count: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -56,8 +122,9 @@ impl Default for Metrics {
 impl Metrics {
     #[must_use]
     pub fn new() -> Self {
-        // Zero-init the atomic matrix without heap allocation at boot.
+        // Zero-init the atomic matrices without heap allocation at boot.
         let requests = std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)));
+        let zero = |_| AtomicU64::new(0);
         Self {
             requests,
             bytes_in: AtomicU64::new(0),
@@ -65,6 +132,17 @@ impl Metrics {
             evictions_total: AtomicU64::new(0),
             reservations_active: AtomicU64::new(0),
             storage_used_bytes: AtomicU64::new(0),
+            draining: AtomicU64::new(0),
+            peers_healthy: AtomicU64::new(0),
+            peers_known: AtomicU64::new(0),
+            peers_direct: AtomicU64::new(0),
+            relay_failures: std::array::from_fn(zero),
+            peer_latency_buckets: std::array::from_fn(zero),
+            peer_latency_micros: AtomicU64::new(0),
+            peer_latency_count: AtomicU64::new(0),
+            relay_hop_buckets: std::array::from_fn(zero),
+            relay_hops_sum: AtomicU64::new(0),
+            relay_hops_count: AtomicU64::new(0),
         }
     }
 
@@ -147,6 +225,50 @@ impl Metrics {
         self.storage_used_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Set the drain-state gauge (plan task 49): `1` while draining, else `0`.
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(u64::from(draining), Ordering::Relaxed);
+    }
+
+    /// Set the cluster peer gauges (plan task 49): healthy, known (total), and
+    /// directly-discovered (identity known) peer counts.
+    pub fn set_peers(&self, healthy: u64, known: u64, direct: u64) {
+        self.peers_healthy.store(healthy, Ordering::Relaxed);
+        self.peers_known.store(known, Ordering::Relaxed);
+        self.peers_direct.store(direct, Ordering::Relaxed);
+    }
+
+    /// Count one relay failure by cause (`502` unreachable / `503` capacity).
+    pub fn inc_relay_failure(&self, reason: RelayFailure) {
+        self.relay_failures[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe one peer exchange's round-trip time (seconds) into
+    /// `peer_latency_seconds`.
+    pub fn observe_peer_latency(&self, seconds: f64) {
+        let micros = (seconds.max(0.0) * 1_000_000.0) as u64;
+        self.peer_latency_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.peer_latency_count.fetch_add(1, Ordering::Relaxed);
+        let slot = PEER_LATENCY_BOUNDS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(PEER_LATENCY_BOUNDS.len());
+        self.peer_latency_buckets[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe the number of relay hops a placement took: `0` = served
+    /// locally, `1` = forwarded to one owner.
+    pub fn observe_relay_hops(&self, hops: u64) {
+        self.relay_hops_sum.fetch_add(hops, Ordering::Relaxed);
+        self.relay_hops_count.fetch_add(1, Ordering::Relaxed);
+        let slot = RELAY_HOP_LABELS
+            .iter()
+            .position(|bound| hops <= bound.parse::<u64>().expect("numeric hop bound"))
+            .unwrap_or(RELAY_HOP_LABELS.len());
+        self.relay_hop_buckets[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render the Prometheus text exposition format for `GET /metrics`.
     #[must_use]
     pub fn render_prometheus(&self) -> String {
@@ -198,6 +320,93 @@ impl Metrics {
         out.push_str("# HELP cachette_storage_used_bytes Bytes currently used in storage.\n");
         out.push_str("# TYPE cachette_storage_used_bytes gauge\n");
         out.push_str(&format!("cachette_storage_used_bytes {storage}\n"));
+
+        // Drain state (plan task 49).
+        let draining = self.draining.load(Ordering::Relaxed);
+        out.push_str("# HELP cachette_draining 1 while the node is draining, else 0.\n");
+        out.push_str("# TYPE cachette_draining gauge\n");
+        out.push_str(&format!("cachette_draining {draining}\n"));
+
+        // Cluster peer gauges (plan task 49).
+        out.push_str("# HELP cachette_peers_healthy Healthy peers in the cluster table.\n");
+        out.push_str("# TYPE cachette_peers_healthy gauge\n");
+        out.push_str(&format!(
+            "cachette_peers_healthy {}\n",
+            self.peers_healthy.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cachette_peers_known Known peers (healthy or not).\n");
+        out.push_str("# TYPE cachette_peers_known gauge\n");
+        out.push_str(&format!(
+            "cachette_peers_known {}\n",
+            self.peers_known.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cachette_peers_direct Peers discovered directly (identity known).\n");
+        out.push_str("# TYPE cachette_peers_direct gauge\n");
+        out.push_str(&format!(
+            "cachette_peers_direct {}\n",
+            self.peers_direct.load(Ordering::Relaxed)
+        ));
+
+        // Relay failures by cause (plan task 49).
+        out.push_str("# HELP cachette_relay_failures_total Peer relay failures by cause.\n");
+        out.push_str("# TYPE cachette_relay_failures_total counter\n");
+        for reason in RelayFailure::ALL {
+            let v = self.relay_failures[reason.index()].load(Ordering::Relaxed);
+            if v > 0 {
+                out.push_str(&format!(
+                    "cachette_relay_failures_total{{reason=\"{}\"}} {v}\n",
+                    reason.as_str()
+                ));
+            }
+        }
+
+        // Peer-latency histogram (plan task 49); only emitted once observed.
+        let count = self.peer_latency_count.load(Ordering::Relaxed);
+        if count > 0 {
+            out.push_str(
+                "# HELP cachette_peer_latency_seconds Round-trip time of peer exchanges.\n",
+            );
+            out.push_str("# TYPE cachette_peer_latency_seconds histogram\n");
+            let mut cumulative = 0u64;
+            for (index, label) in PEER_LATENCY_LABELS.iter().enumerate() {
+                cumulative += self.peer_latency_buckets[index].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "cachette_peer_latency_seconds_bucket{{le=\"{label}\"}} {cumulative}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "cachette_peer_latency_seconds_bucket{{le=\"+Inf\"}} {count}\n"
+            ));
+            let micros = self.peer_latency_micros.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "cachette_peer_latency_seconds_sum {}.{:06}\n",
+                micros / 1_000_000,
+                micros % 1_000_000
+            ));
+            out.push_str(&format!("cachette_peer_latency_seconds_count {count}\n"));
+        }
+
+        // Relay-hops histogram (plan task 49); only emitted once observed.
+        let hop_count = self.relay_hops_count.load(Ordering::Relaxed);
+        if hop_count > 0 {
+            out.push_str("# HELP cachette_relay_hops Peer hops taken to place a relayed upload.\n");
+            out.push_str("# TYPE cachette_relay_hops histogram\n");
+            let mut cumulative = 0u64;
+            for (index, label) in RELAY_HOP_LABELS.iter().enumerate() {
+                cumulative += self.relay_hop_buckets[index].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "cachette_relay_hops_bucket{{le=\"{label}\"}} {cumulative}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "cachette_relay_hops_bucket{{le=\"+Inf\"}} {hop_count}\n"
+            ));
+            out.push_str(&format!(
+                "cachette_relay_hops_sum {}\n",
+                self.relay_hops_sum.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!("cachette_relay_hops_count {hop_count}\n"));
+        }
 
         out
     }
@@ -262,5 +471,77 @@ mod tests {
         m.add_reservations(-1);
         let text = m.render_prometheus();
         assert!(text.contains("cachette_reservations_active 1"));
+    }
+
+    #[test]
+    fn draining_gauge_reflects_state() {
+        let m = Metrics::new();
+        assert!(m.render_prometheus().contains("cachette_draining 0"));
+        m.set_draining(true);
+        assert!(m.render_prometheus().contains("cachette_draining 1"));
+        m.set_draining(false);
+        assert!(m.render_prometheus().contains("cachette_draining 0"));
+    }
+
+    #[test]
+    fn peer_gauges_reflect_counts() {
+        let m = Metrics::new();
+        m.set_peers(2, 5, 3);
+        let text = m.render_prometheus();
+        assert!(text.contains("cachette_peers_healthy 2"));
+        assert!(text.contains("cachette_peers_known 5"));
+        assert!(text.contains("cachette_peers_direct 3"));
+    }
+
+    #[test]
+    fn relay_failures_counted_by_reason() {
+        let m = Metrics::new();
+        // Reasons never observed are omitted (bounded cardinality).
+        assert!(
+            !m.render_prometheus()
+                .contains("cachette_relay_failures_total{")
+        );
+        m.inc_relay_failure(RelayFailure::Unreachable);
+        m.inc_relay_failure(RelayFailure::Unreachable);
+        m.inc_relay_failure(RelayFailure::Capacity);
+        let text = m.render_prometheus();
+        assert!(text.contains(r#"cachette_relay_failures_total{reason="unreachable"} 2"#));
+        assert!(text.contains(r#"cachette_relay_failures_total{reason="capacity"} 1"#));
+    }
+
+    #[test]
+    fn peer_latency_histogram_buckets_and_sum() {
+        let m = Metrics::new();
+        // Not emitted until a sample lands.
+        assert!(
+            !m.render_prometheus()
+                .contains("cachette_peer_latency_seconds")
+        );
+        m.observe_peer_latency(0.003); // <= 0.005
+        m.observe_peer_latency(0.4); // <= 0.5
+        m.observe_peer_latency(30.0); // +Inf only
+        let text = m.render_prometheus();
+        assert!(text.contains(r#"cachette_peer_latency_seconds_bucket{le="0.005"} 1"#));
+        assert!(text.contains(r#"cachette_peer_latency_seconds_bucket{le="0.5"} 2"#));
+        assert!(text.contains(r#"cachette_peer_latency_seconds_bucket{le="+Inf"} 3"#));
+        assert!(text.contains("cachette_peer_latency_seconds_count 3"));
+        // 0.003 + 0.4 + 30.0 = 30.403 exactly.
+        assert!(text.contains("cachette_peer_latency_seconds_sum 30.403000"));
+    }
+
+    #[test]
+    fn relay_hops_histogram_buckets_and_sum() {
+        let m = Metrics::new();
+        assert!(!m.render_prometheus().contains("cachette_relay_hops"));
+        m.observe_relay_hops(0);
+        m.observe_relay_hops(1);
+        m.observe_relay_hops(9); // +Inf only
+        let text = m.render_prometheus();
+        assert!(text.contains(r#"cachette_relay_hops_bucket{le="0"} 1"#));
+        assert!(text.contains(r#"cachette_relay_hops_bucket{le="1"} 2"#));
+        assert!(text.contains(r#"cachette_relay_hops_bucket{le="4"} 2"#));
+        assert!(text.contains(r#"cachette_relay_hops_bucket{le="+Inf"} 3"#));
+        assert!(text.contains("cachette_relay_hops_sum 10"));
+        assert!(text.contains("cachette_relay_hops_count 3"));
     }
 }

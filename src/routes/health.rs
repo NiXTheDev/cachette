@@ -1,9 +1,14 @@
 //! `GET /health` — liveness + node identity probe (plan task 3).
 //!
-//! `GET /healthz` is the same liveness probe under the conventional name, and
-//! `GET /readyz` is the readiness probe (plan task 47): it reports
-//! `503 draining` while the node is shutting down and `503 starting` before
-//! storage is attached, so a load balancer / peer stops routing NEW work here.
+//! `GET /healthz` is the same liveness probe under the conventional name (it is
+//! dependency-free and always `200` while the process answers, so a supervisor
+//! restarts a truly dead node rather than a busy one). `GET /readyz` is the
+//! readiness probe (plan tasks 47/49): it reports `503 draining` while the node
+//! is shutting down, `503 starting` before storage is attached, and
+//! `503 unavailable` when the storage backend has reported a fault, and
+//! `503 no_peers` when cluster mode is enabled but no healthy peer (other than
+//! this node) is currently visible — so a load balancer / peer stops routing
+//! NEW work here.
 
 use std::sync::atomic::Ordering;
 
@@ -46,7 +51,8 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthBody> {
     })
 }
 
-/// Readiness body: `{"status":"ready" | "draining" | "starting"}`.
+/// Readiness body: `{"status":"ready" | "draining" | "starting" |
+/// "unavailable" | "no_peers"}`.
 ///
 /// Hand-serialized, like [`HealthBody`], so the field order is guaranteed.
 pub struct ReadyBody {
@@ -66,18 +72,39 @@ impl Serialize for ReadyBody {
 
 /// `GET /readyz` → 200 `ready` when serving, else 503.
 ///
-/// Draining (plan task 47) reports `draining`; a node without storage yet
-/// reports `starting`. The readiness flag is advertised to peers via heartbeat
-/// and read here, so a load balancer and the cluster agree on eligibility.
+/// Order (plan task 49): draining wins (a shutting-down node reports `draining`
+/// even mid-storage-fault), then `starting` (no storage attached yet), then a
+/// reported storage fault as `unavailable`, then `no_peers` (cluster mode
+/// enabled but no healthy peer other than this node is visible). Otherwise
+/// `ready`. The readiness flag is advertised to peers via heartbeat and read
+/// here, so a load balancer and the cluster agree on eligibility.
 pub async fn readyz(State(state): State<AppState>) -> Response {
     let (code, status) = if state.draining.load(Ordering::Relaxed) {
         (StatusCode::SERVICE_UNAVAILABLE, "draining")
     } else if state.storage.is_none() {
         (StatusCode::SERVICE_UNAVAILABLE, "starting")
+    } else if !state.storage_ok() {
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    } else if !cluster_ready(&state) {
+        (StatusCode::SERVICE_UNAVAILABLE, "no_peers")
     } else {
         (StatusCode::OK, "ready")
     };
     (code, Json(ReadyBody { status })).into_response()
+}
+
+/// Readiness gate for cluster mode (plan task 49): a node advertising cluster
+/// support is only ready once it can see at least one healthy peer other than
+/// itself. Single-node mode (cluster disabled) has no peer requirement.
+fn cluster_ready(state: &AppState) -> bool {
+    if !state.auth().cluster_enabled {
+        return true;
+    }
+    state
+        .peer_table
+        .healthy_sorted()
+        .iter()
+        .any(|peer| peer.node_id != state.node_id && peer.fingerprint != state.node_id)
 }
 
 #[cfg(test)]

@@ -48,6 +48,7 @@ use crate::auth::{self, jwt, urls};
 use crate::cluster::relay::{self, V2Finalize, V2Reserve};
 use crate::config::AuthMode;
 use crate::error::ApiError;
+use crate::metrics::RelayFailure;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
 use crate::storage::{Entry, EntryStat, StorageBackend, Version, lookup, normalize_key};
@@ -224,7 +225,8 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
-    let key = normalize_key(&request.key, state.cache.key_case);
+    let limits = state.cache_limits();
+    let key = normalize_key(&request.key, limits.key_case);
     // Cluster placement (plan task 32): when a relay is configured the owner is
     // chosen by placement over the healthy peers. A self-owner falls through to
     // the local path below; a remote owner B gets a v2 reservation forwarded to
@@ -247,6 +249,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
                     .await
                 {
                     V2Reserve::Accepted { external_url } => {
+                        state.metrics.observe_relay_hops(1);
                         let base = super::owner_base_url(external_url.as_deref(), &owner.addr);
                         tracing::debug!(
                             owner = %owner.node_id, addr = %owner.addr, cache_id = %cache_id,
@@ -255,19 +258,27 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
                         mint_create_response(state, &base, &cache_id)
                     }
                     V2Reserve::Duplicate => duplicate_entry_response(),
-                    V2Reserve::NoCapacity => Json(json!({
-                        "ok": false,
-                        "message": "the storage owner is below its free-space floor",
-                    }))
-                    .into_response(),
-                    V2Reserve::Unreachable => Json(json!({
-                        "ok": false,
-                        "message": "the storage owner is unreachable",
-                    }))
-                    .into_response(),
+                    V2Reserve::NoCapacity => {
+                        state.metrics.inc_relay_failure(RelayFailure::Capacity);
+                        Json(json!({
+                            "ok": false,
+                            "message": "the storage owner is below its free-space floor",
+                        }))
+                        .into_response()
+                    }
+                    V2Reserve::Unreachable => {
+                        state.metrics.inc_relay_failure(RelayFailure::Unreachable);
+                        Json(json!({
+                            "ok": false,
+                            "message": "the storage owner is unreachable",
+                        }))
+                        .into_response()
+                    }
                 };
             }
-            Some(_) => {}
+            Some(_) => {
+                state.metrics.observe_relay_hops(0);
+            }
         }
     }
     // v2 duplicate rule (plan task 24 / handoff): a COMPLETE entry OR a
@@ -299,8 +310,8 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         }
     };
     state.metrics.set_storage_used(used);
-    if state.cache.max_size > 0 {
-        let capacity = Capacity::resolve(state.cache.min_free, state.cache.max_size, 0, used);
+    if limits.max_size > 0 {
+        let capacity = Capacity::resolve(limits.min_free, limits.max_size, 0, used);
         if !capacity.admits(None) {
             tracing::debug!(
                 free = capacity.free(),
@@ -310,7 +321,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         }
     }
     let cache_id = generate_cache_id(&key, &request.version);
-    let expires_at = now_unix.saturating_add(state.cache.reservation_ttl_seconds);
+    let expires_at = now_unix.saturating_add(limits.reservation_ttl_seconds);
     if let Err(err) = storage
         .reserve(&cache_id, &key, &request.version, expires_at)
         .await
@@ -325,7 +336,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
     if let Some(scope) = scope {
         tracing::debug!(cache_id = %cache_id, scope = %scope, "v2 create: scope observed");
     }
-    if state.auth.cluster_enabled {
+    if state.auth().cluster_enabled {
         tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (self-owned entry)");
     }
     let base = state.external_url.as_deref().unwrap_or_default();
@@ -338,9 +349,10 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
 /// URLs A minted, and the paths match the `/v2/upload` + `/v2/artifacts`
 /// handlers.
 fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Response {
-    let secret = super::signing_secret(state);
+    let policy = state.auth();
+    let secret = super::signing_secret(&policy);
     let now = auth::now_secs();
-    let ttl = state.cache.signed_url_ttl_seconds;
+    let ttl = state.cache_limits().signed_url_ttl_seconds;
     let upload_path = format!("{UPLOAD_PATH_PREFIX}{cache_id}");
     let download_path = format!("{ARTIFACT_PATH_PREFIX}{cache_id}");
     let signed_upload = format!(
@@ -389,7 +401,7 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
-    let key = normalize_key(&request.key, state.cache.key_case);
+    let key = normalize_key(&request.key, state.cache_limits().key_case);
     let stat = match stat_key_or_id(storage, &key, request.cache_id.as_deref()).await {
         Ok(stat) => stat,
         Err(err) => {
@@ -461,7 +473,7 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
-    let key = normalize_key(&request.key, state.cache.key_case);
+    let key = normalize_key(&request.key, state.cache_limits().key_case);
     if let Some(relay) = state.relay.as_deref() {
         relay.v2_supersede(&key).await;
         return Json(json!({"ok": true})).into_response();
@@ -500,13 +512,15 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
-    let key = normalize_key(&request.key, state.cache.key_case);
+    let limits = state.cache_limits();
+    let policy = state.auth();
+    let key = normalize_key(&request.key, limits.key_case);
     let mut lookup_keys = vec![key];
     if let Some(restore_keys) = &request.restore_keys {
         lookup_keys.extend(
             restore_keys
                 .iter()
-                .map(|restore| normalize_key(restore, state.cache.key_case)),
+                .map(|restore| normalize_key(restore, limits.key_case)),
         );
     }
     let finalized = match storage.list().await {
@@ -534,7 +548,7 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
         &candidates,
         &lookup_keys,
         &Version::from(request.version.as_str()),
-        state.cache.key_case,
+        limits.key_case,
     ) {
         {
             let matched_key = entry.key.clone();
@@ -546,8 +560,8 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
                 urls::mint(
                     &artifact_path,
                     &matched_key,
-                    super::signing_secret(state),
-                    state.cache.signed_url_ttl_seconds,
+                    super::signing_secret(&policy),
+                    limits.signed_url_ttl_seconds,
                     auth::now_secs(),
                 )
                 .query()
@@ -564,7 +578,7 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
     // proxies the download body.
     if let Some(relay) = state.relay.as_deref() {
         let hits = relay.find(&lookup_keys, &request.version).await;
-        if let Some(hit) = relay::best_hit(&hits, &lookup_keys, state.cache.key_case) {
+        if let Some(hit) = relay::best_hit(&hits, &lookup_keys, limits.key_case) {
             let matched_key = hit.key.clone();
             let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
             let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
@@ -574,8 +588,8 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
                 urls::mint(
                     &artifact_path,
                     &matched_key,
-                    super::signing_secret(state),
-                    state.cache.signed_url_ttl_seconds,
+                    super::signing_secret(&policy),
+                    limits.signed_url_ttl_seconds,
                     auth::now_secs(),
                 )
                 .query()
@@ -611,6 +625,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
     let Some(storage) = state.storage.as_deref() else {
         return Json(json!({"cache_entries": []})).into_response();
     };
+    let limits = state.cache_limits();
     let finalized = match storage.list().await {
         Ok(entries) => entries,
         Err(err) => {
@@ -620,7 +635,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
     };
     let mut cache_entries: Vec<serde_json::Value> = Vec::new();
     for key_version in &request.key_versions {
-        let key = normalize_key(&key_version.key, state.cache.key_case);
+        let key = normalize_key(&key_version.key, limits.key_case);
         let version = key_version.version.clone();
         let candidates: Vec<Entry> = finalized
             .iter()
@@ -638,7 +653,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             &candidates,
             std::slice::from_ref(&key),
             &Version::from(version.as_str()),
-            state.cache.key_case,
+            limits.key_case,
         ) {
             cache_entries.push(json!({
                 "key": hit.key.clone(),
@@ -650,9 +665,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
         }
         if let Some(relay) = state.relay.as_deref() {
             let hits = relay.find(std::slice::from_ref(&key), &version).await;
-            if let Some(hit) =
-                relay::best_hit(&hits, std::slice::from_ref(&key), state.cache.key_case)
-            {
+            if let Some(hit) = relay::best_hit(&hits, std::slice::from_ref(&key), limits.key_case) {
                 cache_entries.push(json!({
                     "key": hit.key.clone(),
                     "version": version,
@@ -710,15 +723,15 @@ async fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(token) = auth::bearer_token(headers) else {
         return false;
     };
-    let is_static = state
-        .auth
+    let policy = state.auth();
+    let is_static = policy
         .static_tokens
         .iter()
         .any(|candidate| auth::constant_time_eq(candidate.as_bytes(), token.as_bytes()));
     if is_static || state.tokens.is_valid(token).await.unwrap_or(false) {
         return true;
     }
-    match state.auth.mode {
+    match policy.mode {
         AuthMode::Hmac => false,
         AuthMode::Bearer | AuthMode::Merge => jwt_is_valid(state, token),
     }
@@ -726,7 +739,7 @@ async fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
 
 /// Validate a self-minted JWT against the configured signing secret.
 fn jwt_is_valid(state: &AppState, token: &str) -> bool {
-    match state.auth.secret.as_deref() {
+    match state.auth().secret.as_deref() {
         Some(secret) => jwt::validate(token, secret, auth::now_secs()).is_ok(),
         None => false,
     }

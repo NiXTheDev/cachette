@@ -1,15 +1,27 @@
-//! Tracing subscriber installation (plan task 4/35).
+//! Tracing subscriber installation (plan task 4/35) and live level reload
+//! (plan task 49).
 //!
-//! One `fmt` subscriber, filtered by `RUST_LOG` (default `info`), installed
-//! exactly once for the whole process. `RUST_LOG` parsing is lossy: an unset
-//! or malformed variable falls back to `info` instead of aborting startup.
+//! One `fmt` subscriber, filtered by `RUST_LOG` (default: `[log] level`),
+//! installed exactly once for the whole process. `RUST_LOG` parsing is lossy:
+//! an unset or malformed variable falls back to the configured level instead of
+//! aborting startup.
+//!
+//! The filter sits behind a [`tracing_subscriber::reload`] layer, so a SIGHUP
+//! config reload ([`reload_level`]) can swap the level in place without
+//! reinstalling the subscriber or dropping any connections.
 
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
+use tracing_subscriber::util::SubscriberInitExt;
+
+use crate::config::LogLevel;
 
 /// Log output format.
 ///
@@ -27,49 +39,85 @@ pub enum LogFormat {
 /// Guards the one-time subscriber installation; later calls are no-ops.
 static INIT: Once = Once::new();
 
-/// Install the `fmt` subscriber filtered by `RUST_LOG` (default `info`).
+/// The reload handle for the installed `EnvFilter` (plan task 49). Set once by
+/// [`init`]; [`reload_level`] swaps the filter through it.
+static FILTER: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+/// Build the `EnvFilter`: `[log] level` as the default directive, with an
+/// explicitly set `RUST_LOG` winning (lossy parse — malformed values fall back).
+fn build_filter(level: LogLevel) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(level_filter(level).into())
+        .from_env_lossy()
+}
+
+/// Map a config [`LogLevel`] to a tracing [`LevelFilter`].
+const fn level_filter(level: LogLevel) -> LevelFilter {
+    match level {
+        LogLevel::Trace => LevelFilter::TRACE,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Error => LevelFilter::ERROR,
+    }
+}
+
+/// Install the `fmt` subscriber filtered by `RUST_LOG` (default `level`).
 ///
 /// Idempotent: only the first call installs a subscriber — subsequent calls
 /// (tests, re-entry) are silent no-ops and never panic, and a failure to
 /// install (e.g. a subscriber already set by a test harness) is reported on
 /// stderr rather than aborting the process.
-pub fn init(format: LogFormat, file: Option<PathBuf>) {
+pub fn init(format: LogFormat, file: Option<PathBuf>, level: LogLevel) {
     INIT.call_once(|| {
-        let filter = EnvFilter::builder()
-            .with_default_directive(LevelFilter::INFO.into())
-            .from_env_lossy();
-        if let Some(path) = file {
-            match open_log_file(&path) {
-                Ok(f) => {
-                    let installed = match format {
-                        LogFormat::Text => fmt().with_writer(f).with_env_filter(filter).try_init(),
-                        LogFormat::Json => fmt()
-                            .with_writer(f)
-                            .json()
-                            .with_env_filter(filter)
-                            .try_init(),
-                    };
-                    if let Err(err) = installed {
-                        eprintln!("cachette: tracing subscriber not installed: {err}");
-                    }
-                    return;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "cachette: failed to open log file {}: {err}",
-                        path.display()
-                    );
-                }
+        // Resolve the writer first so the reload handle is set exactly once.
+        let file_writer = file.and_then(|path| match open_log_file(&path) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                eprintln!(
+                    "cachette: failed to open log file {}: {err}",
+                    path.display()
+                );
+                None
             }
-        }
-        let installed = match format {
-            LogFormat::Text => fmt().with_env_filter(filter).try_init(),
-            LogFormat::Json => fmt().json().with_env_filter(filter).try_init(),
-        };
-        if let Err(err) = installed {
-            eprintln!("cachette: tracing subscriber not installed: {err}");
+        });
+        let (filter_layer, handle) = reload::Layer::new(build_filter(level));
+        let _ = FILTER.set(handle);
+        match file_writer {
+            Some(f) => install(filter_layer, format, f),
+            None => install(filter_layer, format, std::io::stdout),
         }
     });
+}
+
+/// Layer the reloadable filter and the `fmt` writer together and install.
+fn install<W>(filter_layer: reload::Layer<EnvFilter, Registry>, format: LogFormat, writer: W)
+where
+    W: for<'writer> fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let base = tracing_subscriber::registry().with(filter_layer);
+    let installed = match format {
+        LogFormat::Text => base.with(fmt::layer().with_writer(writer)).try_init(),
+        LogFormat::Json => base
+            .with(fmt::layer().with_writer(writer).json())
+            .try_init(),
+    };
+    if let Err(err) = installed {
+        eprintln!("cachette: tracing subscriber not installed: {err}");
+    }
+}
+
+/// Swap the live log level after a config reload (plan task 49). A no-op when
+/// [`init`] has not installed a subscriber (tests) or when a `RUST_LOG` value
+/// was set explicitly at boot — the rebuilt filter still honours `RUST_LOG`
+/// first, so an operator override is preserved.
+pub fn reload_level(level: LogLevel) {
+    let Some(handle) = FILTER.get() else {
+        return;
+    };
+    if let Err(err) = handle.reload(build_filter(level)) {
+        eprintln!("cachette: log level reload failed: {err}");
+    }
 }
 
 /// Open (creating parent directories and appending) the user-configured
@@ -89,15 +137,25 @@ pub(crate) fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::
 
 #[cfg(test)]
 mod tests {
-    use super::{LogFormat, init};
+    use super::{LogFormat, init, reload_level};
+    use crate::config::LogLevel;
 
     /// Plan task 4 test guard: a second (and third) `init` call must be a
     /// silent no-op — no double-install panic, no process abort.
     #[test]
     fn init_is_idempotent_across_repeated_calls() {
-        init(LogFormat::Text, None);
-        init(LogFormat::Text, None);
-        init(LogFormat::Json, None);
+        init(LogFormat::Text, None, LogLevel::Info);
+        init(LogFormat::Text, None, LogLevel::Info);
+        init(LogFormat::Json, None, LogLevel::Debug);
+    }
+
+    /// Plan task 49: a level reload through the installed handle must not panic
+    /// (the filter behind the `reload` layer is swapped in place).
+    #[test]
+    fn reload_level_swaps_the_live_filter() {
+        init(LogFormat::Text, None, LogLevel::Info);
+        reload_level(LogLevel::Debug);
+        reload_level(LogLevel::Warn);
     }
 
     /// Plan task 35: `log.file` creates missing parent directories and appends

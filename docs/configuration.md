@@ -153,6 +153,36 @@ and prints the result as JSON with every secret masked as `***`
 ./cachette --config /etc/cachette/cachette.toml --print-config
 ```
 
+## Live reload
+
+`cachette serve` re-reads its config file on `SIGHUP` (Unix) without dropping
+connections or restarting the process. The reloaded values are applied in place
+on the next request; a load balancer and the cluster pick them up immediately.
+
+Reloadable at runtime:
+
+- `[auth]` — `mode`, `secret`, `tokens`, `hmac_max_age_seconds`. Rotate a leaked
+  admin secret by rewriting the file and sending `SIGHUP`; tokens minted (or
+  HMAC signatures made) against the old secret are rejected from the next
+  request onwards.
+- `[cache]` / `[storage.fs]` admission numbers read per request — `max_size`,
+  `min_free`, `reservation_ttl_seconds`, `key_case`, `signed_url_ttl_seconds`,
+  and `[server]` `max_chunk_bytes`.
+- `[log] level` — the active tracing filter is swapped in place.
+
+Boot-only (a reload logs them as ignored; restart to change):
+
+- `[server]` `listen`, `external_url`, `tls_*`, `drain_grace_seconds` — the
+  listener and identity are already bound.
+- `[storage]` `backend` and `[storage.fs]` `path` — the backend is already open.
+- `[cluster]` — `enabled`, `mdns`, `seeds`, `seed_fingerprints`, `cert_path`,
+  timeouts and thresholds; the peer table, TLS pins, and mDNS task are live.
+- `[v2]` `jwt_secret` / `jwt_ttl_seconds` and `[v1]` / `[v2]` protocol shape —
+  these are wired into the router at boot.
+
+A malformed or invalid file is rejected and the previously loaded configuration
+stays in effect (fail-closed); the failure is logged at `warn`.
+
 ## A fuller example
 
 ```toml

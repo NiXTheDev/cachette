@@ -54,6 +54,7 @@ use crate::auth::{self, urls};
 use crate::cluster::relay::{self, RelayCommit, RelayReserve, RelayUpload};
 use crate::config::{AuthMode, KeyCase};
 use crate::error::ApiError;
+use crate::metrics::RelayFailure;
 use crate::state::AppState;
 use crate::storage::eviction::Capacity;
 use crate::storage::{
@@ -128,7 +129,7 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         return StatusCode::NO_CONTENT.into_response();
     }
     let version = query.version.unwrap_or_default();
-    match lookup_local(storage, &keys, &version, state.cache.key_case).await {
+    match lookup_local(storage, &keys, &version, state.cache_limits().key_case).await {
         Ok(Some(entry)) => {
             let base = state.external_url.as_deref().unwrap_or_default();
             return signed_find_hit(&state, base, &entry.key);
@@ -144,7 +145,7 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         return StatusCode::NO_CONTENT.into_response();
     };
     let hits = relay.find(&keys, &version).await;
-    match relay::best_hit(&hits, &keys, state.cache.key_case) {
+    match relay::best_hit(&hits, &keys, state.cache_limits().key_case) {
         Some(hit) => {
             let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
             tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
@@ -189,7 +190,8 @@ pub(crate) async fn lookup_local(
 /// Mint the signed `archiveLocation` hit body against `base` (the host that
 /// actually holds the blob — self or a remote owner).
 fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
-    let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+    let policy = state.auth();
+    let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
     let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
     let signed = urls::mint(
         &path,
@@ -220,7 +222,8 @@ pub async fn reserve(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let key = normalize_key(&request.key, state.cache.key_case);
+    let limits = state.cache_limits();
+    let key = normalize_key(&request.key, limits.key_case);
     // A complete entry holding the exact key is a duplicate (409); an
     // incomplete reservation (or nothing) falls through to a fresh 200.
     match storage.stat(&key).await {
@@ -245,8 +248,8 @@ pub async fn reserve(
     // against the `min_free` floor; the eviction service is not on the request
     // path, so a below-floor reserve is logged, not rejected, and `cacheSize`
     // simply clamps to 0 (criterion 1 QA).
-    if state.cache.max_size > 0 {
-        let capacity = Capacity::resolve(state.cache.min_free, state.cache.max_size, 0, used);
+    if limits.max_size > 0 {
+        let capacity = Capacity::resolve(limits.min_free, limits.max_size, 0, used);
         if !capacity.admits(None) {
             tracing::debug!(
                 free = capacity.free(),
@@ -255,7 +258,7 @@ pub async fn reserve(
             );
         }
     }
-    let cache_size = state.cache.max_size.saturating_sub(used);
+    let cache_size = limits.max_size.saturating_sub(used);
     // Cluster seam (plan tasks 30/31): when a relay is present (cluster mode),
     // placement picks the owner. A remote owner takes the reservation and the
     // client keeps A's `cacheId`; a self owner (or no peers yet) falls through
@@ -263,17 +266,22 @@ pub async fn reserve(
     if let Some(relay) = state.relay.as_deref() {
         let client_cache_id = generate_cache_id(&key, &request.version);
         match relay.reserve(client_cache_id, &key, &request.version).await {
-            RelayReserve::Local => {}
+            RelayReserve::Local => {
+                state.metrics.observe_relay_hops(0);
+            }
             RelayReserve::Relayed => {
+                state.metrics.observe_relay_hops(1);
                 return Json(json!({"cacheId": client_cache_id, "cacheSize": cache_size}))
                     .into_response();
             }
             RelayReserve::Duplicate => return duplicate_response(&request.key),
             RelayReserve::NoCapacity => {
+                state.metrics.inc_relay_failure(RelayFailure::Capacity);
                 return ApiError::Unavailable(String::from("insufficient capacity"))
                     .into_response();
             }
             RelayReserve::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
                 return ApiError::BadGateway(String::from("storage owner unreachable"))
                     .into_response();
             }
@@ -283,7 +291,7 @@ pub async fn reserve(
     let cache_id_key = cache_id.to_string();
     let expires_at = u64::try_from(auth::now_secs())
         .unwrap_or(0)
-        .saturating_add(state.cache.reservation_ttl_seconds);
+        .saturating_add(limits.reservation_ttl_seconds);
     if let Err(err) = storage
         .reserve(&cache_id_key, &key, &request.version, expires_at)
         .await
@@ -322,7 +330,7 @@ pub async fn patch_chunk(
             .into_response();
     };
     let expected = range.len();
-    if expected > state.cache.max_chunk_bytes {
+    if expected > state.cache_limits().max_chunk_bytes {
         return ApiError::BadRequest(String::from("chunk exceeds the maximum size"))
             .into_response();
     }
@@ -360,6 +368,7 @@ pub async fn patch_chunk(
             RelayUpload::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
             RelayUpload::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
             RelayUpload::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
                 return ApiError::BadGateway(String::from("storage owner unreachable"))
                     .into_response();
             }
@@ -411,6 +420,7 @@ pub async fn commit(
             RelayCommit::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
             RelayCommit::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
             RelayCommit::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
                 return ApiError::BadGateway(String::from("storage owner unreachable"))
                     .into_response();
             }
@@ -447,7 +457,8 @@ pub async fn download(
     // Authorize before touching storage so a bad/missing signature is a
     // fail-closed 403 even when the backend is misconfigured.
     if requires_signed_url(&state) {
-        let secret = state.auth.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+        let policy = state.auth();
+        let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
         if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
             return ApiError::from(err).into_response();
         }
@@ -627,7 +638,8 @@ pub(crate) fn commit_error(err: io::Error) -> Response {
 /// Whether a download must present a signed URL: bearer/merge auth or any
 /// cluster deployment. Pure HMAC single-node serving relies on the HMAC gate.
 fn requires_signed_url(state: &AppState) -> bool {
-    state.auth.cluster_enabled || matches!(state.auth.mode, AuthMode::Bearer | AuthMode::Merge)
+    let policy = state.auth();
+    policy.cluster_enabled || matches!(policy.mode, AuthMode::Bearer | AuthMode::Merge)
 }
 
 /// Generate a fresh numeric `cacheId`.

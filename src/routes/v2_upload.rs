@@ -78,11 +78,12 @@ pub async fn upload(
     // The MAC binds the exact resource path task 24 minted, reconstructed from
     // the route param (so it can never be spoofed by a traversal-style path).
     let path = format!("/v2/upload/{entry_id}");
-    let secret = super::signing_secret(&state);
+    let policy = state.auth();
+    let secret = super::signing_secret(&policy);
     if let Err(err) = urls::validate(&query, &path, secret, auth::now_secs()) {
         return ApiError::from(err).into_response();
     }
-    let max_bytes = usize::try_from(state.cache.max_chunk_bytes).unwrap_or(usize::MAX);
+    let max_bytes = usize::try_from(state.cache_limits().max_chunk_bytes).unwrap_or(usize::MAX);
     match query.get("comp").map(String::as_str) {
         Some("block") => stage_block(storage, &entry_id, &query, body, max_bytes).await,
         Some("blocklist") => commit_block_list(&state, &entry_id, &query, body, max_bytes).await,

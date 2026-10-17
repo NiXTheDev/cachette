@@ -57,7 +57,8 @@ pub(crate) async fn reserve(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let key = normalize_key(&body.key, state.cache.key_case);
+    let limits = state.cache_limits();
+    let key = normalize_key(&body.key, limits.key_case);
     match storage.stat(&key).await {
         Ok(Some(_)) => return super::v1::duplicate_response(&body.key),
         Ok(None) => {}
@@ -75,12 +76,7 @@ pub(crate) async fn reserve(
     };
     // M15: the owner re-checks its OWN live admission at accept time — a stale
     // placement estimate must never let an over-floor reservation through.
-    let capacity = Capacity::resolve(
-        state.cache.min_free,
-        state.cache.max_size,
-        state.capacity_total,
-        used,
-    );
+    let capacity = Capacity::resolve(limits.min_free, limits.max_size, state.capacity_total, used);
     if !capacity.admits(body.size) {
         tracing::debug!(
             free = capacity.free(),
@@ -93,7 +89,7 @@ pub(crate) async fn reserve(
     let cache_id_key = cache_id.to_string();
     let expires_at = u64::try_from(crate::auth::now_secs())
         .unwrap_or(0)
-        .saturating_add(state.cache.reservation_ttl_seconds);
+        .saturating_add(limits.reservation_ttl_seconds);
     if let Err(err) = storage
         .reserve(&cache_id_key, &key, &body.version, expires_at)
         .await
@@ -102,7 +98,7 @@ pub(crate) async fn reserve(
         return ApiError::Internal.into_response();
     }
     state.metrics.add_reservations(1);
-    let cache_size = state.cache.max_size.saturating_sub(used);
+    let cache_size = limits.max_size.saturating_sub(used);
     Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
 
@@ -125,7 +121,7 @@ pub(crate) async fn upload(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let limit = usize::try_from(state.cache.max_chunk_bytes).unwrap_or(usize::MAX);
+    let limit = usize::try_from(state.cache_limits().max_chunk_bytes).unwrap_or(usize::MAX);
     let bytes = match to_bytes(body, limit).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -189,7 +185,7 @@ pub(crate) async fn commit(
             // artifact key — treat it as success (commit is idempotent by
             // cacheId).
             if let Some(raw_key) = body.key.as_deref() {
-                let key = normalize_key(raw_key, state.cache.key_case);
+                let key = normalize_key(raw_key, state.cache_limits().key_case);
                 if let Ok(Some(stat)) = storage.stat(&key).await
                     && stat.size == body.size
                 {
@@ -241,7 +237,7 @@ pub(crate) async fn find(
         return StatusCode::NO_CONTENT.into_response();
     }
     let version = params.version.as_deref().unwrap_or("");
-    match super::v1::lookup_local(storage, &keys, version, state.cache.key_case).await {
+    match super::v1::lookup_local(storage, &keys, version, state.cache_limits().key_case).await {
         Ok(Some(entry)) => Json(json!({
             "hit": true,
             "cacheId": entry.key,
@@ -283,7 +279,8 @@ pub(crate) async fn v2_reserve(
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
-    let key = normalize_key(&body.key, state.cache.key_case);
+    let limits = state.cache_limits();
+    let key = normalize_key(&body.key, limits.key_case);
     match storage.stat(&key).await {
         Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
         Ok(None) => {}
@@ -309,16 +306,11 @@ pub(crate) async fn v2_reserve(
         }
     };
     // M15: the owner re-checks its OWN live admission at accept time.
-    let capacity = Capacity::resolve(
-        state.cache.min_free,
-        state.cache.max_size,
-        state.capacity_total,
-        used,
-    );
+    let capacity = Capacity::resolve(limits.min_free, limits.max_size, state.capacity_total, used);
     if !capacity.admits(body.size) {
         return ApiError::Unavailable(String::from("insufficient capacity")).into_response();
     }
-    let expires_at = now_unix.saturating_add(state.cache.reservation_ttl_seconds);
+    let expires_at = now_unix.saturating_add(limits.reservation_ttl_seconds);
     if let Err(err) = storage
         .reserve(&body.cache_id, &key, &body.version, expires_at)
         .await
@@ -358,7 +350,7 @@ pub(crate) async fn v2_finalize(
         )
             .into_response();
     };
-    let key = normalize_key(&body.key, state.cache.key_case);
+    let key = normalize_key(&body.key, state.cache_limits().key_case);
     match super::twirp::stat_key_or_id(storage, &key, body.cache_id.as_deref()).await {
         Ok(Some(stat)) => {
             if let Some(size) = body.size_bytes
@@ -394,7 +386,7 @@ pub(crate) async fn v2_supersede(
     let Some(storage) = state.storage.as_deref() else {
         return Json(json!({"ok": true})).into_response();
     };
-    let key = normalize_key(&body.key, state.cache.key_case);
+    let key = normalize_key(&body.key, state.cache_limits().key_case);
     if let Err(err) = storage.delete(&key).await {
         tracing::error!(error = %err, "peer v2 supersede: delete failed");
         return (

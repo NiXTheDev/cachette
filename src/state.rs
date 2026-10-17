@@ -1,13 +1,13 @@
 //! Shared application state (plan task 3).
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::auth::{AuthPolicy, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
-use crate::config::{KeyCase, MinFree};
+use crate::config::{Config, KeyCase, MinFree};
 use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -33,6 +33,23 @@ pub struct CacheLimits {
     /// chunk / Azure block the request path accepts. One request can hold at
     /// most this many bytes, so it bounds per-request memory.
     pub max_chunk_bytes: u64,
+}
+
+impl CacheLimits {
+    /// Snapshot the reloadable `[cache]` / `[storage.fs]` / protocol knobs from
+    /// a resolved config. Used at boot and by the SIGHUP reload path (plan task
+    /// 49) so both construct limits identically.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            max_size: config.cache.max_size,
+            min_free: config.storage.fs.min_free,
+            reservation_ttl_seconds: config.cache.reservation_ttl_seconds,
+            key_case: config.cache.key_case,
+            signed_url_ttl_seconds: config.v1.signed_url_ttl_seconds,
+            max_chunk_bytes: config.server.max_chunk_bytes,
+        }
+    }
 }
 
 impl Default for CacheLimits {
@@ -73,11 +90,16 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     /// Auth policy snapshot (plan task 15): per-request mode resolution for
     /// the v1 artifactcache routes plus the admin register/revoke gate.
-    pub auth: Arc<AuthPolicy>,
-    /// Cache capacity + reservation knobs (plan task 19). Defaults mirror
-    /// `CacheConfig` / `FsConfig`; `serve()` overwrites them from the loaded
-    /// config.
-    pub cache: CacheLimits,
+    ///
+    /// The inner `Arc<AuthPolicy>` is swapped wholesale by a SIGHUP config
+    /// reload (plan task 49) — readers clone the `Arc` (an atomic refcount
+    /// bump, no heap allocation) so an in-flight request keeps the policy it
+    /// started with and never holds the lock across an `.await`.
+    pub auth: Arc<RwLock<Arc<AuthPolicy>>>,
+    /// Cache capacity + reservation knobs (plan task 19), shared so a SIGHUP
+    /// reload (plan task 49) can refresh them live. Readers take a `Copy`
+    /// snapshot through [`AppState::cache_limits`].
+    pub cache: Arc<RwLock<CacheLimits>>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -98,6 +120,11 @@ pub struct AppState {
     /// and refuses NEW uploads with `503` while still serving in-flight
     /// requests (PATCH chunks, finalize, downloads).
     pub draining: Arc<AtomicBool>,
+    /// Storage-backend health (plan task 49): readiness reports not-ready while
+    /// false. Defaults `true`; the periodic sweep (and shutdown) flips it on a
+    /// storage error and back on the next success. Tests flip it directly to
+    /// exercise the `/readyz` storage-fault branch.
+    pub storage_ok: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -112,14 +139,80 @@ impl AppState {
             peers: Arc::new(PeerPins::default()),
             peer_table: Arc::new(PeerTable::new()),
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
-            auth: Arc::new(AuthPolicy::default()),
-            cache: CacheLimits::default(),
+            auth: Arc::new(RwLock::new(Arc::new(AuthPolicy::default()))),
+            cache: Arc::new(RwLock::new(CacheLimits::default())),
             external_url: None,
             relay: None,
             capacity_total: 0,
             metrics: Arc::new(Metrics::default()),
             draining: Arc::new(AtomicBool::new(false)),
+            storage_ok: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// The live auth policy (plan task 49). Clones the inner `Arc` — no heap
+    /// allocation, and the returned handle is `Send`, so callers may hold it
+    /// across an `.await` (the lock itself is released immediately).
+    #[must_use]
+    pub fn auth(&self) -> Arc<AuthPolicy> {
+        self.auth
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the live auth policy (boot + SIGHUP reload).
+    pub fn set_auth(&self, policy: AuthPolicy) {
+        *self
+            .auth
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+    }
+
+    /// A `Copy` snapshot of the live cache limits (no lock held afterwards).
+    #[must_use]
+    pub fn cache_limits(&self) -> CacheLimits {
+        *self
+            .cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replace the live cache limits (boot + SIGHUP reload).
+    pub fn set_cache_limits(&self, limits: CacheLimits) {
+        *self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
+    }
+
+    /// Mutate the live cache limits in place (test helper).
+    pub fn with_cache_limits(&self, f: impl FnOnce(&mut CacheLimits)) {
+        let mut guard = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard);
+    }
+
+    /// Whether the storage backend is currently considered healthy (plan task
+    /// 49 readiness signal).
+    #[must_use]
+    pub fn storage_ok(&self) -> bool {
+        self.storage_ok.load(Ordering::Relaxed)
+    }
+
+    /// Record the storage backend's health (readiness signal).
+    pub fn set_storage_ok(&self, ok: bool) {
+        self.storage_ok.store(ok, Ordering::Relaxed);
+    }
+
+    /// Apply one reloaded config's reloadable subset in place (plan task 49):
+    /// the auth policy and the cache limits. Boot-only knobs (listen addresses,
+    /// the data directory, the storage backend, cluster wiring) are not touched.
+    pub fn apply_reload(&self, config: &Config) {
+        self.set_auth(AuthPolicy::from_config(config));
+        self.set_cache_limits(CacheLimits::from_config(config));
     }
 }
 

@@ -60,7 +60,7 @@ fn metrics_state() -> AppState {
     let storage = Arc::new(MemoryStorage::new());
     let mut state = AppState::new();
     state.storage = Some(storage);
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

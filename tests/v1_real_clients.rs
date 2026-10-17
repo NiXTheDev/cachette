@@ -691,7 +691,7 @@ fn fixture_state(storage_dir: &Path, jwt: &str, base: &str) -> AppState {
     let mut state = AppState::new();
     state.storage = Some(Arc::new(storage));
     state.external_url = Some(base.trim_end_matches('/').to_owned());
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Merge,
         secret: Some(FIXTURE_SECRET.to_owned()),
         hmac_max_age_seconds: 600,

@@ -46,7 +46,7 @@ fn state() -> (AppState, Arc<MemoryStorage>) {
     let mut state = AppState::new();
     state.storage = Some(storage.clone());
     state.external_url = Some(String::from(HOST));
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Merge,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

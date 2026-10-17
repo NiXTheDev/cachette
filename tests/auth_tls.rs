@@ -261,7 +261,7 @@ async fn start_server(root: &Path, mode: AuthMode, pki: &Pki, peers: PeerPins) -
     state.node_id = String::from("test-node");
     state.tokens =
         Arc::new(TokenStore::open(&root.join("auth.sqlite3")).expect("token store opens"));
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

@@ -99,7 +99,7 @@ async fn fixture_state() -> AppState {
     seed(&storage, FIXTURE_KEY, FIXTURE_BODY).await;
     let mut state = AppState::new();
     state.storage = Some(storage);
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -115,9 +115,9 @@ async fn sized_state(max_size: u64) -> (AppState, Arc<MemoryStorage>) {
     let storage = Arc::new(MemoryStorage::new());
     seed(&storage, FIXTURE_KEY, FIXTURE_BODY).await;
     let mut state = AppState::new();
-    state.cache.max_size = max_size;
+    state.with_cache_limits(|c| c.max_size = max_size);
     state.storage = Some(storage.clone());
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -132,7 +132,7 @@ async fn hmac_state(cluster_enabled: bool) -> AppState {
     seed(&storage, FIXTURE_KEY, FIXTURE_BODY).await;
     let mut state = AppState::new();
     state.storage = Some(storage);
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Hmac,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -520,8 +520,8 @@ async fn reserve_repeat_after_completion_returns_409() {
 
 #[tokio::test]
 async fn reserve_duplicate_detection_folds_key_case_when_lower() {
-    let mut state = fixture_state().await;
-    state.cache.key_case = KeyCase::Lower;
+    let state = fixture_state().await;
+    state.with_cache_limits(|c| c.key_case = KeyCase::Lower);
     let app = routes::router(state);
     let requested = "NGINX-SRC-1.30.5";
     let reply = call(
@@ -542,7 +542,7 @@ async fn reserve_duplicate_detection_folds_key_case_when_lower() {
 #[tokio::test]
 async fn reserve_key_case_defaults_to_preserve_and_is_case_sensitive() {
     let state = fixture_state().await;
-    assert_eq!(state.cache.key_case, KeyCase::Preserve);
+    assert_eq!(state.cache_limits().key_case, KeyCase::Preserve);
     let app = routes::router(state);
     let reply = call(
         &app,
@@ -591,7 +591,7 @@ async fn fs_state() -> (AppState, TempDir) {
     let storage = Arc::new(FsStorage::open(dir.path()).expect("fs storage opens"));
     let mut state = AppState::new();
     state.storage = Some(storage);
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -606,7 +606,7 @@ async fn fs_state_with_fs() -> (AppState, Arc<FsStorage>, TempDir) {
     let storage = Arc::new(FsStorage::open(dir.path()).expect("fs storage opens"));
     let mut state = AppState::new();
     state.storage = Some(storage.clone());
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -847,8 +847,8 @@ async fn patch_body_length_mismatch_returns_400() {
 /// rejected before it is written.
 #[tokio::test]
 async fn patch_over_the_configured_max_chunk_bytes_returns_400() {
-    let (mut state, _dir) = fs_state().await;
-    state.cache.max_chunk_bytes = 1024;
+    let (state, _dir) = fs_state().await;
+    state.with_cache_limits(|c| c.max_chunk_bytes = 1024);
     let app = routes::router(state);
     let cache_id = reserve_key(&app).await;
 

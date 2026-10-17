@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cachette::auth::AuthPolicy;
+use cachette::cluster::PeerTable;
 use cachette::config::{AuthMode, KeyCase, MinFree, ServerConfig};
 use cachette::identity::Identity;
 use cachette::routes;
@@ -97,21 +98,27 @@ fn state_with(identity: &Identity, storage: &Arc<MemoryStorage>, draining: bool)
     state.node_id = identity.fingerprint().to_owned();
     state.peers = Arc::new(cachette::tls::PeerPins::new(&BTreeMap::new(), false));
     state.storage = Some(storage.clone());
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: None,
         hmac_max_age_seconds: 600,
         static_tokens: vec![TOKEN.to_owned()],
         cluster_enabled: true,
     });
-    state.cache = CacheLimits {
+    // Cluster mode is only ready once a healthy peer other than this node is
+    // visible (task 49), so register one representative peer; the drain itself
+    // is orthogonal to the peer table.
+    state
+        .peer_table
+        .hello("peer-node", "peer-fingerprint", "10.0.0.2:8443", 0);
+    state.set_cache_limits(CacheLimits {
         max_size: 0,
         min_free: MinFree::Fraction(0.2),
         reservation_ttl_seconds: 3600,
         key_case: KeyCase::Preserve,
         signed_url_ttl_seconds: 900,
         max_chunk_bytes: 64 * 1024 * 1024,
-    };
+    });
     state.draining.store(draining, Ordering::SeqCst);
     state
 }
@@ -310,4 +317,60 @@ async fn readyz_reports_starting_without_storage() {
         "body: {}",
         String::from_utf8_lossy(&bytes)
     );
+}
+
+#[tokio::test]
+async fn readyz_requires_a_healthy_peer_in_cluster_mode() {
+    // Cluster mode with storage attached but no peer yet: `no_peers`. Once a
+    // healthy peer appears the node is `ready` (plan task 49).
+    let root = TestDir::new();
+    let node = mint(root.path(), "node");
+    let storage = Arc::new(MemoryStorage::new());
+    let mut state = state_with(&node, &storage, false);
+    state.peer_table = Arc::new(PeerTable::new());
+
+    let (status, body) = readyz_body(routes::router(state.clone())).await;
+    assert_eq!(status, 503, "cluster mode without peers: {body}");
+    assert!(body.contains("no_peers"), "body: {body}");
+
+    state
+        .peer_table
+        .hello("peer-node", "peer-fingerprint", "10.0.0.2:8443", 0);
+    let (status, body) = readyz_body(routes::router(state)).await;
+    assert_eq!(status, 200, "cluster mode with a healthy peer: {body}");
+    assert!(body.contains("ready"), "body: {body}");
+}
+
+#[tokio::test]
+async fn readyz_reports_unavailable_on_storage_fault() {
+    // A storage backend that has reported a fault is not ready (task 49), even
+    // though the process is alive and no longer draining.
+    let root = TestDir::new();
+    let node = mint(root.path(), "node");
+    let storage = Arc::new(MemoryStorage::new());
+    let state = state_with(&node, &storage, false);
+    state.set_storage_ok(false);
+
+    let (status, body) = readyz_body(routes::router(state)).await;
+    assert_eq!(status, 503, "storage fault: {body}");
+    assert!(body.contains("unavailable"), "body: {body}");
+}
+
+/// Call `GET /readyz` in-process; return the status code and body text.
+async fn readyz_body(app: axum::Router) -> (u16, String) {
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .expect("request"),
+    )
+    .await
+    .expect("router responds");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }

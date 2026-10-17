@@ -123,21 +123,21 @@ fn state_with(
     state.node_id = identity.fingerprint().to_owned();
     state.peers = Arc::new(PeerPins::new(&seed, false));
     state.storage = Some(storage.clone());
-    state.auth = Arc::new(AuthPolicy {
+    state.set_auth(AuthPolicy {
         mode: AuthMode::Bearer,
         secret: None,
         hmac_max_age_seconds: 600,
         static_tokens: vec![TOKEN.to_owned()],
         cluster_enabled: true,
     });
-    state.cache = CacheLimits {
+    state.set_cache_limits(CacheLimits {
         max_size,
         min_free,
         reservation_ttl_seconds: 3600,
         key_case: KeyCase::Lower,
         signed_url_ttl_seconds: 900,
         max_chunk_bytes: 64 * 1024 * 1024,
-    };
+    });
     state.capacity_total = max_size;
     state
 }
@@ -186,9 +186,10 @@ fn build_relay(identity: &Identity, state: &AppState, table: Arc<PeerTable>) -> 
         pins: state.peers.clone(),
         placement: Arc::new(Placement::with_seed(Tiebreak::Progressive, 7)),
         peer_table: table,
-        min_free: state.cache.min_free,
-        max_size: state.cache.max_size,
-        reservation_ttl_seconds: state.cache.reservation_ttl_seconds,
+        metrics: state.metrics.clone(),
+        min_free: state.cache_limits().min_free,
+        max_size: state.cache_limits().max_size,
+        reservation_ttl_seconds: state.cache_limits().reservation_ttl_seconds,
     })
     .expect("relay builds")
 }

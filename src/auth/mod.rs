@@ -88,12 +88,13 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
     if !path.starts_with(ARTIFACTCACHE_PREFIX) || path.starts_with(ARTIFACT_DOWNLOAD_PREFIX) {
         return next.run(request).await;
     }
-    let authorized = match state.auth.mode {
-        AuthMode::Hmac => hmac::verify(&state.auth, request.headers()),
-        AuthMode::Bearer => bearer::verify(&state.auth, &state.tokens, request.headers()).await,
+    let policy = state.auth();
+    let authorized = match policy.mode {
+        AuthMode::Hmac => hmac::verify(&policy, request.headers()),
+        AuthMode::Bearer => bearer::verify(&policy, &state.tokens, request.headers()).await,
         AuthMode::Merge => {
-            hmac::verify(&state.auth, request.headers())
-                || bearer::verify(&state.auth, &state.tokens, request.headers()).await
+            hmac::verify(&policy, request.headers())
+                || bearer::verify(&policy, &state.tokens, request.headers()).await
         }
     };
     if authorized {
