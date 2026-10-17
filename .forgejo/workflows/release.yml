@@ -1,5 +1,8 @@
-# Release pipeline for cachette (plan task 36):
-#   cross-compiled binary matrix + multi-arch Docker image push.
+# Release pipeline for cachette (plan task 53; supersedes the task-36/38 drafts):
+#   cross-compiled binary matrix -> checksums -> multi-arch image -> release.
+#
+# Runs on tag pushes (`v*`) and can be dispatched manually. On a manual dispatch
+# (no tag) the build + docker dry-run still run, but nothing is published.
 #
 # =============================================================================
 # TOOLCHAIN JUSTIFICATION (required by plan): cargo-zigbuild for the Linux legs
@@ -44,11 +47,15 @@
 # installed, so the cross legs are CI-validated only; the YAML itself is
 # gated locally with `actionlint` (0 errors).
 #
-# Acceptance criterion 12:
-#   * native artifacts (linux x86_64-musl, windows x86_64-msvc) RUN
-#     `cachette --version` and assert stdout == `cachette 0.1.0`.
-#   * cross artifacts are verified via `file`/`uname` (linux) and the
-#     PE-machine equivalent (windows).
+# Native artifacts (linux x86_64-musl, windows x86_64-msvc) RUN
+# `cachette --version` and assert stdout == `cachette 0.1.0`; cross artifacts
+# are verified via `file`/`uname` (linux) and the PE-machine equivalent.
+#
+# =============================================================================
+# PUBLISHING (plan task 53): registry = the real forge, hangar.nixthedev.ru.
+# Forgejo ships its own OCI registry at the forge host, so the image is
+# `hangar.nixthedev.ru/<owner>/cachette` (NOT ghcr.io). Binaries + SHA256SUMS
+# are attached to the Forgejo release for the pushed tag.
 # =============================================================================
 name: Release
 
@@ -191,29 +198,71 @@ jobs:
           if ($machine -ne 0xAA64) { throw ("expected ARM64 machine 0xAA64, got 0x{0:X4}" -f $machine) }
           Write-Host "OK: PE machine 0xAA64 = ARM64 (aarch64-pc-windows-msvc)"
 
-      # ---- Stage + upload one artifact per target ----
+      # ---- Stage + upload one uniquely-named binary per target ----
+      # The file name is the ARTIFACT name (target-qualified) so the later
+      # `merge-multiple` download never overwrites one binary with another
+      # (two linux legs both build a file called `cachette`).
       - name: Stage artifact
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          suffix=""
+          case "${{ matrix.bin }}" in *.exe) suffix=".exe" ;; esac
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}${suffix}"
           ls -l dist
 
       - name: Upload ${{ matrix.artifact }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.bin }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    name: checksums (SHA256SUMS)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download all built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum * > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+          echo "----------------------"
+          # Exactly the 4 target binaries must be present.
+          n="$(grep -c . SHA256SUMS)"
+          if [ "$n" -ne 4 ]; then
+            echo "::error::expected 4 binaries in SHA256SUMS, found $n"
+            exit 1
+          fi
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
           if-no-files-found: error
 
   docker:
     name: docker multi-arch image
     runs-on: ubuntu-latest
+    needs: build
     timeout-minutes: 90
     permissions:
       contents: read
-      packages: write # push to ghcr.io on tag builds only
+      packages: write # push to the forge registry on tag builds only
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -224,11 +273,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR (tag builds only)
+      - name: Log in to the forge registry (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: hangar.nixthedev.ru
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -236,9 +285,9 @@ jobs:
         id: ref
         shell: bash
         run: |
-          owner="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${owner}/cachette"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          image="hangar.nixthedev.ru/${owner}/cachette"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tag="${GITHUB_REF_NAME#v}"
             push=true
           else
@@ -250,37 +299,137 @@ jobs:
           echo "push=$push" >> "$GITHUB_OUTPUT"
           echo "ref=${image}:${tag} push=${push}"
 
-      # THE exact multi-arch push command from plan task 36. Runs ONLY in CI on
-      # tag pushes - NOTHING is ever pushed from a dev workstation (the worker's
-      # local gate is `buildx --load` amd64 only, see the dry-run step below).
+      # THE multi-arch push (linux/amd64,linux/arm64). Retried so a transient
+      # registry/network blip does NOT fail an otherwise-green build (plan
+      # task 53: "must NOT let registry-push flakiness fail an otherwise-green
+      # build"). Runs ONLY in CI on tag pushes - nothing is ever pushed from a
+      # dev workstation.
       - name: Build + push multi-arch manifest (linux/amd64,linux/arm64)
         if: steps.ref.outputs.push == 'true'
+        shell: bash
         run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --tag "${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.tag }}" \
-            --tag "${{ steps.ref.outputs.image }}:latest" \
-            --push \
-            .
+          set -euo pipefail
+          image="${{ steps.ref.outputs.image }}"
+          tag="${{ steps.ref.outputs.tag }}"
+          for attempt in 1 2 3 4; do
+            echo "== push attempt $attempt =="
+            if docker buildx build \
+                 --platform linux/amd64,linux/arm64 \
+                 --tag "${image}:${tag}" \
+                 --tag "${image}:latest" \
+                 --push \
+                 .; then
+              echo "OK: pushed ${image}:${tag}"
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::multi-arch push failed after 4 attempts"
+          exit 1
 
-      # Acceptance criterion 12 (docker half): the pushed tag must be a
-      # manifest list covering BOTH architectures.
+      # Acceptance (docker half): the pushed tag must be a manifest list
+      # covering BOTH architectures.
       - name: Verify manifest lists amd64 AND arm64
         if: steps.ref.outputs.push == 'true'
         run: |
+          set -euo pipefail
           ref="${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.tag }}"
           manifest="$(docker manifest inspect "$ref")"
           echo "$manifest"
           echo "$manifest" | grep -q '"architecture": "amd64"'
           echo "$manifest" | grep -q '"architecture": "arm64"'
           echo "OK: $ref is a manifest list with amd64 + arm64"
-          echo "(equivalent: docker buildx imagetools inspect $ref)"
 
       # Non-tag runs are a DRY RUN: amd64 only, local --load, no registry.
       - name: Dry run (amd64 --load only, no push without a registry)
         if: steps.ref.outputs.push == 'false'
         run: |
+          set -euo pipefail
           docker buildx build --load --platform linux/amd64 --tag cachette:ci-dryrun .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
           [ "$got" = "cachette 0.1.0" ]
+
+  release:
+    name: publish release (${{ github.ref_name }})
+    needs: [build, checksums, docker]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - name: Download every built binary + SHA256SUMS
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release and attach assets (retry)
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          api="$SERVER/api/v1/repos/$REPO"
+          auth="Authorization: token $TOKEN"
+
+          echo "Publishing $TAG to $api"
+          ls -l dist
+
+          # Create the release; a re-run returns "already exists", which we
+          # tolerate by resolving the id from the tag anyway.
+          create_body="{\"tag_name\":\"$TAG\",\"name\":\"cachette $TAG\",\"draft\":false,\"prerelease\":false}"
+          curl -sS -X POST "$api/releases" \
+            -H "$auth" -H 'Content-Type: application/json' \
+            -d "$create_body" || true
+
+          release_id=""
+          for attempt in 1 2 3 4 5; do
+            listing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
+            release_id="$(printf '%s' "$listing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
+            [ -n "$release_id" ] && break
+            echo "release not resolvable yet (attempt $attempt); retrying"
+            sleep 3
+          done
+          if [ -z "$release_id" ]; then
+            echo "::error::could not resolve a release id for tag $TAG"
+            exit 1
+          fi
+          echo "release id = $release_id"
+
+          # Upload each asset (binaries + SHA256SUMS), retrying transient
+          # failures. A re-run hits "already exists" (HTTP 400/409) for an asset
+          # that is already attached; that is treated as success so a re-run of
+          # the tag is idempotent.
+          for f in dist/*; do
+            name="$(basename "$f")"
+            uploaded=false
+            for attempt in 1 2 3 4; do
+              code="$(curl -sS -o /tmp/upload.out -w '%{http_code}' \
+                -X POST "$api/releases/$release_id/assets?name=$name" \
+                -H "$auth" -F "attachment=@$f" || true)"
+              if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+                echo "uploaded $name (HTTP $code)"
+                uploaded=true
+                break
+              fi
+              if [ "$code" = "400" ] || [ "$code" = "409" ]; then
+                echo "asset $name already attached (HTTP $code); idempotent re-run"
+                uploaded=true
+                break
+              fi
+              echo "upload $name attempt $attempt -> HTTP $code; retrying"
+              cat /tmp/upload.out || true
+              sleep $((attempt * 3))
+            done
+            if [ "$uploaded" != "true" ]; then
+              echo "::error::failed to upload $name after retries"
+              exit 1
+            fi
+          done
+          echo "OK: release $TAG published with all assets"

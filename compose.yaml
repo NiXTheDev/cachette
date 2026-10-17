@@ -28,7 +28,7 @@
 #     shared by both nodes in the cluster demo.
 #   * To consume a published image instead of building locally, replace
 #     `image: cachette:local` with the pushed tag, e.g.
-#     ghcr.io/<owner>/cachette:0.1.0 (see .github/workflows/release.yml).
+#     hangar.nixthedev.ru/<owner>/cachette:0.1.0 (see .forgejo/workflows/release.yml).
 
 name: cachette
 

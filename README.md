@@ -329,6 +329,17 @@ multicast interface). See [docs/cluster.md](docs/cluster.md).
 - [docs/encrypted-storage.md](docs/encrypted-storage.md) - encrypting the
   storage volume with LUKS, ZFS, or BitLocker.
 
+### CI & releases
+
+One Forgejo pipeline (`.forgejo/workflows/`) takes a commit from lint to
+published artifact: `ci.yml` runs rustfmt/clippy, the workspace tests, the v1 +
+v2 real-client round-trips (`node`/`npm`/`go` must be present or the job fails),
+the example-config/compose lint, and the multi-node cluster suites on every push
+and pull request. `release.yml` runs on `v*` tags: it cross-compiles the four
+targets (linux/windows x amd64/arm64), writes `SHA256SUMS`, builds and pushes a
+multi-arch image to the forge registry (`hangar.nixthedev.ru/<owner>/cachette`),
+and attaches the binaries + checksums to the tag's release.
+
 ## Not in this release
 
 These are intentionally out of scope for this version; cachette does not

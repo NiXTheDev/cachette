@@ -40,7 +40,7 @@ FROM rust:1.98-alpine AS builder
 RUN apk add --no-cache gcc musl-dev file
 
 # Optional crates.io source replacement for restricted networks (CI needs NONE;
-# GitHub runners reach crates.io directly):
+# CI runners reach crates.io directly):
 #   --build-arg CARGO_MIRROR=sparse+https://<registry-host>/crates.io-index/
 ARG CARGO_MIRROR=
 RUN if [ -n "$CARGO_MIRROR" ]; then \
