@@ -335,10 +335,14 @@ One Forgejo pipeline (`.forgejo/workflows/`) takes a commit from lint to
 published artifact: `ci.yml` runs rustfmt/clippy, the workspace tests, the v1 +
 v2 real-client round-trips (`node`/`npm`/`go` must be present or the job fails),
 the example-config/compose lint, and the multi-node cluster suites on every push
-and pull request. `release.yml` runs on `v*` tags: it cross-compiles the four
-targets (linux/windows x amd64/arm64), writes `SHA256SUMS`, builds and pushes a
-multi-arch image to the forge registry (`hangar.nixthedev.ru/<owner>/cachette`),
-and attaches the binaries + checksums to the tag's release.
+and pull request. `release.yml` runs on `v*` tags and on pushes to the `release`
+branch: it cross-compiles the four targets (linux/windows x amd64/arm64), writes
+`SHA256SUMS`, builds and pushes a multi-arch image to the forge registry
+(`hangar.nixthedev.ru/<owner>/cachette`), and attaches the binaries + checksums
+to a release tagged `v<version>` - the pushed tag on a tag build, or `Cargo.toml`'s
+package version on a `release`-branch build. Merging a `feat/*` pull request into
+`release` is therefore what cuts a release; a manual dispatch on any other ref
+only builds and dry-runs the image.
 
 ## Not in this release
 
