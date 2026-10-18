@@ -43,11 +43,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust (rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Cache cargo registry/build
-        uses: Swatinem/rust-cache@v2
+        uses: https://github.com/Swatinem/rust-cache@v2
       - name: rustfmt --check
         run: cargo fmt --all -- --check
       - name: clippy -D warnings
@@ -61,7 +61,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
@@ -74,7 +74,7 @@ jobs:
         with:
           go-version: "1.25"
       - name: Cache cargo registry/build
-        uses: Swatinem/rust-cache@v2
+        uses: https://github.com/Swatinem/rust-cache@v2
       - name: Assert real-client toolchains are present (fail, never skip)
         run: |
           set -euo pipefail
@@ -92,7 +92,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
       - name: Install Node.js (for the @actions/cache toolkit fixture)
         uses: actions/setup-node@v4
         with:
@@ -102,7 +102,7 @@ jobs:
         with:
           go-version: "1.25"
       - name: Cache cargo registry/build
-        uses: Swatinem/rust-cache@v2
+        uses: https://github.com/Swatinem/rust-cache@v2
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
       - name: Assert real-client toolchains are present (fail, never skip)
@@ -122,9 +122,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
       - name: Cache cargo registry/build
-        uses: Swatinem/rust-cache@v2
+        uses: https://github.com/Swatinem/rust-cache@v2
       # The embedded example must resolve end to end (env + file + derived
       # defaults validated); --print-config masks secrets and exits non-zero on
       # any invalid key.
@@ -147,9 +147,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
       - name: Cache cargo registry/build
-        uses: Swatinem/rust-cache@v2
+        uses: https://github.com/Swatinem/rust-cache@v2
       # Placement distribution, heartbeat/health, v1 relay + find fan-out,
       # graceful drain, and the peer mTLS/rotation handshakes. These are the
       # multi-node behaviours the process-level 3-node harness (plan task 33,
