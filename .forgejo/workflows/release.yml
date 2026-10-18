@@ -72,8 +72,10 @@ on:
     branches: ["release"]
   workflow_dispatch:
 
-permissions:
-  contents: read
+# NOTE (Forgejo): a `permissions:` key is NOT supported - the instance logs
+# "Job ... has a permissions field, which is not supported in Forgejo and will
+# be ignored. Use Authorized Integrations ...". Registry/release capabilities
+# come from the forge's Authorized Integrations, so none is declared here.
 
 env:
   CARGO_TERM_COLOR: always
@@ -314,9 +316,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, version]
     timeout-minutes: 90
-    permissions:
-      contents: read
-      packages: write # push to the forge registry on publishing refs only
+    # Registry push needs `packages: write` - granted via Authorized Integrations.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -408,8 +408,7 @@ jobs:
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write # create the release + upload assets
+    # Release publish needs `contents: write` - granted via Authorized Integrations.
     steps:
       - name: Download every built binary + SHA256SUMS
         uses: actions/download-artifact@v4
