@@ -1,22 +1,33 @@
-# Full CI gate for cachette (plan task 53): one PR/push pipeline from lint to
-# test on the real forge (Forgejo Actions under .forgejo/workflows/). The tag
-# path (cross-build -> checksums -> registry -> release) lives in release.yml.
+# CI gate for cachette (plan task 53): one PR/push pipeline built from parallel
+# static checks that must ALL pass before any test runs. The tag path
+# (cross-build -> checksums -> registry -> release) lives in release.yml.
 #
-# The gates are deliberately independent jobs so a deliberately broken fmt /
-# clippy / test / real-client run each turns the pipeline red on its own:
+# The static checks run as independent, PARALLEL jobs so a deliberately broken
+# fmt / typecheck / clippy turns its own gate red on its own:
 #
-#   lint         - rustfmt --check + clippy --all-targets -D warnings
-#   test         - the whole workspace test suite (unit + integration)
-#   real-clients - v1 (@actions/cache toolkit + go-actions-cache) and v2
-#                  (go-actions-cache CacheService) against the REAL clients.
-#                  node/npm/go MUST be present; a missing toolchain FAILS the
-#                  job - it never silently skips (plan tasks 22/27).
-#   docs         - the embedded example config resolves (`--print-config`) and
-#                  compose.yaml parses (`docker compose config`)
-#   cluster      - the multi-node cluster suites (placement, relay, fan-out,
-#                  drain, mTLS). The process-level 3-node harness (plan task 33)
-#                  is GATED on the v2.0 cluster listener and is not present yet;
-#                  these in-process suites are its current stand-in.
+#   fmt      - rustfmt --all -- --check
+#   check    - cargo check --workspace --all-targets (typecheck)
+#   clippy   - cargo clippy --workspace --all-targets -- -D warnings
+#
+# Every downstream job `needs:` all three, so a failure in any static check
+# short-circuits the pipeline before any (expensive) test work starts:
+#
+#   test     - the ENTIRE test suite in a single job/step: unit + integration
+#              + the v1/v2 real clients (@actions/cache toolkit + vendored
+#              go-actions-cache CacheService) + the multi-node cluster suites
+#              (placement, relay, fan-out, drain, mTLS). `cargo test --workspace`
+#              already covers every suite exactly once. node/npm/go MUST be
+#              present; a missing toolchain FAILS the job - it never silently
+#              skips (plan tasks 22/27). The process-level 3-node harness (plan
+#              task 33) is GATED on the v2.0 cluster listener and is not present
+#              yet; the in-process suites are its current stand-in.
+#   docs     - the embedded example config resolves (`--print-config`) and
+#              compose.yaml parses (`docker compose config`).
+#
+# NOTE (Forgejo): a `permissions:` key is NOT supported - the instance logs
+# "Job ... has a permissions field, which is not supported in Forgejo and will
+# be ignored. Use Authorized Integrations ...". Capabilities come from the
+# forge's Authorized Integrations, so none is declared here.
 name: CI
 
 on:
@@ -28,35 +39,61 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: lint (fmt + clippy)
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust (rustfmt)
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+  check:
+    name: check (typecheck)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install stable Rust (rustfmt + clippy)
+      - name: Install stable Rust
         uses: https://github.com/dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
-      - name: rustfmt --check
-        run: cargo fmt --all -- --check
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust (clippy)
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
       - name: clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    name: test (workspace)
+    name: test (all suites)
+    needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,34 +112,6 @@ jobs:
           go-version: "1.25"
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
-      - name: Assert real-client toolchains are present (fail, never skip)
-        run: |
-          set -euo pipefail
-          node --version
-          npm --version
-          go version
-      - name: cargo test --workspace
-        run: cargo test --workspace --locked
-
-  real-clients:
-    name: real-client integration (v1 + v2)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: https://github.com/dtolnay/rust-toolchain@stable
-      - name: Install Node.js (for the @actions/cache toolkit fixture)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Install Go (for the go-actions-cache fixture)
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-      - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
       - name: Assert real-client toolchains are present (fail, never skip)
@@ -111,11 +120,15 @@ jobs:
           node --version
           npm --version
           go version
-      - name: v1 + v2 real-client round-trips (full transcripts)
-        run: cargo test --locked --test v1_real_clients --test v2_real_clients -- --nocapture
+      # EVERY suite the workspace has runs here, in this single step: unit +
+      # integration + v1/v2 real clients + the multi-node cluster suites.
+      # `--workspace` already includes them all, so each test runs exactly once.
+      - name: cargo test (entire workspace)
+        run: cargo test --workspace --locked
 
   docs:
-    name: docs lint (example config + compose)
+    name: docs (example config + compose)
+    needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -138,30 +151,3 @@ jobs:
           set -euo pipefail
           docker compose -f compose.yaml config > /dev/null
           echo "OK: compose.yaml parses"
-
-  cluster:
-    name: cluster (multi-node)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: https://github.com/dtolnay/rust-toolchain@stable
-      - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
-      # Placement distribution, heartbeat/health, v1 relay + find fan-out,
-      # graceful drain, and the peer mTLS/rotation handshakes. These are the
-      # multi-node behaviours the process-level 3-node harness (plan task 33,
-      # gated on the v2.0 cluster listener) will also cover.
-      - name: Multi-node cluster suites
-        run: |
-          set -euo pipefail
-          cargo test --locked \
-            --test cluster \
-            --test placement \
-            --test v1_relay \
-            --test v1_find_fanout \
-            --test drain \
-            --test tls_peers \
-            --test auth_tls
