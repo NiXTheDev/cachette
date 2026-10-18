@@ -28,6 +28,13 @@
 # "Job ... has a permissions field, which is not supported in Forgejo and will
 # be ignored. Use Authorized Integrations ...". Capabilities come from the
 # forge's Authorized Integrations, so none is declared here.
+#
+# NOTE (timeouts): the budgets below are deliberately GENEROUS. `static.rust-lang.org`
+# is very slow from these runners (~65 KB/s), so a cold `rustup toolchain install`
+# alone can eat 20-25 min. A job killed mid-install never runs `Swatinem/rust-cache`'s
+# post step, so nothing is cached and every retry starts cold again. The wide
+# budgets let one cold run finish and seed the cache, after which reruns are quick.
+# Tighten only once the toolchain install is known to be fast.
 name: CI
 
 on:
@@ -46,7 +53,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,7 +69,7 @@ jobs:
   check:
     name: check (typecheck)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,7 +83,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,7 +100,7 @@ jobs:
     name: test (all suites)
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -130,7 +137,7 @@ jobs:
     name: docs (example config + compose)
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
