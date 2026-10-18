@@ -153,6 +153,20 @@ jobs:
           set -euo pipefail
           cargo run --locked --quiet -- --config cachette.example.toml --print-config > /dev/null
           echo "OK: cachette.example.toml resolves"
+      # Debian 13 (trixie) ships the Docker CLI in its own `docker-cli` package
+      # (`docker.io` only provides dockerd now) and compose v2 as the standalone
+      # `docker-compose`; the `node:24-trixie` job image carries neither, while
+      # GitHub's `ubuntu-latest` had both - hence the explicit install + the
+      # cli-plugins symlink so the documented `docker compose ...` form works.
+      - name: Install docker CLI + compose
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends docker-cli docker-compose
+          mkdir -p /usr/libexec/docker/cli-plugins
+          ln -sf /usr/bin/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+          docker --version
+          docker compose version
       - name: Validate compose.yaml
         run: |
           set -euo pipefail

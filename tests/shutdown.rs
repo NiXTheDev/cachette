@@ -203,12 +203,22 @@ async fn sigterm_triggers_graceful_shutdown() {
 
     let stdout = child.stdout.take().expect("stdout piped");
     let mut reader = tokio::io::BufReader::new(stdout);
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-        .await
-        .expect("readiness within 10s")
-        .expect("read line");
-    assert!(line.contains("cachette listening on"), "readiness: {line}");
+    // Startup INFO logs share stdout with the readiness gate (`logging::init`
+    // writes to stdout), so with `RUST_LOG=info` the identity log can precede
+    // the marker: scan lines instead of assuming the first one is readiness.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).await.expect("read line");
+            assert!(read != 0, "stdout closed before the readiness line");
+            if line.contains("cachette listening on") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("readiness within 10s");
 
     let pid = child.id().expect("child pid");
     let killed = std::process::Command::new("kill")
