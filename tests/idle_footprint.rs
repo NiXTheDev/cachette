@@ -150,10 +150,10 @@ fn start(config: &Path) -> Server {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!(
-        "readiness line '{READY}' not seen within 15s:\n{}",
-        log.lock().expect("log lock")
-    );
+    let log_final = log.lock().expect("log lock").clone();
+    drop(log_final);
+    let text_final = log.lock().expect("log lock").clone();
+    panic!("readiness line '{READY}' not seen within 15s:\n{text_final}");
 }
 
 /// A CPU-time and resident-set reading of the child process.

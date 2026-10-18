@@ -147,15 +147,15 @@ jobs:
             artifact: cachette-aarch64-unknown-linux-musl
             bin: cachette
             smoke: cross-linux
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            zigbuild: false
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            zigbuild: true
             artifact: cachette-x86_64-pc-windows-msvc
             bin: cachette.exe
-            smoke: run
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            zigbuild: false
+            smoke: cross-windows
+          - os: ubuntu-latest
+            target: aarch64-pc-windows-gnu
+            zigbuild: true
             artifact: cachette-aarch64-pc-windows-msvc
             bin: cachette.exe
             smoke: cross-windows
@@ -320,6 +320,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Debian 13 (trixie) job image: the Docker CLI is its own `docker-cli`
+      # package now (`docker.io` only provides dockerd), so install it before the
+      # docker/* actions below - they shell out to `docker` (as do `docker
+      # buildx`/`docker manifest` further down), which GitHub's ubuntu-latest had
+      # preinstalled but node:24-trixie does not.
+      - name: Install docker CLI
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends docker-cli
+          docker --version
 
       - name: Set up QEMU (arm64 builder stage emulation)
         uses: docker/setup-qemu-action@v3
