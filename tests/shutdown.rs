@@ -187,6 +187,7 @@ async fn restart_after_shutdown_leaves_no_half_row() {
 #[tokio::test]
 async fn sigterm_triggers_graceful_shutdown() {
     use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
 
     let dir = TestDir::new();
     let config_path = write_config(&dir);
@@ -206,12 +207,16 @@ async fn sigterm_triggers_graceful_shutdown() {
     // Startup INFO logs share stdout with the readiness gate (`logging::init`
     // writes to stdout), so with `RUST_LOG=info` the identity log can precede
     // the marker: scan lines instead of assuming the first one is readiness.
+    // Keep the lines we consumed so the drain-line assertion below still sees
+    // them.
+    let mut transcript = String::new();
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut line = String::new();
         loop {
             line.clear();
             let read = reader.read_line(&mut line).await.expect("read line");
             assert!(read != 0, "stdout closed before the readiness line");
+            transcript.push_str(&line);
             if line.contains("cachette listening on") {
                 return;
             }
@@ -228,14 +233,30 @@ async fn sigterm_triggers_graceful_shutdown() {
         .expect("kill runs");
     assert!(killed.success(), "kill -TERM delivered");
 
-    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+    // `child.stdout` was `take()`n above, so `wait_with_output()` would hand
+    // back EMPTY pipes and could never observe the drain line. Drain the
+    // remainder of the same reader, then reap the child and assert the exit.
+    let drain = async {
+        let mut rest = String::new();
+        reader
+            .read_to_string(&mut rest)
+            .await
+            .expect("read remaining stdout");
+        (reader, rest)
+    };
+    let (reader, rest) = tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("drain line within 10s");
+    transcript.push_str(&rest);
+    let _ = reader;
+
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .expect("exits within 10s")
         .expect("wait");
-    assert_eq!(output.status.code(), Some(0), "SIGTERM drains and exits 0");
-    let combined = combined_output(&output);
+    assert_eq!(status.code(), Some(0), "SIGTERM drains and exits 0");
     assert!(
-        combined.contains(DRAIN_LINE),
-        "drain line present: {combined}"
+        transcript.contains(DRAIN_LINE),
+        "drain line present: {transcript}"
     );
 }
