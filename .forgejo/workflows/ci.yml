@@ -156,15 +156,14 @@ jobs:
       # Debian 13 (trixie) ships the Docker CLI in its own `docker-cli` package
       # (`docker.io` only provides dockerd now) and compose v2 as the standalone
       # `docker-compose`; the `node:24-trixie` job image carries neither, while
-      # GitHub's `ubuntu-latest` had both - hence the explicit install + the
-      # cli-plugins symlink so the documented `docker compose ...` form works.
+      # GitHub's `ubuntu-latest` had both. The Debian package already drops its
+      # binary into docker's cli-plugins dir, so no symlink is needed - and one
+      # is actively harmful, since `ln -sf` onto the same file fails under `set -e`.
       - name: Install docker CLI + compose
         run: |
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends docker-cli docker-compose
-          mkdir -p /usr/libexec/docker/cli-plugins
-          ln -sf /usr/bin/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
           docker --version
           docker compose version
       - name: Validate compose.yaml
