@@ -331,18 +331,24 @@ multicast interface). See [docs/cluster.md](docs/cluster.md).
 
 ### CI & releases
 
-One Forgejo pipeline (`.forgejo/workflows/`) takes a commit from lint to
-published artifact: `ci.yml` runs rustfmt/clippy, the workspace tests, the v1 +
-v2 real-client round-trips (`node`/`npm`/`go` must be present or the job fails),
-the example-config/compose lint, and the multi-node cluster suites on every push
-and pull request. `release.yml` runs on `v*` tags and on pushes to the `release`
-branch: it cross-compiles the four targets (linux/windows x amd64/arm64), writes
-`SHA256SUMS`, builds and pushes a multi-arch image to the forge registry
-(`hangar.nixthedev.ru/<owner>/cachette`), and attaches the binaries + checksums
-to a release tagged `v<version>` - the pushed tag on a tag build, or `Cargo.toml`'s
-package version on a `release`-branch build. Merging a `feat/*` pull request into
-`release` is therefore what cuts a release; a manual dispatch on any other ref
-only builds and dry-runs the image.
+Three Forgejo workflows (`.forgejo/workflows/`) take a commit from lint to
+published artifact. `push-checks.yml` (every branch push) and `pr-checks.yml`
+(pull requests to `release`) run the same gates: rustfmt/clippy, the workspace
+tests including the v1 + v2 real-client round-trips (`node`/`npm`/`go` must be
+present or the job fails), the example-config/compose lint, and the multi-node
+cluster suites - followed by the docker job: a registry-published multi-arch
+image (`linux/amd64` + `linux/arm64`, tags `0.1.0`/`0.1`/`0` + `latest` +
+`release` read from `Cargo.toml`) on pushes to the `release` branch, and a
+validation-only amd64 build everywhere else (no `:dev` tag waterfalls). Both
+legs share a buildkit layer cache served by cachette itself (docker buildx
+`type=gha` against the `acc.nixthedev.ru` cache; an unset
+`CACHETTE_BUILDX_JWT` only means cache misses, never failures). `release.yml`
+runs on `v*` tags and on pushes to the `release` branch: it cross-compiles the
+four targets (linux/windows x amd64/arm64), writes `SHA256SUMS`, and attaches
+the binaries + checksums to a release tagged `v<version>` - the pushed tag on a
+tag build, or `Cargo.toml`'s package version on a `release`-branch build.
+Merging a `feat/*` pull request into `release` therefore fires both pipelines
+at once: the image publish and the release cut.
 
 ## Not in this release
 

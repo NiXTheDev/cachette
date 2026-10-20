@@ -1,12 +1,19 @@
 # Release pipeline for cachette (plan task 53; supersedes the task-36/38 drafts):
-#   cross-compiled binary matrix -> checksums -> multi-arch image -> release.
+#   cross-compiled binary matrix -> checksums -> release.
+#
+# The OCI image is NOT built here. regexYbot-shaped split: the docker image
+# work (multi-arch build, registry push on `refs/heads/release`, validation
+# builds everywhere else) lives in push-checks.yml / pr-checks.yml, so the
+# publish machinery is exercised by the ordinary checks on every merge - and a
+# merge into `release` fires BOTH this pipeline (binaries + checksums + release)
+# and push-checks.yml (the image) at the same time.
 #
 # Runs on tag pushes (`v*`) AND on pushes to the long-lived `release` branch (the
 # merge commit of a `feat/*` -> release pull request), and can be dispatched
 # manually. Tag pushes publish under the tag; `release`-branch pushes publish
 # under the crate version (`v<version>` from Cargo.toml), so merging the PR is
 # what cuts a release. On a manual dispatch (no tag, non-release branch) the
-# build + docker dry-run still run, but nothing is published.
+# build + checksums still run, but nothing is published.
 #
 # =============================================================================
 # TOOLCHAIN JUSTIFICATION (required by plan): cargo-zigbuild for the Linux legs
@@ -38,13 +45,14 @@
 #   with `cross build --target <triple> --release` and record the reason in
 #   this comment (NOT silently in a follow-up commit).
 #
-# Windows legs need no extra toolchain:
-#   * x86_64-pc-windows-msvc  - native on windows-latest, links with MSVC.
-#   * aarch64-pc-windows-msvc - cross-links with the VS ARM64 C++ toolchain
-#     that ships on windows-latest images (VC.Tools.ARM64); the resulting
-#     ARM64 PE cannot EXECUTE on the x64 runner, so it is verified structurally
-#     below (PE COFF machine == 0xAA64 - the exact fact `file(1)` would report;
-#     a `file`-based check runs too whenever `file` exists on the runner).
+# Windows legs are cross-built on Linux by cargo-zigbuild like everything else:
+#   * x86_64-pc-windows-gnu / aarch64-pc-windows-gnu are Tier 2 rustup targets
+#     whose mingw-w64 link step `zig cc` satisfies; no Windows-native toolchain
+#     (no MSVC, no windows-latest legs) is involved. A cross-built PE cannot
+#     execute on the Linux runner, so the artifacts are verified structurally:
+#     the PE COFF machine field must be 0x8664 (x86_64) or 0xAA64 (ARM64) -
+#     the exact fact `file(1)` would report; a `file`-based check runs too
+#     whenever `file` exists on the runner.
 #
 # Local-dev limitation (recorded by task 36): the dev workstation has NO
 # zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
@@ -56,12 +64,14 @@
 # are verified via `file`/`uname` (linux) and the PE-machine equivalent.
 #
 # =============================================================================
-# PUBLISHING (plan task 53): registry = the real forge, hangar.nixthedev.ru.
-# Forgejo ships its own OCI registry at the forge host, so the image is
-# `hangar.nixthedev.ru/<owner>/cachette` (NOT ghcr.io). Binaries + SHA256SUMS
-# are attached to the Forgejo release. The release tag is `v<version>`: the
-# pushed tag on a tag push, or the Cargo.toml package version on a push to the
-# `release` branch (so merging a `feat/*` PR into `release` cuts the release).
+# PUBLISHING (plan task 53): the forge release + its binaries. Binaries +
+# SHA256SUMS are attached to the Forgejo release. The release tag is
+# `v<version>`: the pushed tag on a tag push, or the Cargo.toml package version
+# on a push to the `release` branch (so merging a `feat/*` PR into `release`
+# cuts the release). The image side of a release (bare-semver tags
+# `0.1.0`/`0.1`/`0` + `latest` + `release` at
+# `hangar.nixthedev.ru/<owner>/cachette`) is pushed by push-checks.yml's docker
+# job on the same merge.
 # =============================================================================
 name: Release
 
@@ -85,8 +95,8 @@ jobs:
   # publishing refs:
   #   * a `v*` tag            -> version = the tag minus its leading `v`
   #   * the `release` branch  -> version = Cargo.toml's `[package] version`
-  # Every other ref (manual dispatch on a feature branch) builds and dry-runs the
-  # image but never pushes or publishes.
+  # Every other ref (manual dispatch on a feature branch) builds binaries +
+  # checksums but never publishes.
   version:
     name: resolve version
     runs-on: ubuntu-latest
@@ -97,7 +107,7 @@ jobs:
       publish: ${{ steps.v.outputs.publish }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
       - name: Resolve version and publish flag
         id: v
@@ -161,7 +171,7 @@ jobs:
             smoke: cross-windows
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
       - name: Install stable Rust (${{ matrix.target }})
         uses: https://github.com/dtolnay/rust-toolchain@stable
@@ -187,11 +197,6 @@ jobs:
       - name: Build (cargo zigbuild -> static musl)
         if: matrix.zigbuild == true
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
-
-      # ---- Windows legs: plain cargo build (MSVC; ARM64 tools preinstalled) ----
-      - name: Build (cargo build, MSVC)
-        if: matrix.zigbuild == false
-        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ---- Smoke: native artifacts actually RUN --version ----
       - name: Smoke - run native binary (--version -> "cachette 0.1.0")
@@ -316,124 +321,9 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
-  docker:
-    name: docker multi-arch image
-    runs-on: ubuntu-latest
-    needs: [build, version]
-    timeout-minutes: 120
-    # Registry push needs `packages: write` - granted via Authorized Integrations.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Debian 13 (trixie) job image: the Docker CLI is its own `docker-cli`
-      # package now (`docker.io` only provides dockerd), so install it before the
-      # docker/* actions below - they shell out to `docker` (as do `docker
-      # buildx`/`docker manifest` further down), which GitHub's ubuntu-latest had
-      # preinstalled but node:24-trixie does not.
-      # deb.debian.org (Fastly) is intermittently unreachable from some runners
-      # (the CI docs job hit "Connection failed [IP: 151.101.x.x 80]" on every
-      # index fetch), so update + install are retried as one unit, matching the
-      # approach used there and for the registry pushes below.
-      - name: Install docker CLI (retry)
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            echo "== apt attempt $attempt =="
-            if apt-get update && apt-get install -y --no-install-recommends docker-cli; then
-              docker --version
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying"
-            sleep $((attempt * 5))
-          done
-          echo "::error::apt install failed after 3 attempts"
-          exit 1
-
-      - name: Set up QEMU (arm64 builder stage emulation)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to the forge registry (publishing refs only)
-        if: needs.version.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: hangar.nixthedev.ru
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image ref
-        id: ref
-        shell: bash
-        run: |
-          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          image="hangar.nixthedev.ru/${owner}/cachette"
-          if [ "${{ needs.version.outputs.publish }}" = "true" ]; then
-            tag="${{ needs.version.outputs.version }}"
-          else
-            tag="sha-${GITHUB_SHA:0:12}"
-          fi
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "ref=${image}:${tag}"
-
-      # THE multi-arch push (linux/amd64,linux/arm64). Retried so a transient
-      # registry/network blip does NOT fail an otherwise-green build (plan
-      # task 53: "must NOT let registry-push flakiness fail an otherwise-green
-      # build"). Runs on publishing refs only (a `v*` tag or the `release`
-      # branch); a manual dispatch never pushes.
-      - name: Build + push multi-arch manifest (linux/amd64,linux/arm64)
-        if: needs.version.outputs.publish == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${{ steps.ref.outputs.image }}"
-          tag="${{ steps.ref.outputs.tag }}"
-          for attempt in 1 2 3 4; do
-            echo "== push attempt $attempt =="
-            if docker buildx build \
-                 --platform linux/amd64,linux/arm64 \
-                 --tag "${image}:${tag}" \
-                 --tag "${image}:latest" \
-                 --push \
-                 .; then
-              echo "OK: pushed ${image}:${tag}"
-              exit 0
-            fi
-            echo "push attempt $attempt failed; retrying"
-            sleep $((attempt * 5))
-          done
-          echo "::error::multi-arch push failed after 4 attempts"
-          exit 1
-
-      # Acceptance (docker half): the pushed tag must be a manifest list
-      # covering BOTH architectures.
-      - name: Verify manifest lists amd64 AND arm64
-        if: needs.version.outputs.publish == 'true'
-        run: |
-          set -euo pipefail
-          ref="${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.tag }}"
-          manifest="$(docker manifest inspect "$ref")"
-          echo "$manifest"
-          echo "$manifest" | grep -q '"architecture": "amd64"'
-          echo "$manifest" | grep -q '"architecture": "arm64"'
-          echo "OK: $ref is a manifest list with amd64 + arm64"
-
-      # Non-publishing runs are a DRY RUN: amd64 only, local --load, no registry.
-      - name: Dry run (amd64 --load only, no push without a registry)
-        if: needs.version.outputs.publish != 'true'
-        run: |
-          set -euo pipefail
-          docker buildx build --load --platform linux/amd64 --tag cachette:ci-dryrun .
-          got="$(docker run --rm cachette:ci-dryrun --version)"
-          echo "cachette --version => [$got]"
-          [ "$got" = "cachette 0.1.0" ]
-
   release:
     name: publish release (${{ needs.version.outputs.tag }})
-    needs: [build, checksums, docker, version]
+    needs: [build, checksums, version]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30

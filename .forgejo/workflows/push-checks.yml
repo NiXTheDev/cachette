@@ -1,0 +1,344 @@
+# Push gate for cachette (was ci.yml; the pull_request twin is pr-checks.yml):
+# parallel static checks that must ALL pass before any test runs. The tag path
+# (cross-build -> checksums -> release) lives in release.yml.
+
+# The static checks run as independent, PARALLEL jobs so a deliberately broken
+# fmt / typecheck / clippy turns its own gate red on its own:
+#
+#   fmt      - rustfmt --all -- --check
+#   check    - cargo check --workspace --all-targets (typecheck)
+#   clippy   - cargo clippy --workspace --all-targets -- -D warnings
+#
+# Every downstream job `needs:` all three, so a failure in any static check
+# short-circuits the pipeline before any (expensive) test work starts:
+#
+#   test     - the ENTIRE test suite in a single job/step: unit + integration
+#              + the v1/v2 real clients (@actions/cache toolkit + vendored
+#              go-actions-cache CacheService) + the multi-node cluster suites
+#              (placement, relay, fan-out, drain, mTLS). `cargo test --workspace`
+#              already covers every suite exactly once. node/npm/go MUST be
+#              present; a missing toolchain FAILS the job - it never silently
+#              skips (plan tasks 22/27). The process-level 3-node harness (plan
+#              task 33) is GATED on the v2.0 cluster listener and is not present
+#              yet; the in-process suites are its current stand-in.
+#   docs     - the embedded example config resolves (`--print-config`) and
+#              compose.yaml parses (`docker compose config`).
+#
+# docker     - the image path lives HERE (regexYbot-shaped split: the forge
+#              registry publish belongs to branch pushes, not to the release
+#              job). On a push to `release` it builds and pushes the multi-arch
+#              (linux/amd64,linux/arm64) image with the bare-semver tag scheme
+#              (latest, release, 0.1.0, and the parent truncations 0.1 / 0) read
+#              from Cargo.toml. On every other branch it is a validation-only
+#              amd64 build that leaves the runner. Both legs share a buildkit
+#              layer cache served by cachette (docker buildx `type=gha` -> the
+#              acc.nixthedev.ru cache; `CACHETTE_BUILDX_JWT` is the static
+#              bearer token, minted per docs/clients.md; if the secret is not
+#              set yet the build still passes - cache writes are
+#              ignore-error=true and cache reads just miss).
+#
+# NOTE (Forgejo): a `permissions:` key is NOT supported - the instance logs
+# "Job ... has a permissions field, which is not supported in Forgejo and will
+# be ignored. Use Authorized Integrations ...". Capabilities come from the
+# forge's Authorized Integrations, so none is declared here.
+#
+# NOTE (timeouts): the budgets below are deliberately GENEROUS. `static.rust-lang.org`
+# is very slow from these runners (~65 KB/s), so a cold `rustup toolchain install`
+# alone can eat 20-25 min. A job killed mid-install never runs `Swatinem/rust-cache`'s
+# post step, so nothing is cached and every retry starts cold again. The wide
+# budgets let one cold run finish and seed the cache, after which reruns are quick.
+# Tighten only once the toolchain install is known to be fast.
+name: Push Checks
+
+on:
+  push:
+    # Every branch; tags are deliberately excluded (release.yml owns tag pushes,
+    # and a tag push must not re-run the whole CI suite).
+    branches: ["**"]
+
+# Cancel superseded runs on the same branch (cheap, keeps the queue short).
+# Distinct group names keep push runs and pr-checks runs from cancelling
+# each other, which a single ci.yml used to cause.
+concurrency:
+  group: push-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust (rustfmt)
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+  check:
+    name: check (typecheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust (clippy)
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      - name: clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (all suites)
+    needs: [fmt, check, clippy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+      # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
+      # vendored go-actions-cache client. Both are REQUIRED (the real-client
+      # tests fail, not skip, when a toolchain is missing).
+      - name: Install Node.js (for the @actions/cache toolkit fixture)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Go (for the go-actions-cache fixture)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
+      # must never degenerate into a silent skip (plan tasks 22/27).
+      - name: Assert real-client toolchains are present (fail, never skip)
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          go version
+      # EVERY suite the workspace has runs here, in this single step: unit +
+      # integration + v1/v2 real clients + the multi-node cluster suites.
+      # `--workspace` already includes them all, so each test runs exactly once.
+      - name: cargo test (entire workspace)
+        run: cargo test --workspace --locked
+
+  docs:
+    name: docs (example config + compose)
+    needs: [fmt, check, clippy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry/build
+        uses: https://github.com/Swatinem/rust-cache@v2
+      # The embedded example must resolve end to end (env + file + derived
+      # defaults validated); --print-config masks secrets and exits non-zero on
+      # any invalid key.
+      - name: Validate the embedded example config (--print-config)
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet -- --config cachette.example.toml --print-config > /dev/null
+          echo "OK: cachette.example.toml resolves"
+      # Debian 13 (trixie) ships the Docker CLI in its own `docker-cli` package
+      # (`docker.io` only provides dockerd now) and compose v2 as the standalone
+      # `docker-compose`; the `node:24-trixie` job image carries neither, while
+      # GitHub's `ubuntu-latest` had both. The Debian package already drops its
+      # binary into docker's cli-plugins dir, so no symlink is needed - and one
+      # is actively harmful, since `ln -sf` onto the same file fails under `set -e`.
+      #
+      # deb.debian.org (Fastly) is intermittently unreachable from some runners:
+      # apt-get update fails every index fetch ("Connection failed
+      # [IP: 151.101.x.x 80]") - either dying outright or exiting 0 with only
+      # warnings - and the subsequent install then reports "E: Unable to locate
+      # package docker-cli". So update + install are retried as one unit,
+      # mirroring the release pipeline's registry-push retries.
+      - name: Install docker CLI + compose (retry)
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "== apt attempt $attempt =="
+            if apt-get update && apt-get install -y --no-install-recommends docker-cli docker-compose; then
+              docker --version
+              docker compose version
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
+      - name: Validate compose.yaml
+        run: |
+          set -euo pipefail
+          docker compose -f compose.yaml config > /dev/null
+          echo "OK: compose.yaml parses"
+
+  # ---------------------------------------------------------------------------
+  # THE docker job. This is the only place cachette's OCI image is ever built -
+  # regexYbot-shaped: pushed on the release branch, validated elsewhere.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: docker (publish on release push, validate otherwise)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      # buildkit layer cache <-> cachette (the same server this workflow tests
+      # against). TOKEN: the static bearer `CACHETTE_BUILDX_JWT`, a locally
+      # minted JWT-shaped token (go-actions-cache parses claims ac/exp/nbf
+      # locally; the signature itself is not required by the auth model -
+      # cachette string-matches [auth] tokens). `ignore-error=true` means a
+      # cache outage can never turn an otherwise-green build red.
+      CACHE_ARGS: >-
+        --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
+        --cache-to type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
+    steps:
+      - name: Checkout
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
+
+      # Docker CLI as a STATIC binary (the recipe regexYbot's proven on these
+      # exact runners) - avoids apt and deb.debian.org entirely. Only the
+      # client is needed: buildx (set up just below) runs buildkit in its own
+      # container; no dockerd is involved in this job.
+      - name: Install docker CLI (static tarball, retried)
+        run: |
+          set -euo pipefail
+          url="https://download.docker.com/linux/static/stable/$(uname -m)/docker-28.0.4.tgz"
+          for attempt in 1 2 3; do
+            echo "== docker download attempt $attempt =="
+            if curl -fsSL "$url" | tar xz -C /usr/local/bin --strip-components=1 docker/docker; then
+              docker --version
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not install the docker CLI after 3 attempts"
+          exit 1
+
+      - name: Set up QEMU (arm64 builder stage emulation)
+        uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
+
+      - name: Log in to the forge registry (release pushes only)
+        if: github.ref == 'refs/heads/release'
+        uses: https://hangar.nixthedev.ru/docker/login-action@v3
+        with:
+          registry: hangar.nixthedev.ru
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags follow the proven regexYbot scheme: mutable aliases + the bare
+      # Cargo.toml version (NO `v` prefix) + parent truncation (0.1.0 -> 0.1 -> 0).
+      # Non-release refs get a single throwaway local tag and never push.
+      - name: Compute image ref + docker tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          image="hangar.nixthedev.ru/${owner}/cachette"
+          v="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/[^"]*"([^"]*)".*/\1/')"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF}" = "refs/heads/release" ]; then
+            suffixes="latest release ${v}"
+            cur="${v}"
+            while :; do
+              prev="${cur}"
+              cur="$(printf '%s' "${cur}" | sed 's/\.[^.]*$//')"
+              if [ -z "${cur}" ] || [ "${cur}" = "${prev}" ]; then break; fi
+              suffixes="${suffixes} ${cur}"
+            done
+            flags=""
+            for s in ${suffixes}; do flags="${flags} --tag ${image}:${s}"; done
+          else
+            flags="--tag cachette:ci-dryrun"
+          fi
+          echo "TAGFLAGS=${flags# }" >> "$GITHUB_ENV"
+          echo "TAGFLAGS=${flags# }" >> "$GITHUB_OUTPUT"
+
+      # THE multi-arch push (linux/amd64 + linux/arm64), release-branch pushes
+      # only. Retried so a transient registry/network blip does NOT fail an
+      # otherwise-green build.
+      - name: Build + push multi-arch manifest
+        if: github.ref == 'refs/heads/release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.tags.outputs.image }}"
+          for attempt in 1 2 3 4; do
+            echo "== buildx push attempt $attempt =="
+            if docker buildx build \
+                 --platform linux/amd64,linux/arm64 \
+                 ${TAGFLAGS} \
+                 ${CACHE_ARGS} \
+                 --push \
+                 .; then
+              echo "OK: pushed ${image} (tags for Cargo.toml v${{ steps.tags.outputs.version }})"
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::multi-arch push failed after 4 attempts"
+          exit 1
+
+      # Acceptance: the pushed bare-version tag must be a manifest list
+      # covering BOTH architectures.
+      - name: Verify manifest lists amd64 AND arm64
+        if: github.ref == 'refs/heads/release'
+        run: |
+          set -euo pipefail
+          ref="${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}"
+          manifest="$(docker manifest inspect "$ref")"
+          echo "$manifest"
+          echo "$manifest" | grep -q '"architecture": "amd64"'
+          echo "$manifest" | grep -q '"architecture": "arm64"'
+          echo "OK: $ref is a manifest list with amd64 + arm64"
+
+      # Non-release refs: validation build only (amd64, --load, nothing leaves
+      # the runner); the built binary must RUN and print the exact version.
+      - name: Validation build (amd64 --load)
+        if: github.ref != 'refs/heads/release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --load --platform linux/amd64 ${TAGFLAGS} ${CACHE_ARGS} .
+          got="$(docker run --rm cachette:ci-dryrun --version)"
+          echo "cachette --version => [$got]"
+          [ "$got" = "cachette 0.1.0" ]

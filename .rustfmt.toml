@@ -1,5 +1,5 @@
 # rustfmt configuration — cachette
-# Enforced by CI: `cargo fmt --check` (see .forgejo/workflows/ci.yml).
+# Enforced by CI: `cargo fmt --check` (see .forgejo/workflows/push-checks.yml).
 
 max_width = 100
 
