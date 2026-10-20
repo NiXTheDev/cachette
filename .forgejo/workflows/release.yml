@@ -331,12 +331,24 @@ jobs:
       # docker/* actions below - they shell out to `docker` (as do `docker
       # buildx`/`docker manifest` further down), which GitHub's ubuntu-latest had
       # preinstalled but node:24-trixie does not.
-      - name: Install docker CLI
+      # deb.debian.org (Fastly) is intermittently unreachable from some runners
+      # (the CI docs job hit "Connection failed [IP: 151.101.x.x 80]" on every
+      # index fetch), so update + install are retried as one unit, matching the
+      # approach used there and for the registry pushes below.
+      - name: Install docker CLI (retry)
         run: |
           set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends docker-cli
-          docker --version
+          for attempt in 1 2 3; do
+            echo "== apt attempt $attempt =="
+            if apt-get update && apt-get install -y --no-install-recommends docker-cli; then
+              docker --version
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
 
       - name: Set up QEMU (arm64 builder stage emulation)
         uses: docker/setup-qemu-action@v3

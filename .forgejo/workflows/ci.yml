@@ -159,13 +159,28 @@ jobs:
       # GitHub's `ubuntu-latest` had both. The Debian package already drops its
       # binary into docker's cli-plugins dir, so no symlink is needed - and one
       # is actively harmful, since `ln -sf` onto the same file fails under `set -e`.
-      - name: Install docker CLI + compose
+      #
+      # deb.debian.org (Fastly) is intermittently unreachable from some runners:
+      # apt-get update fails every index fetch ("Connection failed
+      # [IP: 151.101.x.x 80]") - either dying outright or exiting 0 with only
+      # warnings - and the subsequent install then reports "E: Unable to locate
+      # package docker-cli". So update + install are retried as one unit,
+      # mirroring the release pipeline's registry-push retries.
+      - name: Install docker CLI + compose (retry)
         run: |
           set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends docker-cli docker-compose
-          docker --version
-          docker compose version
+          for attempt in 1 2 3; do
+            echo "== apt attempt $attempt =="
+            if apt-get update && apt-get install -y --no-install-recommends docker-cli docker-compose; then
+              docker --version
+              docker compose version
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::apt install failed after 3 attempts"
+          exit 1
       - name: Validate compose.yaml
         run: |
           set -euo pipefail
