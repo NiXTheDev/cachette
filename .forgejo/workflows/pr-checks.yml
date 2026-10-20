@@ -10,7 +10,7 @@
 # bearer, minted per docs/clients.md; unset secret = cache misses, still green).
 #
 # See push-checks.yml for the per-job notes (rust-cache, real-client toolchain
-# requirements, apt retry on deb.debian.org, tag scheme).
+# requirements, the static docker-compose install, tag scheme).
 name: PR Checks
 
 on:
@@ -119,25 +119,29 @@ jobs:
           set -euo pipefail
           cargo run --locked --quiet -- --config cachette.example.toml --print-config > /dev/null
           echo "OK: cachette.example.toml resolves"
-      - name: Install docker CLI + compose (retry)
+      # Same reasoning as push-checks.yml: `docker-compose config` is file-only
+      # validation, so this job fetches the pinned docker/compose standalone
+      # release binary and avoids apt / deb.debian.org entirely (the mirror was
+      # the flake that failed this job on #31 attempt 1).
+      - name: Install docker-compose (standalone release binary, retried)
         run: |
           set -euo pipefail
+          url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
           for attempt in 1 2 3; do
-            echo "== apt attempt $attempt =="
-            if apt-get update && apt-get install -y --no-install-recommends docker-cli docker-compose; then
-              docker --version
-              docker compose version
+            echo "== docker-compose download attempt $attempt =="
+            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose; then
+              docker-compose --version
               exit 0
             fi
-            echo "apt attempt $attempt failed; retrying"
+            echo "attempt $attempt failed; retrying"
             sleep $((attempt * 5))
           done
-          echo "::error::apt install failed after 3 attempts"
+          echo "::error::could not install docker-compose after 3 attempts"
           exit 1
       - name: Validate compose.yaml
         run: |
           set -euo pipefail
-          docker compose -f compose.yaml config > /dev/null
+          docker-compose -f compose.yaml config > /dev/null
           echo "OK: compose.yaml parses"
 
   # ---------------------------------------------------------------------------

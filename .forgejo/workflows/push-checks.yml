@@ -22,7 +22,7 @@
 #              task 33) is GATED on the v2.0 cluster listener and is not present
 #              yet; the in-process suites are its current stand-in.
 #   docs     - the embedded example config resolves (`--print-config`) and
-#              compose.yaml parses (`docker compose config`).
+#              compose.yaml parses (`docker-compose config`).
 #
 # docker     - the image path lives HERE (regexYbot-shaped split: the forge
 #              registry publish belongs to branch pushes, not to the release
@@ -170,38 +170,34 @@ jobs:
           set -euo pipefail
           cargo run --locked --quiet -- --config cachette.example.toml --print-config > /dev/null
           echo "OK: cachette.example.toml resolves"
-      # Debian 13 (trixie) ships the Docker CLI in its own `docker-cli` package
-      # (`docker.io` only provides dockerd now) and compose v2 as the standalone
-      # `docker-compose`; the `node:24-trixie` job image carries neither, while
-      # GitHub's `ubuntu-latest` had both. The Debian package already drops its
-      # binary into docker's cli-plugins dir, so no symlink is needed - and one
-      # is actively harmful, since `ln -sf` onto the same file fails under `set -e`.
-      #
-      # deb.debian.org (Fastly) is intermittently unreachable from some runners:
-      # apt-get update fails every index fetch ("Connection failed
-      # [IP: 151.101.x.x 80]") - either dying outright or exiting 0 with only
-      # warnings - and the subsequent install then reports "E: Unable to locate
-      # package docker-cli". So update + install are retried as one unit,
-      # mirroring the release pipeline's registry-push retries.
-      - name: Install docker CLI + compose (retry)
+      # This job needs none of the docker machinery: `docker-compose config`
+      # is a pure file validation (parse + interpolate + schema), so the docs
+      # job downloads the pinned docker/compose standalone release binary and
+      # touches neither apt nor deb.debian.org. That path was the flake source:
+      # pr-checks #31 lost three update+install retries in a row (index fetches
+      # dying or warning out to exit 0, install then reporting "E: Unable to
+      # locate package docker-cli") while the identical block ran green in
+      # push-checks minutes later. The mirror is the hazard - drop it, don't
+      # retry it.
+      - name: Install docker-compose (standalone release binary, retried)
         run: |
           set -euo pipefail
+          url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
           for attempt in 1 2 3; do
-            echo "== apt attempt $attempt =="
-            if apt-get update && apt-get install -y --no-install-recommends docker-cli docker-compose; then
-              docker --version
-              docker compose version
+            echo "== docker-compose download attempt $attempt =="
+            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose; then
+              docker-compose --version
               exit 0
             fi
-            echo "apt attempt $attempt failed; retrying"
+            echo "attempt $attempt failed; retrying"
             sleep $((attempt * 5))
           done
-          echo "::error::apt install failed after 3 attempts"
+          echo "::error::could not install docker-compose after 3 attempts"
           exit 1
       - name: Validate compose.yaml
         run: |
           set -euo pipefail
-          docker compose -f compose.yaml config > /dev/null
+          docker-compose -f compose.yaml config > /dev/null
           echo "OK: compose.yaml parses"
 
   # ---------------------------------------------------------------------------
