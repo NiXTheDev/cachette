@@ -240,7 +240,7 @@ jobs:
             echo "file(1) not on this runner - PE machine asserted in the next step"
           fi
 
-      - name: Smoke - cross windows artifact (PE machine == ARM64)
+      - name: Smoke - cross windows artifact (PE machine)
         if: matrix.smoke == 'cross-windows'
         shell: pwsh
         run: |
@@ -251,8 +251,13 @@ jobs:
           $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
           Write-Host ("PE header @ 0x{0:X}; signature 0x{1:X8}; machine 0x{2:X4}" -f $peOff, $peSig, $machine)
           if ($peSig -ne 0x00004550) { throw "not a PE file" }
-          if ($machine -ne 0xAA64) { throw ("expected ARM64 machine 0xAA64, got 0x{0:X4}" -f $machine) }
-          Write-Host "OK: PE machine 0xAA64 = ARM64 (aarch64-pc-windows-msvc)"
+          if ("${{ matrix.target }}" -match "aarch64") {
+            if ($machine -ne 0xAA64) { throw ("expected ARM64 machine 0xAA64, got 0x{0:X4}" -f $machine) }
+            Write-Host "OK: PE machine 0xAA64 = ARM64"
+          } else {
+            if ($machine -ne 0x8664) { throw ("expected x86_64 machine 0x8664, got 0x{0:X4}" -f $machine) }
+            Write-Host "OK: PE machine 0x8664 = x86_64"
+          }
 
       # ---- Stage + upload one uniquely-named binary per target ----
       # The file name is the ARTIFACT name (target-qualified) so the later
