@@ -48,7 +48,8 @@ pub enum Command {
     Gc,
     /// Check config, data dir, SQLite, identity, seeds, and disk headroom.
     Doctor,
-    /// Print a Forgejo artifactcache HMAC token for the configured secret.
+    /// Mint tokens for the configured secret: Forgejo HMAC headers (the
+    /// default) or a buildx `type=gha` bearer JWT (`buildx-jwt`).
     Token {
         /// `mint`.
         #[command(subcommand)]
@@ -81,7 +82,7 @@ pub enum CacheCommand {
     },
     /// Delete entries not accessed within `--older-than` (e.g. 7d, 12h, 30m).
     Prune {
-        /// Age window: integer plus a s/m/h/d/w suffix (e.g. 90s, 12h, 7d).
+        /// Age window: bare seconds or a s/m/h/d/w/y suffix (e.g. 3600, 90s, 12h, 7d).
         #[arg(long, value_name = "dur")]
         older_than: String,
         /// Print what would be deleted without deleting anything.
@@ -93,8 +94,31 @@ pub enum CacheCommand {
 /// `cachette token <action>`.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum TokenCommand {
-    /// Mint an HMAC token; prints the `Forgejo-Cache-*` header values.
+    /// Mint a token. Bare `mint` means `hmac` (the `Forgejo-Cache-*` header
+    /// mint); `buildx-jwt` prints an HS256 bearer JWT for the buildx
+    /// `type=gha` exporter / the @actions/cache toolkit.
     Mint {
+        /// hmac defaults, used when no variant is named: `write` sets a
+        /// non-empty write-isolation key, `read` leaves it empty.
+        #[arg(long, value_enum, default_value = "write")]
+        scope: Scope,
+        /// hmac default repo (used when no variant is named).
+        #[arg(long, default_value = "cachette/ops")]
+        repo: String,
+        /// hmac default run number (used when no variant is named).
+        #[arg(long, default_value = "0")]
+        run: u64,
+        /// `hmac` or `buildx-jwt`; omitted means `hmac` with the flags above.
+        #[command(subcommand)]
+        kind: Option<MintKind>,
+    },
+}
+
+/// Which token kind `token mint` produces.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum MintKind {
+    /// Forgejo artifactcache HMAC; prints the `Forgejo-Cache-*` header values.
+    Hmac {
         /// `write` sets a non-empty write-isolation key, `read` leaves it empty.
         #[arg(long, value_enum, default_value = "write")]
         scope: Scope,
@@ -104,6 +128,17 @@ pub enum TokenCommand {
         /// Workflow run number the token is for.
         #[arg(long, default_value = "0")]
         run: u64,
+    },
+    /// HS256 bearer JWT for buildx `type=gha` and the @actions/cache toolkit
+    /// (`ac`/`exp`/`nbf`, three dot-separated segments). List the printed
+    /// string verbatim in the forge secret `CACHETTE_BUILDX_JWT` and in
+    /// cachette's `[auth] tokens`; see docs/clients.md.
+    BuildxJwt {
+        /// Lifetime of the `exp` claim, counted from now: a bare integer
+        /// counts as seconds (`3600` = 1h), or use `s`/`m`/`h`/`d`/`w`/`y`
+        /// suffixes (`90s`, `12h`, `7d`, `10y`).
+        #[arg(long, value_name = "dur", default_value = "10y")]
+        exp: String,
     },
 }
 
@@ -224,6 +259,7 @@ mod tests {
                     scope: Scope::Write,
                     repo: String::from("cachette/ops"),
                     run: 0,
+                    kind: None,
                 }
             })
         );
@@ -238,6 +274,72 @@ mod tests {
                     scope: Scope::Read,
                     repo: String::from("o/r"),
                     run: 7,
+                    kind: None,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn token_mint_kind_variants_parse() {
+        // Bare mint is hmac with the parent defaults (parent flags are parsed
+        // but unused when a variant is named).
+        let cli = Cli::try_parse_from(["cachette", "token", "mint"]).unwrap();
+        if let Some(Command::Token {
+            action: TokenCommand::Mint { kind, .. },
+        }) = cli.command
+        {
+            assert_eq!(kind, None);
+        } else {
+            panic!("bare mint does not parse: {cli:?}");
+        }
+        // The explicit hmac variant carries its own flags.
+        let cli = Cli::try_parse_from([
+            "cachette", "token", "mint", "hmac", "--scope", "read", "--run", "7",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Token {
+                action: TokenCommand::Mint {
+                    scope: Scope::Write,
+                    repo: String::from("cachette/ops"),
+                    run: 0,
+                    kind: Some(MintKind::Hmac {
+                        scope: Scope::Read,
+                        repo: String::from("cachette/ops"),
+                        run: 7,
+                    }),
+                }
+            })
+        );
+        // buildx-jwt: the default lifetime and a custom one.
+        let cli = Cli::try_parse_from(["cachette", "token", "mint", "buildx-jwt"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Token {
+                action: TokenCommand::Mint {
+                    scope: Scope::Write,
+                    repo: String::from("cachette/ops"),
+                    run: 0,
+                    kind: Some(MintKind::BuildxJwt {
+                        exp: String::from("10y"),
+                    }),
+                }
+            })
+        );
+        let cli = Cli::try_parse_from(["cachette", "token", "mint", "buildx-jwt", "--exp", "90s"])
+            .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Token {
+                action: TokenCommand::Mint {
+                    scope: Scope::Write,
+                    repo: String::from("cachette/ops"),
+                    run: 0,
+                    kind: Some(MintKind::BuildxJwt {
+                        exp: String::from("90s"),
+                    }),
                 }
             })
         );

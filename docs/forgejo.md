@@ -50,6 +50,50 @@ If cachette is behind a reverse proxy that terminates TLS, the runner reaches it
 at the proxy's `https://` URL and `external_url` must be that public URL. See
 [tls.md](tls.md).
 
+## Using cache in workflow steps
+
+With the runner wired as above, workflow files need **no extra setup** for
+caching - the cache proxy is transparent to steps. Two shapes, both taken
+from this repository's own workflows:
+
+**Actions that cache by themselves** (restore at step start, save at job
+end) - use them normally, no cache plumbing:
+
+```yaml
+- uses: actions/setup-go@v5                # caches ~/.cache/go-build + ~/go/pkg/mod
+- uses: actions/setup-node@v4
+  with:
+    cache: "npm"                           # caches ~/.npm; needs a lock file
+    cache-dependency-path: path/to/package-lock.json
+- uses: https://github.com/Swatinem/rust-cache@v2   # cargo registry + target dir
+```
+
+**One explicit step** for paths no setup action covers:
+
+```yaml
+- uses: actions/cache@v6
+  with:
+    path: ~/.cache/mytool
+    key: mytool-${{ runner.os }}-${{ hashFiles('**/lockfile') }}
+    restore-keys: |
+      mytool-${{ runner.os }}-
+```
+
+Key notes from practice:
+
+- Key on content with `hashFiles()` over lockfiles/sources so entries
+  invalidate when inputs change, and list `restore-keys:` prefixes so a
+  changed lockfile still restores (stale but useful).
+- For restored **binaries**, version-pinned static keys beat content hashes:
+  `mytool-1.2.3-${{ runner.os }}-amd64`, and let the install step
+  short-circuit when the pinned version is already present (see the
+  docker-compose and docker CLI steps in `.forgejo/workflows/`).
+- `actions/cache` **v4 and v6 behave identically through this proxy**: on a
+  Forgejo host the toolkit classes itself as GHES and deterministically
+  speaks this v1 protocol (its `ACTIONS_CACHE_SERVICE_V2` flag is ignored
+  on such hosts). v6.1.0 additionally requires the runner to support the
+  `node24` action runtime; v4 runs on `node20`.
+
 ## How the HMAC is checked
 
 The runner signs every v1 request with these headers:

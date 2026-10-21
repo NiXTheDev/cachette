@@ -174,9 +174,19 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
       - name: Install stable Rust (${{ matrix.target }})
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Cache the per-target toolchain + std libs (the slow rustup leg on these
+      # runners); matrix.target keeps the different std libraries apart, and
+      # dtolnay's `cachekey` output pins the exact stable version.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
 
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2

@@ -33,9 +33,12 @@
 #              amd64 build that leaves the runner. Both legs share a buildkit
 #              layer cache served by cachette (docker buildx `type=gha` -> the
 #              acc.nixthedev.ru cache; `CACHETTE_BUILDX_JWT` is the static
-#              bearer token, minted per docs/clients.md; if the secret is not
-#              set yet the build still passes - cache writes are
-#              ignore-error=true and cache reads just miss).
+#              bearer token, minted per docs/clients.md; the value MUST be
+#              JWT-shaped (three dot-separated segments carrying ac/exp/nbf,
+#              with exp years in the future) - a missing, malformed, or
+#              expired token is RED at exporter configure time, BEFORE the
+#              build starts. `ignore-error=true` only covers export
+#              failures during the build, not this config-stage parse).
 #
 # NOTE (Forgejo): a `permissions:` key is NOT supported - the instance logs
 # "Job ... has a permissions field, which is not supported in Forgejo and will
@@ -44,10 +47,10 @@
 #
 # NOTE (timeouts): the budgets below are deliberately GENEROUS. `static.rust-lang.org`
 # is very slow from these runners (~65 KB/s), so a cold `rustup toolchain install`
-# alone can eat 20-25 min. A job killed mid-install never runs `Swatinem/rust-cache`'s
-# post step, so nothing is cached and every retry starts cold again. The wide
-# budgets let one cold run finish and seed the cache, after which reruns are quick.
-# Tighten only once the toolchain install is known to be fast.
+# alone can eat 20-25 min. The rustup toolchains dir is itself cached (keyed on
+# dtolnay's `cachekey` output), so the download happens once per stable version;
+# a cold run still needs the wide budget, and a job killed mid-install seeds
+# nothing. Tighten only once the install is known to be fast.
 name: Push Checks
 
 on:
@@ -75,9 +78,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust (rustfmt)
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: rustfmt --check
@@ -91,7 +103,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: cargo check (all targets)
@@ -105,9 +126,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust (clippy)
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: clippy -D warnings
@@ -122,7 +152,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
@@ -130,10 +169,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          # Built-in restore-at-start/store-at-end of the npm tarballs via the
+          # toolkit; the fixture's `npm ci` then makes no registry fetches.
+          cache: "npm"
+          cache-dependency-path: tests/fixtures/package-lock.json
       - name: Install Go (for the go-actions-cache fixture)
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+      # Both setup steps above cache through the toolkit natively
+      # (restore-at-start / store-at-end): node caches the npm tarballs, go caches
+      # ~/.cache/go-build + ~/go/pkg/mod by default - so the vendored fixture
+      # builds below don't refetch/recompile from zero each run.
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
@@ -159,7 +206,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       # The embedded example must resolve end to end (env + file + derived
@@ -179,9 +235,19 @@ jobs:
       # locate package docker-cli") while the identical block ran green in
       # push-checks minutes later. The mirror is the hazard - drop it, don't
       # retry it.
+      - name: Cache the pinned docker-compose binary (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/bin/docker-compose
+          key: cachette-docker-compose-5.6.0-linux-amd64
       - name: Install docker-compose (standalone release binary, retried)
         run: |
           set -euo pipefail
+          # Cache hit: the pinned binary was restored - skip the download.
+          if docker-compose --version 2>/dev/null | grep -q 'v5.6.0'; then
+            echo "docker-compose already present (cachette hit): $(docker-compose --version)"
+            exit 0
+          fi
           url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
           for attempt in 1 2 3; do
             echo "== docker-compose download attempt $attempt =="
@@ -215,14 +281,22 @@ jobs:
       # against). TOKEN: the static bearer `CACHETTE_BUILDX_JWT`, a locally
       # minted JWT-shaped token (go-actions-cache parses claims ac/exp/nbf
       # locally; the signature itself is not required by the auth model -
-      # cachette string-matches [auth] tokens). `ignore-error=true` means a
-      # cache outage can never turn an otherwise-green build red.
+      # cachette string-matches [auth] tokens). `ignore-error=true` covers
+      # cache outages DURING the build; a missing/malformed/expired token
+      # instead fails exporter CONFIGURATION and the job goes red (seen
+      # live: "invalid number of segments" on a random-bytes token).
       CACHE_ARGS: >-
         --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
         --cache-to type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+
+      - name: Cache the pinned docker CLI (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/bin/docker
+          key: cachette-docker-cli-28.0.4-linux-amd64
 
       # Docker CLI as a STATIC binary (the recipe regexYbot's proven on these
       # exact runners) - avoids apt and deb.debian.org entirely. Only the
@@ -231,6 +305,11 @@ jobs:
       - name: Install docker CLI (static tarball, retried)
         run: |
           set -euo pipefail
+          # Cache hit: the pinned binary was restored - skip the download.
+          if docker --version 2>/dev/null | grep -q '28.0.4'; then
+            echo "docker CLI already present (cachette hit): $(docker --version)"
+            exit 0
+          fi
           url="https://download.docker.com/linux/static/stable/$(uname -m)/docker-28.0.4.tgz"
           for attempt in 1 2 3; do
             echo "== docker download attempt $attempt =="

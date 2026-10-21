@@ -7,7 +7,8 @@
 # leaves the runner); the registry publish lives in push-checks.yml on the
 # `release` branch. Both legs exercise the cachette buildkit layer cache
 # (docker buildx `type=gha` -> acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static
-# bearer, minted per docs/clients.md; unset secret = cache misses, still green).
+# bearer, minted per docs/clients.md; a missing/malformed/expired token is
+# RED at exporter configure time, not a mere cache miss).
 #
 # See push-checks.yml for the per-job notes (rust-cache, real-client toolchain
 # requirements, the static docker-compose install, tag scheme).
@@ -35,9 +36,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust (rustfmt)
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: rustfmt --check
@@ -51,7 +61,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: cargo check (all targets)
@@ -65,9 +84,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust (clippy)
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: clippy -D warnings
@@ -82,15 +110,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Install Node.js (for the @actions/cache toolkit fixture)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          # Built-in restore-at-start/store-at-end of the npm tarballs via the
+          # toolkit; the fixture's `npm ci` then makes no registry fetches.
+          cache: "npm"
+          cache-dependency-path: tests/fixtures/package-lock.json
       - name: Install Go (for the go-actions-cache fixture)
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+      # Both setup steps above cache through the toolkit natively
+      # (restore-at-start / store-at-end): node caches the npm tarballs, go caches
+      # ~/.cache/go-build + ~/go/pkg/mod by default - so the vendored fixture
+      # builds below don't refetch/recompile from zero each run.
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: Assert real-client toolchains are present (fail, never skip)
@@ -111,7 +156,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install stable Rust
+        id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
+      # Restore the rustup toolchains dir (the ~20-25 min download on these
+      # runners); dtolnay's `cachekey` output pins the exact stable version,
+      # so the next stable bump retargets the cache by itself.
+      - name: Cache rustup toolchains (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: Validate the embedded example config (--print-config)
@@ -123,9 +177,19 @@ jobs:
       # validation, so this job fetches the pinned docker/compose standalone
       # release binary and avoids apt / deb.debian.org entirely (the mirror was
       # the flake that failed this job on #31 attempt 1).
+      - name: Cache the pinned docker-compose binary (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/bin/docker-compose
+          key: cachette-docker-compose-5.6.0-linux-amd64
       - name: Install docker-compose (standalone release binary, retried)
         run: |
           set -euo pipefail
+          # Cache hit: the pinned binary was restored - skip the download.
+          if docker-compose --version 2>/dev/null | grep -q 'v5.6.0'; then
+            echo "docker-compose already present (cachette hit): $(docker-compose --version)"
+            exit 0
+          fi
           url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
           for attempt in 1 2 3; do
             echo "== docker-compose download attempt $attempt =="
@@ -164,9 +228,20 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
+      - name: Cache the pinned docker CLI (cachette-backed)
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/bin/docker
+          key: cachette-docker-cli-28.0.4-linux-amd64
+
       - name: Install docker CLI (static tarball, retried)
         run: |
           set -euo pipefail
+          # Cache hit: the pinned binary was restored - skip the download.
+          if docker --version 2>/dev/null | grep -q '28.0.4'; then
+            echo "docker CLI already present (cachette hit): $(docker --version)"
+            exit 0
+          fi
           url="https://download.docker.com/linux/static/stable/$(uname -m)/docker-28.0.4.tgz"
           for attempt in 1 2 3; do
             echo "== docker download attempt $attempt =="

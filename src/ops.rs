@@ -25,7 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::cli::{CacheCommand, ClusterCommand, Command, IdentityCommand, Scope, TokenCommand};
+use crate::cli::{
+    CacheCommand, ClusterCommand, Command, IdentityCommand, MintKind, Scope, TokenCommand,
+};
 use crate::config::{Config, split_host_port};
 use crate::identity::Identity;
 use crate::storage::StorageBackend;
@@ -476,35 +478,73 @@ async fn seed_reachable(seed: &str) -> bool {
     .is_ok_and(|connected| connected.is_ok())
 }
 
-/// `cachette token mint` — print a Forgejo artifactcache HMAC token for the
-/// configured secret (plan task 46).
+/// `cachette token <kind>` — mint tokens for the configured secret (plan
+/// task 46); kind `buildx-jwt` mints the buildx `type=gha` bearer JWT.
 fn token(action: &TokenCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
-    match action {
-        TokenCommand::Mint { scope, repo, run } => {
-            let secret = config
-                .auth
-                .secret
-                .as_deref()
-                .ok_or("auth.secret is not set; nothing to mint with")?;
-            let timestamp = crate::auth::now_secs();
-            // The artifactcache HMAC carries no server-side scope; the only
-            // scope-like field is the verbatim write-isolation key. `write`
-            // mints a non-empty key, `read` leaves it empty.
-            let isolation = match scope {
-                Scope::Read => "",
-                Scope::Write => repo.as_str(),
-            };
-            let mac = crate::auth::hmac::mint(secret, repo, *run, timestamp, isolation);
-            println!("{}: {repo}", crate::auth::hmac::HEADER_REPO);
-            println!("{}: {run}", crate::auth::hmac::HEADER_RUN);
-            println!("{}: {timestamp}", crate::auth::hmac::HEADER_TS);
-            if !isolation.is_empty() {
-                println!("{}: {isolation}", crate::auth::hmac::HEADER_WRITE_ISOLATION);
-            }
-            println!("{}: {mac}", crate::auth::hmac::HEADER_MAC);
-            Ok(0)
+    let TokenCommand::Mint {
+        scope,
+        repo,
+        run,
+        kind,
+    } = action;
+    let secret = config
+        .auth
+        .secret
+        .as_deref()
+        .ok_or("auth.secret is not set; nothing to mint with")?;
+    match kind.as_ref() {
+        Some(MintKind::BuildxJwt { exp }) => {
+            let ttl = parse_duration(exp).map_err(invalid_input)?;
+            let now = crate::auth::now_secs();
+            let jwt = mint_buildx_jwt(secret, ttl, now)?;
+            println!("{jwt}");
+            eprintln!(
+                "# HS256 bearer for buildx type=gha / @actions/cache: ac=\"[]\", exp=now+{ttl}s, nbf=now-5s"
+            );
+            eprintln!("# list this exact string in the forge secret AND in [auth] tokens");
         }
+        Some(MintKind::Hmac { scope, repo, run }) => print_hmac(secret, scope, repo, *run),
+        None => print_hmac(secret, scope, repo, *run),
     }
+    Ok(0)
+}
+
+/// Print the `Forgejo-Cache-*` header values for one HMAC token.
+fn print_hmac(secret: &str, scope: &Scope, repo: &str, run: u64) {
+    let timestamp = crate::auth::now_secs();
+    // The artifactcache HMAC carries no server-side scope; the only
+    // scope-like field is the verbatim write-isolation key. `write`
+    // mints a non-empty key, `read` leaves it empty.
+    let isolation = match scope {
+        Scope::Read => "",
+        Scope::Write => repo,
+    };
+    let mac = crate::auth::hmac::mint(secret, repo, run, timestamp, isolation);
+    println!("{}: {repo}", crate::auth::hmac::HEADER_REPO);
+    println!("{}: {run}", crate::auth::hmac::HEADER_RUN);
+    println!("{}: {timestamp}", crate::auth::hmac::HEADER_TS);
+    if !isolation.is_empty() {
+        println!("{}: {isolation}", crate::auth::hmac::HEADER_WRITE_ISOLATION);
+    }
+    println!("{}: {mac}", crate::auth::hmac::HEADER_MAC);
+}
+
+/// Mint the HS256 bearer JWT that buildx `type=gha` (go-actions-cache) and
+/// the @actions/cache toolkit accept: `ac="[]"`, `exp`/`nbf` from now, three
+/// dot-separated base64url segments. The server string-matches the token
+/// against `[auth] tokens`; signing with `[auth].secret` additionally makes
+/// the string a valid cachette Twirp JWT (see docs/clients.md). The client
+/// enforces `exp` locally (`cache token expired at ...`), which is why the
+/// caller controls the TTL instead of hard-coding a short one. Self-checked
+/// against our own validator before printing.
+fn mint_buildx_jwt(secret: &str, ttl_seconds: u64, now_unix: i64) -> Result<String, io::Error> {
+    let token = crate::auth::jwt::mint(secret, "[]", ttl_seconds, now_unix);
+    if let Err(err) = crate::auth::jwt::validate(&token, secret, now_unix) {
+        return Err(invalid_input(format!(
+            "internal: minted JWT fails self-check: {err}"
+        )));
+    }
+    Ok(token)
 }
 
 /// `cachette cluster status [--watch]` — fetch the live member table from the
@@ -673,6 +713,10 @@ fn print_member_table(body: &str) {
 /// integer is rejected so the unit is never ambiguous.
 fn parse_duration(raw: &str) -> Result<u64, String> {
     let raw = raw.trim();
+    // A bare integer counts as seconds (e.g. `3600` for one hour).
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        return raw.parse().map_err(|_| format!("invalid duration {raw:?}"));
+    }
     let (digits, unit) = raw.split_at(raw.len().checked_sub(1).ok_or("empty duration")?);
     let multiplier: u64 = match unit {
         "s" => 1,
@@ -680,7 +724,8 @@ fn parse_duration(raw: &str) -> Result<u64, String> {
         "h" => 60 * 60,
         "d" => 24 * 60 * 60,
         "w" => 7 * 24 * 60 * 60,
-        _ => return Err(format!("unknown unit in {raw:?} (use s/m/h/d/w)")),
+        "y" => 365 * 24 * 60 * 60,
+        _ => return Err(format!("unknown unit in {raw:?} (use s/m/h/d/w/y)")),
     };
     let value: u64 = digits
         .trim()
@@ -711,10 +756,34 @@ mod tests {
         assert_eq!(parse_duration("12h"), Ok(43_200));
         assert_eq!(parse_duration("7d"), Ok(604_800));
         assert_eq!(parse_duration("1w"), Ok(604_800));
-        assert!(parse_duration("7").is_err());
+        assert_eq!(parse_duration("10y"), Ok(10 * 365 * 24 * 60 * 60));
+        assert_eq!(
+            parse_duration("3600"),
+            Ok(3600),
+            "bare integers are seconds"
+        );
+        assert!(
+            parse_duration("99999999999999999999").is_err(),
+            "bare overflow"
+        );
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("").is_err());
-        assert!(parse_duration("7y").is_err());
+        assert!(parse_duration("7q").is_err());
+    }
+
+    #[test]
+    fn buildx_jwt_mint_shape_claims_and_selfcheck() {
+        const SECRET: &str = "mint-test-secret-0123456789abcdef";
+        const NOW: i64 = 1_700_000_000;
+        let token = mint_buildx_jwt(SECRET, 7 * 24 * 60 * 60, NOW).expect("mints and self-checks");
+        assert_eq!(token.matches('.').count(), 2, "three segments: {token}");
+        let claims = crate::auth::jwt::validate(&token, SECRET, NOW).expect("self-validates");
+        assert_eq!(
+            claims.ac, "[]",
+            "the scope string the vendored client parses into an empty scope list"
+        );
+        assert_eq!(claims.exp, NOW + 7 * 86_400);
+        assert_eq!(claims.nbf, NOW - 5);
     }
 
     #[test]
