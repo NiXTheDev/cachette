@@ -19,6 +19,7 @@ pub(crate) fn split_host_port(raw: &str) -> Option<(&str, u16)> {
 
 pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     validate_listen(&config.server.listen)?;
+    validate_listen(&config.cluster.listen)?;
     validate_tls_pair(config)?;
     if config.storage.fs.path.as_os_str().is_empty() {
         return Err(ConfigError::EmptyStoragePath);

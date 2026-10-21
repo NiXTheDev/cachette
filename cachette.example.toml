@@ -17,7 +17,9 @@ listen = "0.0.0.0:8080"
 # Optional external URL advertised to clients (e.g. https://cache.example.com)
 # external_url = "https://cache.example.com"
 
-# TLS certificate and key paths (must be configured together if used)
+# TLS certificate and key paths. Set BOTH to terminate TLS on the main
+# listener; with both unset (the default) the listener is plain HTTP and the
+# edge terminates TLS. The cluster port always serves the self-signed identity.
 # tls_cert = "/etc/cachette/tls.crt"
 # tls_key  = "/etc/cachette/tls.key"
 
@@ -92,11 +94,15 @@ jwt_ttl_seconds = 300
 # Enable peer-to-peer clustering (standalone if false)
 enabled = false
 
+# Dedicated mTLS listener for peer traffic (host:port). Only bound when
+# `enabled = true`; always TLS with the self-signed node identity cert.
+listen = "0.0.0.0:8081"
+
 # Node ID (optional; generated if unset)
 # node_id = "cache-a"
 
-# Advertise address (host:port). Defaults to server.listen if unset
-# advertise_addr = "cache-a:8080"
+# Advertise address (host:port). Defaults to cluster.listen if unset
+# advertise_addr = "cache-a:8081"
 
 # Enable mDNS discovery
 mdns = true

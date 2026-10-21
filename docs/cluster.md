@@ -33,9 +33,10 @@ secret = "a-shared-16-plus-char-secret"
 [cluster]
 enabled = true
 node_id = "cache-a"
-advertise_addr = "cache-a.internal:8080"
+listen = "0.0.0.0:8081"
+advertise_addr = "cache-a.internal:8081"
 mdns = false
-seeds = ["cache-b.internal:8080", "cache-c.internal:8080"]
+seeds = ["cache-b.internal:8081", "cache-c.internal:8081"]
 seed_fingerprints = {
   "cache-b" = "AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11AA11",
   "cache-c" = "BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22BB22",
@@ -86,7 +87,8 @@ re-seeding every peer's `cluster.seed_fingerprints`. That is out of scope for
 ## Seeds
 
 `cluster.seeds` is a list of `host:port` addresses. A missing port defaults to
-the port in `server.listen`. Seeds are only addressing hints: a seed becomes a
+the port in `cluster.listen` (the dedicated peer listener; default `0.0.0.0:8081`).
+Seeds are only addressing hints: a seed becomes a
 full peer once discovery (mDNS or a peer hello) supplies its identity, so a
 pinned fingerprint is what actually establishes trust.
 
@@ -179,8 +181,9 @@ certificate. Node startup and heartbeat activity are also visible in the logs.
 
 ## Inter-node transport
 
-The inter-node leg is mutual TLS with pinned fingerprints; it is a separate
-layer from the runner-facing edge, which you should terminate with a CA-trusted
-certificate. Both layers are described in [tls.md](tls.md).
+The inter-node leg has its own dedicated listener (`[cluster] listen`): mutual
+TLS with pinned fingerprints, always on when clustering is enabled. It is a
+separate layer from the runner-facing edge, which you can serve plaintext behind
+a proxy or terminate TLS on. Both layers are described in [tls.md](tls.md).
 </content>
 </invoke>

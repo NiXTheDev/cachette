@@ -10,8 +10,10 @@ use serde::Serialize;
 
 use crate::config::min_free::MinFree;
 
-/// `[server]` - the one listener both runners and peers enter through.
-#[derive(Debug, Deserialize, Serialize)]
+/// `[server]` - the main listener runners and clients enter through. It is
+/// plaintext HTTP unless `tls_cert`/`tls_key` are both set; peers have their
+/// own dedicated `[cluster] listen` port.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
@@ -199,7 +201,11 @@ impl Default for V2Config {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub node_id: Option<String>,
-    /// Defaults to `server.listen` (m5).
+    /// Dedicated mTLS listener for peer traffic (always on when `enabled`).
+    /// Serves the self-signed node identity certificate; peer trust is by
+    /// SPKI fingerprint pin, not a CA chain.
+    pub listen: String,
+    /// Defaults to `cluster.listen` (m5).
     pub advertise_addr: Option<String>,
     pub mdns: bool,
     pub seeds: Vec<String>,
@@ -216,6 +222,7 @@ impl Default for ClusterConfig {
         Self {
             enabled: false,
             node_id: None,
+            listen: String::from("0.0.0.0:8081"),
             advertise_addr: None,
             mdns: true,
             seeds: Vec::new(),

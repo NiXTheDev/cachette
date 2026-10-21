@@ -1,6 +1,6 @@
 # Clients and protocols
 
-cachette serves both cache protocols on the same TLS port:
+cachette serves both cache protocols on the same HTTP port:
 
 - **v1 artifactcache** (`/_apis/artifactcache/*`) - the legacy REST API used by
   the `@actions/cache` toolkit and `go-actions-cache`. See

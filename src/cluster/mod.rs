@@ -309,6 +309,10 @@ impl ClusterRuntime {
 /// `cluster.mdns`) advertise this node and browse for peers. mDNS failure is
 /// never fatal — a VPS has no link-local peers, so the node boots with the
 /// seed set alone (m10).
+///
+/// `listen` is the cluster listener's address (`[cluster] listen`): bare
+/// seeds adopt its port, and mDNS advertises it when no
+/// `[cluster] advertise_addr` overrides that.
 #[must_use]
 pub fn start(cluster: &ClusterConfig, identity: &Identity, listen: &str) -> ClusterRuntime {
     let peer_table = std::sync::Arc::new(PeerTable::new());

@@ -184,7 +184,7 @@ fn resolve(mut config: Config) -> Config {
         config.server.external_url = default_external_url(&config.server.listen);
     }
     if config.cluster.advertise_addr.is_none() {
-        config.cluster.advertise_addr = Some(config.server.listen.clone());
+        config.cluster.advertise_addr = Some(config.cluster.listen.clone());
     }
     if config.cluster.cert_path.is_none() {
         config.cluster.cert_path = Some(config.storage.fs.path.join("identity"));
@@ -267,8 +267,13 @@ mod tests {
         assert_eq!(config.storage.fs.min_free, MinFree::Fraction(0.2));
         assert_eq!(config.storage.fs.path, PathBuf::from("/var/lib/cachette"));
         assert_eq!(
+            config.cluster.listen, "0.0.0.0:8081",
+            "cluster listener keeps its own default; server.listen does not bleed over"
+        );
+        assert_eq!(
             config.cluster.advertise_addr.as_deref(),
-            Some("127.0.0.1:9999")
+            Some("0.0.0.0:8081"),
+            "advertise defaults to the cluster listener address"
         );
         assert_eq!(
             config.cluster.cert_path.as_deref(),

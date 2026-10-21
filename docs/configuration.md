@@ -28,13 +28,14 @@ Closed sets (enums) are validated at parse time; structural rules (below) at
 |---|---|---|---|
 | `listen` | string | `"0.0.0.0:8080"` | `host:port`; IPv6 literals bracketed, e.g. `[::1]:8080`. |
 | `external_url` | string | derived | Absolute base URL advertised to clients. When unset it is derived from `listen` as `http://<host>:<port>`, with a wildcard host mapped to loopback (`0.0.0.0` -> `127.0.0.1`, `::` -> `[::1]`). Set it explicitly to your public `https://...` when a reverse proxy terminates TLS, so the v1 `archiveLocation` and v2 capability URLs are absolute and correct. |
-| `tls_cert` | path | unset | PEM certificate. Must be set together with `tls_key`. |
+| `tls_cert` | path | unset | PEM certificate. Must be set together with `tls_key`. When both are set the main listener terminates TLS with this pair; when both are unset the listener is plaintext HTTP and the edge terminates TLS. |
 | `tls_key` | path | unset | PEM private key. Must be set together with `tls_cert`. |
 | `max_chunk_bytes` | integer | `67108864` (64 MiB) | Largest single upload chunk (v1 `PATCH`) or Azure block (v2) accepted. The request path streams uploads, so this bounds one in-flight request rather than the process; a body over the cap is rejected with 400. Must be at least as large as the biggest chunk your client sends (the go-actions-cache client uses 32 MiB). |
 | `drain_grace_seconds` | integer | `30` | Graceful-shutdown drain window. On SIGTERM/SIGINT the node advertises `draining` (heartbeat + `/readyz`), refuses new uploads with `503` + `Retry-After`, keeps serving in-flight requests, and exits after at most this many seconds. |
 
-When `tls_cert`/`tls_key` are unset, the server uses the node identity
-certificate minted on first boot (see [cluster.md](cluster.md)).
+The node identity certificate (minted on first boot, see
+[cluster.md](cluster.md)) is served by the dedicated cluster port only — never
+on the main listener.
 
 ### `[storage]` and `[storage.fs]`
 
@@ -80,10 +81,11 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Off means a standalone node. |
+| `listen` | `host:port` | `"0.0.0.0:8081"` | Dedicated peer listener, bound only when `enabled = true`. Always TLS with the self-signed node identity; peer trust is a fingerprint pin. |
 | `node_id` | string | unset | Human label for the node; falls back to the identity fingerprint. |
-| `advertise_addr` | `host:port` | `server.listen` | Address peers dial for this node. |
+| `advertise_addr` | `host:port` | `cluster.listen` | Address peers dial for this node (the cluster listener). |
 | `mdns` | boolean | `true` | Advertise and browse `_cachette._tcp.local.` on the local link. |
-| `seeds` | list of `host[:port]` | `[]` | Peers to contact directly. A missing port defaults to the `server.listen` port. |
+| `seeds` | list of `host[:port]` | `[]` | Peers to contact directly. A missing port defaults to the `cluster.listen` port. |
 | `seed_fingerprints` | map `node_id -> hex` | `{}` | Pinned peer certificate fingerprints. |
 | `tiebreak` | `random` / `roundrobin` / `progressive` | `random` | How to break ties between equally least-loaded nodes. |
 | `cert_path` | path | `<storage.fs.path>/identity` | Identity directory. Must not equal `storage.fs.path`. |
@@ -138,6 +140,7 @@ export CACHETTE__LOG__LEVEL="info"
 - `auth.secret` must be set and at least 16 characters before the server will
   serve. `--print-config` bypasses this check.
 - `server.listen` must parse as `host:port` (IPv6 literals bracketed).
+- `cluster.listen` must parse as `host:port` (IPv6 literals bracketed).
 - `server.tls_cert` and `server.tls_key` must be set together.
 - `storage.fs.path` must not be empty.
 - `cache.reservation_ttl_seconds` must be greater than `0`.

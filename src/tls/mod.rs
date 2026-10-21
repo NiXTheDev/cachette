@@ -1,10 +1,16 @@
-//! Single TLS listener for the whole server (plan task 14 / B1 + B2).
+//! Listener plumbing for the two ports (plan task 14 / B1 + B2, revised).
 //!
-//! Cachette terminates TLS on exactly one listener. The listener serves every
-//! route over HTTPS, but client authentication is *optional* at the TLS layer:
-//! it offers a certificate and accepts whatever is presented (or nothing).
-//! Which peers are trusted is enforced per-route by [`PeerPins`], not by the
-//! TLS handshake — see [`crate::routes`] and [`crate::routes::router`].
+//! Cachette serves TWO listeners. The MAIN listener (`[server] listen`) is
+//! plaintext HTTP by default and terminates TLS only when the
+//! `[server] tls_cert`/`tls_key` pair is configured. The CLUSTER listener
+//! (`[cluster] listen`, only when `[cluster] enabled`) always terminates TLS
+//! with the self-signed node identity certificate. On both, client
+//! authentication is *optional* at the TLS layer: the handshake offers a
+//! client certificate and accepts whatever is presented (or nothing). Which
+//! peers are trusted is enforced per-route by [`PeerPins`], not by the TLS
+//! handshake — see [`crate::routes`] and [`crate::routes::router`]. A
+//! plaintext connection therefore carries no client fingerprint, and the pin
+//! middleware rejects it — the peer routes fail closed without TLS.
 //!
 //! A connection's peer certificate is surfaced as [`PeerCert`], an axum
 //! `Connected` value carrying the SPKI-SHA256 fingerprint. The pin middleware
@@ -111,6 +117,124 @@ pub async fn bind(addr: &str, config: RustlsServerConfig) -> Result<TlsListener,
         listener,
         acceptor: TlsAcceptor::from(Arc::new(config)),
     })
+}
+
+/// An accepted connection: plain TCP, or a completed TLS handshake.
+#[derive(Debug)]
+pub enum AcceptedStream {
+    /// Plaintext TCP stream (no TLS termination on this listener).
+    Plain(TcpStream),
+    /// TLS stream accepted by [`TlsListener`]. Boxed to keep the enum small
+    /// (the TLS state machine is over 1 KB).
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for AcceptedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for AcceptedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
+/// The server's main listener: plaintext TCP by default, TLS when
+/// `[server] tls_cert`/`tls_key` are configured. Either way, the connection
+/// info handed to axum is a [`PeerCert`] — with a client-certificate
+/// fingerprint only on the TLS variant, so pin-gated routes fail closed on
+/// plaintext connections.
+pub enum ServerListener {
+    /// Plaintext TCP listener (the default; no TLS pair configured).
+    Plain(TcpListener),
+    /// TLS listener ([`TlsListener`] with the configured or identity cert).
+    Tls(TlsListener),
+}
+
+impl Listener for ServerListener {
+    type Io = AcceptedStream;
+    type Addr = PeerCert;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self {
+            Self::Plain(listener) => {
+                // Axum's blanket `Listener` impl for tokio `TcpListener`
+                // already retries failed accepts internally.
+                let (tcp, remote) = listener.accept().await;
+                (
+                    Self::Io::Plain(tcp),
+                    PeerCert {
+                        remote,
+                        fingerprint: None,
+                    },
+                )
+            }
+            // `TlsListener::accept` already retries failed handshakes internally.
+            Self::Tls(listener) => {
+                let (stream, addr) = listener.accept().await;
+                (Self::Io::Tls(Box::new(stream)), addr)
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(match self {
+            Self::Plain(listener) => PeerCert {
+                remote: listener.local_addr()?,
+                fingerprint: None,
+            },
+            Self::Tls(listener) => listener.local_addr()?,
+        })
+    }
+}
+
+impl<'a> Connected<IncomingStream<'a, ServerListener>> for PeerCert {
+    fn connect_info(stream: IncomingStream<'a, ServerListener>) -> Self {
+        stream.remote_addr().clone()
+    }
 }
 
 impl Listener for TlsListener {

@@ -64,14 +64,14 @@ and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
    (or `cluster.cert_path`), then prints a readiness line:
 
    ```text
-   cachette listening on https://0.0.0.0:8080
+   cachette listening on http://0.0.0.0:8080
    ```
 
-4. Check liveness. The listener is always TLS; with the built-in self-signed
-   certificate you must skip verification (or trust the `tls_cert` you supply):
+4. Check liveness. The main listener is plain HTTP unless a
+   `[server] tls_cert`/`tls_key` pair is configured:
 
    ```bash
-   curl -k https://127.0.0.1:8080/health
+   curl http://127.0.0.1:8080/health
    # {"version":"0.1.0","node_id":"<64-hex fingerprint>"}
    ```
 
@@ -80,14 +80,12 @@ and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
    `evictions_total`, `reservations_active`, `storage_used_bytes`):
 
    ```bash
-   curl -k https://127.0.0.1:8080/metrics
+   curl http://127.0.0.1:8080/metrics
    ```
 
-   On Windows, `curl.exe` uses Schannel, which cannot complete a handshake
-   against the built-in Ed25519 identity (`SEC_E_ILLEGAL_MESSAGE`, curl error
-   35). Supply an RSA certificate through `server.tls_cert`/`server.tls_key`, or
-   use a rustls-based client such as `openssl s_client -connect 127.0.0.1:8080`
-   or a Node one-liner.
+   If TLS is enabled on the listener, probe it with `curl -k https://...`
+   (supply a CA-trusted certificate through `server.tls_cert`/`server.tls_key`
+   for real clients); see [docs/tls.md](docs/tls.md).
 
 5. Point your runner at it. See [docs/forgejo.md](docs/forgejo.md) for Forgejo
    `act_runner`, [docs/clients.md](docs/clients.md) for the GitHub toolkit and
@@ -125,7 +123,7 @@ reference, valid-value notes, and examples.
 |---|---|---|---|
 | `server` | `listen` | `host:port` (IPv6 as `[::1]:8080`) | `0.0.0.0:8080` |
 | `server` | `external_url` | absolute URL advertised to clients | derived from `listen` as `http://<host>:<port>` (wildcard host becomes loopback) |
-| `server` | `tls_cert` | PEM certificate path (with `tls_key`) | unset (self-signed identity) |
+| `server` | `tls_cert` | PEM certificate path (with `tls_key`) | unset (listener is plain HTTP) |
 | `server` | `tls_key` | PEM private-key path (with `tls_cert`) | unset |
 | `storage` | `backend` | `fs` | `fs` |
 | `storage.fs` | `path` | blob root directory | `/var/lib/cachette` |
@@ -143,7 +141,8 @@ reference, valid-value notes, and examples.
 | `v2` | `jwt_ttl_seconds` | seconds (governs the Twirp JWT) | `300` |
 | `cluster` | `enabled` | boolean | `false` |
 | `cluster` | `node_id` | string label | unset (uses the identity fingerprint) |
-| `cluster` | `advertise_addr` | `host:port` peers dial | `server.listen` |
+| `cluster` | `listen` | `host:port` dedicated mTLS peer listener | `0.0.0.0:8081` |
+| `cluster` | `advertise_addr` | `host:port` peers dial | `cluster.listen` |
 | `cluster` | `mdns` | boolean | `true` |
 | `cluster` | `seeds` | list of `host[:port]` | `[]` |
 | `cluster` | `seed_fingerprints` | map of `node_id` to hex fingerprint | `{}` |
@@ -297,12 +296,15 @@ Keep the TTL short and rotate the secret if a URL leaks.
 
 ## TLS in one minute
 
-The listener is always TLS, so there is no plaintext mode to forget to disable.
-There are two independent layers: an outer leg from runners to the server, and
-the inter-node leg between peers. The built-in self-signed identity certificate
-is fine for the inter-node leg, but runners should reach you through a
-CA-trusted edge (a reverse proxy, an SSH tunnel, or WireGuard). Recipes for
-nginx, Traefik, `ssh -L/-R`, WireGuard, and proxy-level rate limiting are in
+The main listener is plaintext HTTP unless a `[server] tls_cert`/`tls_key`
+pair is configured: no implicit TLS to fight with, and a reverse proxy that
+terminates the public TLS can forward to plain HTTP. When the pair is set, the
+listener serves that certificate and clients need it CA-trusted (or a trust
+override). Peers have their own dedicated listener — `[cluster] listen`
+(default `0.0.0.0:8081`, bound only when `[cluster] enabled`), which always
+terminates TLS with the self-signed node identity certificate; peer trust is a
+fingerprint pin, not a CA chain. Recipes for nginx, Traefik, `ssh -L/-R`,
+WireGuard, and proxy-level rate limiting are in
 [docs/tls.md](docs/tls.md).
 
 ## Cluster
@@ -310,9 +312,11 @@ nginx, Traefik, `ssh -L/-R`, WireGuard, and proxy-level rate limiting are in
 Set `[cluster] enabled = true`, list peers in `seeds`, and pin their
 fingerprints in `seed_fingerprints`. Nodes discover each other, heartbeat their
 capacity, and place each v1 cache write on the least-loaded healthy owner, which
-streams the blob straight to that owner over pinned mTLS. `cluster.mdns`
-advertises on the local link by default (disable it on a VPS with no usable
-multicast interface). See [docs/cluster.md](docs/cluster.md).
+streams the blob straight to that owner over pinned mTLS. Peers connect on the
+dedicated `[cluster] listen` port (default `0.0.0.0:8081`), which always serves
+the self-signed identity certificate — it is never the runner-facing port.
+`cluster.mdns` advertises on the local link by default (disable it on a VPS with
+no usable multicast interface). See [docs/cluster.md](docs/cluster.md).
 
 ## Documentation
 

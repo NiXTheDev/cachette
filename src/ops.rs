@@ -578,13 +578,13 @@ async fn fetch_cluster(config: &Config) -> Result<String, Box<dyn Error>> {
 }
 
 /// The address to dial the local server: the advertise address (which defaults
-/// to `server.listen`), with wildcard hosts folded to loopback.
+/// to `[cluster] listen`), with wildcard hosts folded to loopback.
 fn connect_addr(config: &Config) -> String {
     let raw = config
         .cluster
         .advertise_addr
         .clone()
-        .unwrap_or_else(|| config.server.listen.clone());
+        .unwrap_or_else(|| config.cluster.listen.clone());
     match split_host_port(&raw) {
         Some((host, port)) => {
             let host = match host {
@@ -734,9 +734,10 @@ mod tests {
     #[test]
     fn connect_addr_folds_wildcards_to_loopback() {
         let mut config = Config::default();
-        config.server.listen = String::from("0.0.0.0:8080");
+        config.cluster.listen = String::from("0.0.0.0:8081");
         config.cluster.advertise_addr = None;
-        assert_eq!(connect_addr(&config), "127.0.0.1:8080");
+        // No advertise override: the cluster listener address folds to loopback.
+        assert_eq!(connect_addr(&config), "127.0.0.1:8081");
 
         config.cluster.advertise_addr = Some(String::from("cache-a:9000"));
         assert_eq!(connect_addr(&config), "cache-a:9000");

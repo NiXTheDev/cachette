@@ -9,20 +9,19 @@
 # Quick start:
 #   docker compose build            # builds cachette:local from ./Dockerfile
 #   docker compose up -d
-#   docker compose logs -f          # wait for: cachette listening on https://0.0.0.0:8080
-#   curl -k https://127.0.0.1:8080/health
-#     (Windows Schannel curl cannot complete the handshake against this
-#     listener - it requests a client cert and errors SEC_E_ILLEGAL_MESSAGE;
-#     use `openssl s_client -connect 127.0.0.1:8080` or node instead)
+#   docker compose logs -f          # wait for: cachette listening on http://0.0.0.0:8080
+#   curl http://127.0.0.1:8080/health   # plain HTTP (no -k needed)
 #   docker compose down
 #
 # Notes:
 #   * Image is scratch-based (musl static, non-root uid 65532): no shell inside,
 #     therefore no in-container healthcheck - readiness = the log line above.
-#   * Port 8080 is [server] listen = "0.0.0.0:8080"; the listener is ALWAYS
-#     TLS - a self-signed Ed25519 identity cert when the mounted config sets
-#     no tls_cert/tls_key (see the commented tls volume below to supply your
-#     own) - the published port does not change.
+#   * Port 8080 is [server] listen = "0.0.0.0:8080"; the main listener is
+#     plaintext HTTP unless the mounted config sets tls_cert/tls_key (see the
+#     commented tls volume below) - terminate public TLS at a reverse proxy.
+#   * When clustering is enabled, peers dial the dedicated [cluster] listen
+#     port (default 0.0.0.0:8081 inside the container), which is always TLS
+#     and needs no CA - trust is by peer fingerprint.
 #   * Auth secret must be >= 16 chars; the default below is demo-only. Set
 #     CACHETTE_AUTH_SECRET in the environment to override. The same secret is
 #     shared by both nodes in the cluster demo.
@@ -38,17 +37,19 @@ services:
     build:
       context: .
     ports:
-      # [server] listen = "0.0.0.0:8080" (always TLS; self-signed identity
-      # cert unless tls_cert/tls_key are set in the config)
+      # [server] listen = "0.0.0.0:8080" (plain HTTP unless tls_cert/tls_key
+      # are set in the config - TLS on the edge is the proxy's job by default)
       - "8080:8080"
     environment:
       # Serving requires an auth secret >= 16 chars (override in real use):
       CACHETTE__AUTH__SECRET: ${CACHETTE_AUTH_SECRET:-compose-demo-secret-please-override}
       # --- cluster demo (node "cache-a"): uncomment together with cachette-node2 ---
+      # Peers dial the dedicated [cluster] listen port (8081 inside the
+      # container, always TLS); the [server] port stays the runner-facing edge.
       # CACHETTE__CLUSTER__ENABLED: "true"
       # CACHETTE__CLUSTER__NODE_ID: "cache-a"
-      # CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette:8080"
-      # CACHETTE__CLUSTER__SEEDS: "cachette-node2:8080"
+      # CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette:8081"
+      # CACHETTE__CLUSTER__SEEDS: "cachette-node2:8081"
     volumes:
       # Mounted config (same shape as the image's baked-in demo config):
       - ./cachette.example.toml:/etc/cachette/cachette.toml:ro
@@ -73,8 +74,8 @@ services:
   #     CACHETTE__AUTH__SECRET: ${CACHETTE_AUTH_SECRET:-compose-demo-secret-please-override}
   #     CACHETTE__CLUSTER__ENABLED: "true"
   #     CACHETTE__CLUSTER__NODE_ID: "cache-b"
-  #     CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette-node2:8080"
-  #     CACHETTE__CLUSTER__SEEDS: "cachette:8080"
+  #     CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette-node2:8081"
+  #     CACHETTE__CLUSTER__SEEDS: "cachette:8081"
   #   volumes:
   #     - cachette-node2-data:/var/lib/cachette
   #   restart: unless-stopped

@@ -58,6 +58,7 @@ const FIELDS: &[Field] = &[
     field(&["v2"], "jwt_ttl_seconds", Kind::U64),
     field(&["cluster"], "enabled", Kind::Bool),
     field(&["cluster"], "node_id", Kind::Str),
+    field(&["cluster"], "listen", Kind::Str),
     field(&["cluster"], "advertise_addr", Kind::Str),
     field(&["cluster"], "mdns", Kind::Bool),
     field(&["cluster"], "seeds", Kind::StrList),
@@ -241,8 +242,20 @@ mod tests {
 
     #[test]
     fn bare_unique_key_prefix_matches_its_section() {
-        let listen = apply_one("CACHETTE__LISTEN", "127.0.0.1:9002").expect("applies");
+        // `listen` exists in both `[server]` and `[cluster]`, so a bare
+        // `LISTEN` is ambiguous and rejected; the full names still work.
+        let listen = apply_one("CACHETTE__SERVER__LISTEN", "127.0.0.1:9002").expect("applies");
         assert_eq!(listen["server"]["listen"], "127.0.0.1:9002");
+        let ambiguous =
+            apply_one("CACHETTE__LISTEN", "127.0.0.1:9002").expect_err("ambiguous bare key");
+        assert!(
+            matches!(&ambiguous, ConfigError::UnknownEnvVar(var) if var == "CACHETTE__LISTEN"),
+            "unexpected error: {ambiguous:?}"
+        );
+
+        // `advertise_addr` exists only in `[cluster]`, so a bare prefix maps.
+        let advertise = apply_one("CACHETTE__ADVERTISE_ADDR", "cache-a:9001").expect("applies");
+        assert_eq!(advertise["cluster"]["advertise_addr"], "cache-a:9001");
 
         let enabled = apply_one("CACHETTE__ENABLED", "true").expect("applies");
         assert_eq!(enabled["cluster"]["enabled"], json!(true));

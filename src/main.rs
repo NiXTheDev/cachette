@@ -101,7 +101,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // when `[cluster] enabled`. The runtime handle is kept alive for the
     // process lifetime so the mDNS daemon keeps responding and browsing.
     let cluster_runtime = if config.cluster.enabled {
-        let runtime = cachette::cluster::start(&config.cluster, &identity, &config.server.listen);
+        let runtime = cachette::cluster::start(&config.cluster, &identity, &config.cluster.listen);
         state.peer_table = runtime.peer_table().clone();
         Some(runtime)
     } else {
@@ -202,7 +202,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                 .cluster
                 .advertise_addr
                 .as_deref()
-                .unwrap_or(&config.server.listen)
+                .unwrap_or(&config.cluster.listen)
                 .to_owned(),
             peer_table: state.peer_table.clone(),
             pins: state.peers.clone(),
@@ -219,15 +219,34 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // TraceLayer logs each request/response at DEBUG — visible under
     // `RUST_LOG=debug`, silent under the default `info` and under `warn`.
     let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
-    // Single TLS listener (plan task 14 / B1): every route is served over
-    // HTTPS; client certs are optional at the TLS layer and gated per-route.
-    let tls_config = tls::server_config(&config.server, &identity)?;
-    let listener = tls::bind(config.server.listen.as_str(), tls_config).await?;
+    // Main listener: plaintext HTTP by default; TLS is opt-in through the
+    // `[server] tls_cert`/`tls_key` pair (validated together-or-neither). The
+    // listener is wrapped so both variants hand axum a `PeerCert` — a client
+    // fingerprint exists only on TLS accepts, so pin-gated routes fail closed
+    // on plaintext connections.
+    let server_tls_cfg = if config.server.tls_cert.is_some() {
+        Some(tls::server_config(&config.server, &identity)?)
+    } else {
+        None
+    };
+    let scheme = if server_tls_cfg.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let listener: tls::ServerListener = match server_tls_cfg {
+        Some(tls_config) => {
+            tls::ServerListener::Tls(tls::bind(&config.server.listen, tls_config).await?)
+        }
+        None => {
+            tls::ServerListener::Plain(tokio::net::TcpListener::bind(&config.server.listen).await?)
+        }
+    };
     // Unconditional stdout line: the readiness gate for scripts (it must
     // appear even when `RUST_LOG` silences the tracing subscriber).
     let listen = &config.server.listen;
-    println!("cachette listening on https://{listen}");
-    tracing::info!(%listen, "listener ready");
+    println!("cachette listening on {scheme}://{listen}");
+    tracing::info!(%listen, scheme, "listener ready");
 
     // Periodic sweep (plan task 34): `reservation_ttl / 4` (>= 1s), the cadence
     // the reaper documents. The first tick is immediate and skipped — the
@@ -299,6 +318,40 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let (shutdown_notify, mut signals) = shutdown::listen();
     let drain_grace = Duration::from_secs(config.server.drain_grace_seconds);
     let serve_draining = draining.clone();
+    // Cluster listener (`[cluster] enabled`): a dedicated port for peer
+    // traffic that ALWAYS terminates TLS with the self-signed node identity
+    // certificate — peers authenticate by SPKI fingerprint pin, not a CA
+    // chain. The shim clears `tls_cert`/`tls_key` so the cluster port presents
+    // the identity cert even when the main listener serves a configured PEM
+    // pair (peer pins match the identity fingerprint, not the CA cert's).
+    let mut cluster_handle = None;
+    if config.cluster.enabled {
+        let cluster_server = cachette::config::ServerConfig {
+            tls_cert: None,
+            tls_key: None,
+            ..config.server.clone()
+        };
+        let cluster_tls = tls::server_config(&cluster_server, &identity)?;
+        let cluster_listener = tls::bind(&config.cluster.listen, cluster_tls).await?;
+        println!(
+            "cachette cluster listening on https://{}",
+            config.cluster.listen
+        );
+        tracing::info!(listen = %config.cluster.listen, "cluster listener ready");
+        let cluster_app = app.clone();
+        let cluster_notify = shutdown_notify.clone();
+        // Aborted at shutdown flush (after the main serve drains): a peer
+        // connection severed here only loses that one in-flight transfer;
+        // the peer retries on its next heartbeat and orphan parts are swept.
+        cluster_handle = Some(tokio::spawn(async move {
+            axum::serve(
+                cluster_listener,
+                cluster_app.into_make_service_with_connect_info::<tls::PeerCert>(),
+            )
+            .with_graceful_shutdown(async move { cluster_notify.notified().await })
+            .await
+        }));
+    }
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<tls::PeerCert>(),
@@ -358,6 +411,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     sweep_task.abort();
     reload_task.abort();
     if let Some(handle) = heartbeat_task {
+        handle.abort();
+    }
+    if let Some(handle) = cluster_handle {
         handle.abort();
     }
     match reaper.sweep_once(&storage).await {

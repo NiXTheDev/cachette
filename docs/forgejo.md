@@ -99,9 +99,10 @@ URL.
 - **`404` on a cache save/restore** - the runner is not reaching cachette's
   `/_apis/artifactcache/*` paths; confirm `external_server` has no trailing
   path segment.
-- **TLS failures** - the built-in certificate is self-signed. Terminate TLS at a
-  reverse proxy with a CA-trusted certificate, or configure `tls_cert`/
-  `tls_key`. Do not point runners at plain TCP; cachette is TLS-only.
+- **TLS failures** - the main listener is plaintext HTTP by default; enable TLS
+  with `tls_cert`/`tls_key` (a CA-trusted pair), or terminate TLS at the reverse
+  proxy. The self-served identity certificate exists only on the separate
+  `[cluster] listen` port, which runners never use.
 - **Windows `curl.exe`** - Schannel cannot complete the handshake against the
   built-in listener; use `openssl s_client` or a Node client for manual checks.
 
