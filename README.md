@@ -3,18 +3,19 @@
 A small, self-contained GitHub Actions **cache server**: one static binary that
 serves both the legacy `artifactcache` v1 REST API (what Forgejo `act_runner`
 speaks) and the v2 Twirp `CacheService` API (what the GitHub Actions toolkit
-and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
+and `docker buildx --cache-to type=gha` speak) over just two ports: one serves
+the runner-facing endpoints, the other serves the clustering needs (see
+[Clustering](./docs/cluster.md)).
 
 - Blobs live on the local filesystem under a directory you choose; metadata and
   usage accounting live in a SQLite file beside them.
-- One listener serves every route. TLS is never optional.
 - Auth is a shared secret: Forgejo HMAC headers, bearer tokens, or both.
 - Optional peer-to-peer clustering discovers nodes, tracks capacity, and places
   a cache write on the least-loaded healthy owner.
 
 ## Features
 
-- **Dual protocol on one port.** v1 `/_apis/artifactcache/*` and v2
+- **Dual protocol on the cache port.** v1 `/_apis/artifactcache/*` and v2
   `/twirp/github.actions.results.api.v1.CacheService/*` (plus the v2 Azure
   block-blob upload emulation) are served by the same binary.
 - **Chunked, resumable uploads.** v1 `PATCH` chunks are staged and committed;
@@ -66,6 +67,10 @@ and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
    ```text
    cachette listening on http://0.0.0.0:8080
    ```
+
+   With `[cluster] enabled`, the boot log adds a second readiness line for the
+   peer port - `cachette cluster listening on https://0.0.0.0:8081` - which
+   peers dial; runners never see it.
 
 4. Check liveness. The main listener is plain HTTP unless a
    `[server] tls_cert`/`tls_key` pair is configured:
@@ -205,7 +210,9 @@ Commands:
   cache prune         Delete entries not accessed within --older-than <dur>
   gc                  Run the reservation reaper + orphan-blob sweep once, then exit
   doctor              Check config, storage, SQLite, identity, seeds, and disk
-  token mint          Print a Forgejo artifactcache HMAC token for the secret
+  token mint
+    hmac              Print a Forgejo artifactcache HMAC token for the secret
+    buildx-jwt        Print a JWT to use with buildx cache exports
   cluster status      Print the live cluster member table from a running server
 
 Options:

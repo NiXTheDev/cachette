@@ -13,19 +13,24 @@
 #   plan forbids ("must NOT ship a glibc image for the musl binary"), and
 #   distroless-static (gVisor) would add a userspace we don't need for a fully
 #   static binary. scratch = minimal attack surface, no shell to exec into.
-#   (No shell also means no in-container healthcheck - watch
-#   `cachette listening on ...` in the logs instead.)
+#   (No shell also means no in-container healthcheck - readiness is the log:
+#   `cachette listening on ...` for the cache port, plus
+#   `cachette cluster listening on ...` once clustering is enabled.)
 #
 # Non-root: numeric `USER 65532:65532` works in scratch without /etc/passwd;
 #   /config and /var/lib/cachette are chowned to 65532 so the compose
 #   named volume is writable on first use.
 #
-# Entrypoint / command / port:
+# Entrypoint / command / ports:
 #   ENTRYPOINT ["/usr/local/bin/cachette"]
 #   CMD        ["--config", "/config/cachette.toml"]
-#   EXPOSE     8080   # [server] listen = "0.0.0.0:8080" - always TLS
-#                     # (self-signed Ed25519 identity cert when the mounted
-#                     # config sets no tls_cert/tls_key)
+#   8080: [server] listen - the runner-facing cache port. Plain HTTP unless the
+#         mounted config sets [server] tls_cert/tls_key (public TLS is the
+#         reverse proxy's job by default).
+#   8081: [cluster] listen - the peer port. Always mTLS with the self-signed
+#         node identity cert; bound only when [cluster] enabled = true.
+#   (EXPOSE directives were dropped on purpose: publish host mappings per
+#   deployment instead.)
 #   docker run --rm cachette:local            -> cachette --config /config/cachette.toml
 #   docker run --rm cachette:local --version  -> cachette 1.0.0   (replaces CMD)
 #
