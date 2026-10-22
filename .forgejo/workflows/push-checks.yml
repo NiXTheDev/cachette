@@ -241,7 +241,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
-          key: cachette-docker-compose-5.6.0-linux-amd64
+          key: cachette-docker-compose-5.6.0-${{ runner.arch }}
       - name: Install compose
         run: |
           set -euo pipefail
@@ -250,7 +250,14 @@ jobs:
             echo "docker-compose already present (cachette hit): $(docker-compose --version)"
             exit 0
           fi
-          url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
+          # The docs job may land on any runner of the arch-agnostic fleet,
+          # so the pinned compose binary follows the runner arch.
+          case "$(uname -m)" in
+            x86_64)  asset="docker-compose-linux-x86_64" ;;
+            aarch64) asset="docker-compose-linux-aarch64" ;;
+            *) echo "::error::unsupported arch for docker-compose: $(uname -m)"; exit 1 ;;
+          esac
+          url="https://github.com/docker/compose/releases/download/v5.6.0/${asset}"
           for attempt in 1 2 3; do
             echo "== docker-compose download attempt $attempt =="
             if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose; then
@@ -298,7 +305,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker
-          key: cachette-docker-cli-28.0.4-linux-amd64
+          key: cachette-docker-cli-28.0.4-${{ runner.arch }}
 
       # Docker CLI as a STATIC binary (the recipe regexYbot's proven on these
       # exact runners) - avoids apt and deb.debian.org entirely. Only the
@@ -386,15 +393,18 @@ jobs:
           echo "LOCALFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
           echo "verify_ref=${verify}" >> "$GITHUB_OUTPUT"
 
-      # Validation build BEFORE anything is pushed: amd64, --load (nothing
-      # leaves the runner), local throwaway tag; the built binary must RUN and
-      # print the exact version. The multi-arch push below re-spins from the
-      # same buildkit layer cache, so this first pass makes it cheap.
+      # Validation build BEFORE anything is pushed: the runner's NATIVE arch
+      # (no --platform pin: buildx defaults to the host arch, so this stays
+      # native on every runner of the arch-agnostic fleet, arm64 included),
+      # --load (nothing leaves the runner), local throwaway tag; the built
+      # binary must RUN and print the exact version. The multi-arch push
+      # below re-spins from the same buildkit layer cache, so this first
+      # pass makes it cheap.
       - name: Validation build
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --load --platform linux/amd64 ${LOCALFLAGS} ${CACHE_ARGS} .
+          docker buildx build --load ${LOCALFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
           [ "$got" = "cachette 1.0.0" ]

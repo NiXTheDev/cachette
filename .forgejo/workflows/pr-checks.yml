@@ -4,9 +4,9 @@
 # the two triggers read independently.
 #
 # The docker job here pushes the PR head image: a local --load build first
-# (amd64, with the binary `--version` assert), then a real publish multi-arch
-# on the flyweight `pr-<PR number>` tag. Both legs exercise the cachette
-# buildkit layer cache
+# (native-runner-arch, with the binary `--version` assert), then a real publish
+# multi-arch on the flyweight `pr-<PR number>` tag. Both legs exercise the
+# cachette buildkit layer cache
 # (docker buildx `type=gha` -> acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static
 # bearer, minted per docs/clients.md; a missing/malformed/expired token is
 # RED at exporter configure time, not a mere cache miss).
@@ -182,7 +182,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
-          key: cachette-docker-compose-5.6.0-linux-amd64
+          key: cachette-docker-compose-5.6.0-${{ runner.arch }}
       - name: Install compose
         run: |
           set -euo pipefail
@@ -191,7 +191,14 @@ jobs:
             echo "docker-compose already present (cachette hit): $(docker-compose --version)"
             exit 0
           fi
-          url="https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64"
+          # The docs job may land on any runner of the arch-agnostic fleet,
+          # so the pinned compose binary follows the runner arch.
+          case "$(uname -m)" in
+            x86_64)  asset="docker-compose-linux-x86_64" ;;
+            aarch64) asset="docker-compose-linux-aarch64" ;;
+            *) echo "::error::unsupported arch for docker-compose: $(uname -m)"; exit 1 ;;
+          esac
+          url="https://github.com/docker/compose/releases/download/v5.6.0/${asset}"
           for attempt in 1 2 3; do
             echo "== docker-compose download attempt $attempt =="
             if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose; then
@@ -233,7 +240,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker
-          key: cachette-docker-cli-28.0.4-linux-amd64
+          key: cachette-docker-cli-28.0.4-${{ runner.arch }}
 
       - name: Install docker CLI
         run: |
@@ -300,7 +307,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --load --platform linux/amd64 ${LOCALFLAGS} ${CACHE_ARGS} .
+          # No --platform pin: buildx builds the runner's NATIVE arch, so the
+          # validation stays native on every fleet runner (arm64 included).
+          docker buildx build --load ${LOCALFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
           [ "$got" = "cachette 1.0.0" ]
