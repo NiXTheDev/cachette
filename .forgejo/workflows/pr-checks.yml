@@ -282,7 +282,13 @@ jobs:
           owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           image="hangar.nixthedev.ru/${owner}/cachette"
           pr="${GITHUB_REF#refs/pull/}"
-          pr="${pr%/merge}"
+          pr="${pr%%/*}"
+          case "${pr}" in
+            *[!0-9]*)
+              echo "::error::could not parse a numeric PR number out of '${GITHUB_REF}'"
+              exit 1
+              ;;
+          esac
           echo "pr=${pr}" >> "$GITHUB_OUTPUT"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "verify_ref=${image}:pr-${pr}" >> "$GITHUB_OUTPUT"
