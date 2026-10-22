@@ -379,6 +379,6 @@ advertise or require them:
 
 ## License
 
-See the repository for license information.
+cachette is MIT licensed - the full text is in [LICENSE](LICENSE).
 </content>
 </invoke>
