@@ -241,6 +241,6 @@ mod tests {
             .split('.')
             .map(|part| part.parse::<u64>().expect("version component is numeric"))
             .collect();
-        assert_eq!(components, vec![0, 1, 0], "unexpected version: {raw}");
+        assert_eq!(components, vec![1, 0, 0], "unexpected version: {raw}");
     }
 }

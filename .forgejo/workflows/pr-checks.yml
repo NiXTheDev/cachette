@@ -277,4 +277,4 @@ jobs:
           docker buildx build --load --platform linux/amd64 ${TAGFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
-          [ "$got" = "cachette 0.1.0" ]
+          [ "$got" = "cachette 1.0.0" ]

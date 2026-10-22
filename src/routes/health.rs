@@ -114,10 +114,10 @@ mod tests {
     #[test]
     fn health_body_serializes_version_first_then_node_id() {
         let body = HealthBody {
-            version: "0.1.0",
+            version: "1.0.0",
             node_id: "test-host".to_owned(),
         };
         let json = serde_json::to_string(&body).expect("HealthBody serializes");
-        assert_eq!(json, r#"{"version":"0.1.0","node_id":"test-host"}"#);
+        assert_eq!(json, r#"{"version":"1.0.0","node_id":"test-host"}"#);
     }
 }

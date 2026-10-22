@@ -72,7 +72,7 @@ and `docker buildx --cache-to type=gha` speak) over a single, always-TLS port.
 
    ```bash
    curl http://127.0.0.1:8080/health
-   # {"version":"0.1.0","node_id":"<64-hex fingerprint>"}
+   # {"version":"1.0.0","node_id":"<64-hex fingerprint>"}
    ```
 
    `GET /metrics` on the same listener returns the Prometheus text-format
@@ -248,7 +248,7 @@ Options:
 - `verify`, `cache`, and `gc` take an exclusive lock on the data directory and
   refuse with a clear message while a server (or another ops command) holds it.
   `doctor` and `token mint` never touch the data directory and do not lock.
-- `cachette --version` prints `cachette 0.1.0`.
+- `cachette --version` prints `cachette 1.0.0`.
 - A configuration error exits with status `2`.
 
 ## Authentication
@@ -341,7 +341,7 @@ published artifact. `push-checks.yml` (every branch push) and `pr-checks.yml`
 tests including the v1 + v2 real-client round-trips (`node`/`npm`/`go` must be
 present or the job fails), the example-config/compose lint, and the multi-node
 cluster suites - followed by the docker job: a registry-published multi-arch
-image (`linux/amd64` + `linux/arm64`, tags `0.1.0`/`0.1`/`0` + `latest` +
+image (`linux/amd64` + `linux/arm64`, tags `1.0.0`/`1.0`/`1` + `latest` +
 `release` read from `Cargo.toml`) on pushes to the `release` branch, and a
 validation-only amd64 build everywhere else (no `:dev` tag waterfalls). Both
 legs share a buildkit layer cache served by cachette itself (docker buildx

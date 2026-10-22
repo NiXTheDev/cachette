@@ -28,7 +28,7 @@
 #              registry publish belongs to branch pushes, not to the release
 #              job). On a push to `release` it builds and pushes the multi-arch
 #              (linux/amd64,linux/arm64) image with the bare-semver tag scheme
-#              (latest, release, 0.1.0, and the parent truncations 0.1 / 0) read
+#              (latest, release, 1.0.0, and the parent truncations 1.0 / 1) read
 #              from Cargo.toml. On every other branch it is a validation-only
 #              amd64 build that leaves the runner. Both legs share a buildkit
 #              layer cache served by cachette (docker buildx `type=gha` -> the
@@ -338,7 +338,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tags follow the proven regexYbot scheme: mutable aliases + the bare
-      # Cargo.toml version (NO `v` prefix) + parent truncation (0.1.0 -> 0.1 -> 0).
+      # Cargo.toml version (NO `v` prefix) + parent truncation (1.0.0 -> 1.0 -> 1).
       # Non-release refs get a single throwaway local tag and never push.
       - name: Compute image ref + docker tags
         id: tags
@@ -416,4 +416,4 @@ jobs:
           docker buildx build --load --platform linux/amd64 ${TAGFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
-          [ "$got" = "cachette 0.1.0" ]
+          [ "$got" = "cachette 1.0.0" ]

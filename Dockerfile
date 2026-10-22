@@ -27,7 +27,7 @@
 #                     # (self-signed Ed25519 identity cert when the mounted
 #                     # config sets no tls_cert/tls_key)
 #   docker run --rm cachette:local            -> cachette --config /config/cachette.toml
-#   docker run --rm cachette:local --version  -> cachette 0.1.0   (replaces CMD)
+#   docker run --rm cachette:local --version  -> cachette 1.0.0   (replaces CMD)
 #
 # The baked /config/cachette.toml is the repo's cachette.example.toml - a
 # DEMO default (secret = CHANGE_ME_*). Real deployments must override

@@ -60,7 +60,7 @@
 # gated locally with `actionlint` (0 errors).
 #
 # Native artifacts (linux x86_64-musl, windows x86_64-msvc) RUN
-# `cachette --version` and assert stdout == `cachette 0.1.0`; cross artifacts
+# `cachette --version` and assert stdout == `cachette 1.0.0`; cross artifacts
 # are verified via `file`/`uname` (linux) and the PE-machine equivalent.
 #
 # =============================================================================
@@ -69,7 +69,7 @@
 # `v<version>`: the pushed tag on a tag push, or the Cargo.toml package version
 # on a push to the `release` branch (so merging a `feat/*` PR into `release`
 # cuts the release). The image side of a release (bare-semver tags
-# `0.1.0`/`0.1`/`0` + `latest` + `release` at
+# `1.0.0`/`1.0`/`1` + `latest` + `release` at
 # `hangar.nixthedev.ru/<owner>/cachette`) is pushed by push-checks.yml's docker
 # job on the same merge.
 # =============================================================================
@@ -218,8 +218,8 @@ jobs:
           command -v file >/dev/null 2>&1 && file "$bin"
           got="$("$bin" --version | tr -d '\r')"
           echo "cachette --version => [$got]"
-          if [ "$got" != "cachette 0.1.0" ]; then
-            echo "::error::expected exactly 'cachette 0.1.0', got '$got'"
+          if [ "$got" != "cachette 1.0.0" ]; then
+            echo "::error::expected exactly 'cachette 1.0.0', got '$got'"
             exit 1
           fi
 
