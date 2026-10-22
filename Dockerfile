@@ -33,7 +33,7 @@
 # DEMO default (secret = CHANGE_ME_*). Real deployments must override
 # CACHETTE__AUTH__SECRET (compose does) or mount their own config.
 
-FROM rust:1.98-alpine AS builder
+FROM rust:1.99-alpine AS builder
 
 # gcc/musl-dev: C toolchain for rusqlite/bundled (SQLite C) + ring.
 # file(1): build-time static-link assertion.
@@ -69,6 +69,5 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM scratch AS runtime
 COPY --from=builder --chown=65532:65532 /rootfs /
 USER 65532:65532
-EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/cachette"]
 CMD ["--config", "/config/cachette.toml"]
