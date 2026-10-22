@@ -26,11 +26,13 @@
 #
 # docker     - the image path lives HERE (regexYbot-shaped split: the forge
 #              registry publish belongs to branch pushes, not to the release
-#              job). On a push to `release` it builds and pushes the multi-arch
-#              (linux/amd64,linux/arm64) image with the bare-semver tag scheme
-#              (latest, release, 1.0.0, and the parent truncations 1.0 / 1) read
-#              from Cargo.toml. On every other branch it is a validation-only
-#              amd64 build that leaves the runner. Both legs share a buildkit
+#              job). EVERY branch push builds and pushes the multi-arch
+#              (linux/amd64,linux/arm64) image; `release` gets the bare-semver
+#              tag scheme (latest, release, 1.0.0, and the parent truncations
+#              1.0 / 1) read from Cargo.toml, any other branch gets regexY's
+#              dev scheme (dev, latest, <version>-dev, and the truncations as
+#              -dev). Registry auth is the account-wide HGPR_TOKEN secret.
+#              Both legs share a buildkit
 #              layer cache served by cachette (docker buildx `type=gha` -> the
 #              acc.nixthedev.ru cache; `CACHETTE_BUILDX_JWT` is the static
 #              bearer token, minted per docs/clients.md; the value MUST be
@@ -268,7 +270,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # THE docker job. This is the only place cachette's OCI image is ever built -
-  # regexYbot-shaped: pushed on the release branch, validated elsewhere.
+  # every branch push publishes it with its ref's tag scheme.
   # ---------------------------------------------------------------------------
   docker:
     name: docker
@@ -329,17 +331,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
 
+      # Account-wide registry token (the same credentials regexYbot's pipelines
+      # use): the default GITHUB_TOKEN has no registry write on Forgejo.
       - name: Log in to the forge registry
-        if: github.ref == 'refs/heads/release'
         uses: https://hangar.nixthedev.ru/docker/login-action@v3
         with:
           registry: hangar.nixthedev.ru
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.HGPR_TOKEN }}
 
       # Tags follow the proven regexYbot scheme: mutable aliases + the bare
       # Cargo.toml version (NO `v` prefix) + parent truncation (1.0.0 -> 1.0 -> 1).
-      # Non-release refs get a single throwaway local tag and never push.
+      # - `release`: latest, release, <v> + truncations.
+      # - any other branch: regexY's dev semantics - dev, latest, <v>-dev plus
+      #   the truncations as -dev (the mutable aliases track dev heads until
+      #   the next release push re-points them).
+      # TAGFLAGS is what the push step publishes; LOCALFLAGS is the throwaway
+      # local tag for the --load validation + --version assert.
       - name: Compute image ref + docker tags
         id: tags
         shell: bash
@@ -359,19 +367,43 @@ jobs:
               if [ -z "${cur}" ] || [ "${cur}" = "${prev}" ]; then break; fi
               suffixes="${suffixes} ${cur}"
             done
-            flags=""
-            for s in ${suffixes}; do flags="${flags} --tag ${image}:${s}"; done
+            verify="${image}:${v}"
           else
-            flags="--tag cachette:ci-dryrun"
+            suffixes="dev latest ${v}-dev"
+            cur="${v}"
+            while :; do
+              prev="${cur}"
+              cur="$(printf '%s' "${cur}" | sed 's/\.[^.]*$//')"
+              if [ -z "${cur}" ] || [ "${cur}" = "${prev}" ]; then break; fi
+              suffixes="${suffixes} ${cur}-dev"
+            done
+            verify="${image}:dev"
           fi
+          flags=""
+          for s in ${suffixes}; do flags="${flags} --tag ${image}:${s}"; done
           echo "TAGFLAGS=${flags# }" >> "$GITHUB_ENV"
           echo "TAGFLAGS=${flags# }" >> "$GITHUB_OUTPUT"
+          echo "LOCALFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
+          echo "verify_ref=${verify}" >> "$GITHUB_OUTPUT"
 
-      # THE multi-arch push (linux/amd64 + linux/arm64), release-branch pushes
-      # only. Retried so a transient registry/network blip does NOT fail an
-      # otherwise-green build.
+      # Validation build BEFORE anything is pushed: amd64, --load (nothing
+      # leaves the runner), local throwaway tag; the built binary must RUN and
+      # print the exact version. The multi-arch push below re-spins from the
+      # same buildkit layer cache, so this first pass makes it cheap.
+      - name: Validation build
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --load --platform linux/amd64 ${LOCALFLAGS} ${CACHE_ARGS} .
+          got="$(docker run --rm cachette:ci-dryrun --version)"
+          echo "cachette --version => [$got]"
+          [ "$got" = "cachette 1.0.0" ]
+
+      # THE multi-arch push (linux/amd64 + linux/arm64) - every branch push
+      # publishes with its ref's tag scheme. Retried so a transient
+      # registry/network blip does NOT fail an otherwise-green build; the
+      # validation build above seeded the shared layer cache.
       - name: Build + push multi-arch manifest
-        if: github.ref == 'refs/heads/release'
         shell: bash
         run: |
           set -euo pipefail
@@ -393,27 +425,15 @@ jobs:
           echo "::error::multi-arch push failed after 4 attempts"
           exit 1
 
-      # Acceptance: the pushed bare-version tag must be a manifest list
-      # covering BOTH architectures.
+      # Acceptance: the pushed head tag must be a manifest list covering BOTH
+      # architectures (the version tag on `release`, the moving `dev` tag
+      # elsewhere).
       - name: Verify manifest lists amd64 AND arm64
-        if: github.ref == 'refs/heads/release'
         run: |
           set -euo pipefail
-          ref="${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}"
+          ref="${{ steps.tags.outputs.verify_ref }}"
           manifest="$(docker manifest inspect "$ref")"
           echo "$manifest"
           echo "$manifest" | grep -q '"architecture": "amd64"'
           echo "$manifest" | grep -q '"architecture": "arm64"'
           echo "OK: $ref is a manifest list with amd64 + arm64"
-
-      # Non-release refs: validation build only (amd64, --load, nothing leaves
-      # the runner); the built binary must RUN and print the exact version.
-      - name: Validation build
-        if: github.ref != 'refs/heads/release'
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker buildx build --load --platform linux/amd64 ${TAGFLAGS} ${CACHE_ARGS} .
-          got="$(docker run --rm cachette:ci-dryrun --version)"
-          echo "cachette --version => [$got]"
-          [ "$got" = "cachette 1.0.0" ]

@@ -341,9 +341,11 @@ published artifact. `push-checks.yml` (every branch push) and `pr-checks.yml`
 tests including the v1 + v2 real-client round-trips (`node`/`npm`/`go` must be
 present or the job fails), the example-config/compose lint, and the multi-node
 cluster suites - followed by the docker job: a registry-published multi-arch
-image (`linux/amd64` + `linux/arm64`, tags `1.0.0`/`1.0`/`1` + `latest` +
-`release` read from `Cargo.toml`) on pushes to the `release` branch, and a
-validation-only amd64 build everywhere else (no `:dev` tag waterfalls). Both
+image (`linux/amd64` + `linux/arm64`) on EVERY branch push - `release` carries
+the bare-semver tags `1.0.0`/`1.0`/`1` + `latest` + `release` read from
+`Cargo.toml`, other branches carry the regexY-style dev scheme
+(`dev`/`latest`/`<version>-dev` + truncations, with `latest` tracking dev
+between releases), and PR runs publish a flyweight `pr-<number>` tag. Both
 legs share a buildkit layer cache served by cachette itself (docker buildx
 `type=gha` against the `acc.nixthedev.ru` cache; an unset
 `CACHETTE_BUILDX_JWT` only means cache misses, never failures). `release.yml`

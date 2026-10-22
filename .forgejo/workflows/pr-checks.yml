@@ -3,9 +3,10 @@
 # pull-request run and a push run no longer auto-cancel each other, and so
 # the two triggers read independently.
 #
-# The docker job here is always the VALIDATION leg (amd64 --load, nothing
-# leaves the runner); the registry publish lives in push-checks.yml on the
-# `release` branch. Both legs exercise the cachette buildkit layer cache
+# The docker job here pushes the PR head image: a local --load build first
+# (amd64, with the binary `--version` assert), then a real publish multi-arch
+# on the flyweight `pr-<PR number>` tag. Both legs exercise the cachette
+# buildkit layer cache
 # (docker buildx `type=gha` -> acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static
 # bearer, minted per docs/clients.md; a missing/malformed/expired token is
 # RED at exporter configure time, not a mere cache miss).
@@ -209,10 +210,10 @@ jobs:
           echo "OK: compose.yaml parses"
 
   # ---------------------------------------------------------------------------
-  # Docker VALIDATION path - identical recipes to push-checks.yml's docker job
-  # minus the registry login/push/manifest-verify legs. On a PR this is the
-  # first-ever run of the cachette docker path, so it doubles as the release
-  # rehearsal: QEMU + buildx + the cachette-backed layer cache all run here.
+  # Docker path on PRs - the same recipes as push-checks.yml's docker job
+  # (QEMU + buildx + the cachette-backed layer cache, plus registry login,
+  # push and manifest verification): every PR publishes its flyweight
+  # `pr-<number>` head image after the --load validation proves the binary.
   # ---------------------------------------------------------------------------
   docker:
     name: docker
@@ -261,20 +262,76 @@ jobs:
       - name: Set up Docker Buildx
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
 
+      # Account-wide registry token (the same credentials regexYbot's pipelines
+      # use): the default GITHUB_TOKEN has no registry write on Forgejo.
+      - name: Log in to the forge registry
+        uses: https://hangar.nixthedev.ru/docker/login-action@v3
+        with:
+          registry: hangar.nixthedev.ru
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.HGPR_TOKEN }}
+
+      # PR flyweight tag: `pr-<number>` parsed from refs/pull/<number>/merge.
+      # TAGFLAGS is what the push step publishes; LOCALFLAGS is the throwaway
+      # local tag for the --load validation + --version assert.
       - name: Compute image ref + docker tags
         id: tags
         shell: bash
         run: |
           set -euo pipefail
-          echo "TAGFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
-          echo "TAGFLAGS updated"
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          image="hangar.nixthedev.ru/${owner}/cachette"
+          pr="${GITHUB_REF#refs/pull/}"
+          pr="${pr%/merge}"
+          echo "pr=${pr}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "verify_ref=${image}:pr-${pr}" >> "$GITHUB_OUTPUT"
+          echo "TAGFLAGS=--tag ${image}:pr-${pr}" >> "$GITHUB_ENV"
+          echo "LOCALFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
+          echo "TAGFLAGS=--tag ${image}:pr-${pr}"
 
       - name: Validation build
-        if: github.ref != 'refs/heads/release'
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --load --platform linux/amd64 ${TAGFLAGS} ${CACHE_ARGS} .
+          docker buildx build --load --platform linux/amd64 ${LOCALFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
           [ "$got" = "cachette 1.0.0" ]
+
+      # PR flyweight image: multi-arch (linux/amd64 + linux/arm64), same recipe
+      # and retries as push-checks.yml. The validation build above seeded the
+      # layer cache, so this second pass is nearly free.
+      - name: Build + push PR image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.tags.outputs.image }}"
+          for attempt in 1 2 3 4; do
+            echo "== buildx push attempt $attempt =="
+            if docker buildx build \
+                 --platform linux/amd64,linux/arm64 \
+                 ${TAGFLAGS} \
+                 ${CACHE_ARGS} \
+                 --push \
+                 .; then
+              echo "OK: pushed ${image}:pr-${{ steps.tags.outputs.pr }}"
+              exit 0
+            fi
+            echo "push attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::multi-arch PR image push failed after 4 attempts"
+          exit 1
+
+      # Acceptance: the pushed pr-N tag must be a manifest list covering BOTH
+      # architectures.
+      - name: Verify manifest lists amd64 AND arm64
+        run: |
+          set -euo pipefail
+          ref="${{ steps.tags.outputs.verify_ref }}"
+          manifest="$(docker manifest inspect "$ref")"
+          echo "$manifest"
+          echo "$manifest" | grep -q '"architecture": "amd64"'
+          echo "$manifest" | grep -q '"architecture": "arm64"'
+          echo "OK: $ref is a manifest list with amd64 + arm64"

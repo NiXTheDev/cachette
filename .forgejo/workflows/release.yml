@@ -2,11 +2,12 @@
 #   cross-compiled binary matrix -> checksums -> release.
 #
 # The OCI image is NOT built here. regexYbot-shaped split: the docker image
-# work (multi-arch build, registry push on `refs/heads/release`, validation
-# builds everywhere else) lives in push-checks.yml / pr-checks.yml, so the
-# publish machinery is exercised by the ordinary checks on every merge - and a
-# merge into `release` fires BOTH this pipeline (binaries + checksums + release)
-# and push-checks.yml (the image) at the same time.
+# work (multi-arch build + registry publish on every ref that reaches a check
+# - semver tags on `release`, the regexY dev scheme on other branches,
+# `pr-<number>` on PRs) lives in push-checks.yml / pr-checks.yml, so the
+# publish machinery is exercised by the ordinary checks - and a merge into
+# `release` fires BOTH this pipeline (binaries + checksums + release) and
+# push-checks.yml (the image) at the same time.
 #
 # Runs on tag pushes (`v*`) AND on pushes to the long-lived `release` branch (the
 # merge commit of a `feat/*` -> release pull request), and can be dispatched
@@ -71,7 +72,8 @@
 # cuts the release). The image side of a release (bare-semver tags
 # `1.0.0`/`1.0`/`1` + `latest` + `release` at
 # `hangar.nixthedev.ru/<owner>/cachette`) is pushed by push-checks.yml's docker
-# job on the same merge.
+# job on the same merge. Other branches meanwhile publish regexY's dev scheme,
+# so `latest` tracks dev heads until the next release push re-points it.
 # =============================================================================
 name: Release
 
