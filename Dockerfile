@@ -33,7 +33,11 @@
 # DEMO default (secret = CHANGE_ME_*). Real deployments must override
 # CACHETTE__AUTH__SECRET (compose does) or mount their own config.
 
-FROM rust:1.99-alpine AS builder
+# Why rust:1.98-alpine rather than :1.99-alpine (Oct 2026): the 1.99 base
+# (same gcc 15.2.0, alpine 3.24.3 userland vs 3.24.2) ICE'd in gcc during the
+# CI compile of libsqlite3-sys' bundled sqlite3.c with no standalone repro.
+# Retry the bump on a fresh Alpine/gcc point release.
+FROM rust:1.98-alpine AS builder
 
 # gcc/musl-dev: C toolchain for rusqlite/bundled (SQLite C) + ring.
 # file(1): build-time static-link assertion.
