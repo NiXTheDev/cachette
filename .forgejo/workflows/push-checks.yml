@@ -89,7 +89,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
+          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: rustfmt --check
@@ -112,7 +112,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
+          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: cargo check
@@ -137,7 +137,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
+          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: clippy -D warnings
@@ -161,7 +161,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
+          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
@@ -215,7 +215,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
+          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       # The embedded example must resolve end to end (env + file + derived
