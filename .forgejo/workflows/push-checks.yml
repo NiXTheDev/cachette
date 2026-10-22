@@ -77,7 +77,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install stable Rust (rustfmt)
+      - name: Install rustfmt toolchain
         id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -85,7 +85,7 @@ jobs:
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
@@ -96,7 +96,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   check:
-    name: check (typecheck)
+    name: check
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -108,14 +108,14 @@ jobs:
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: cachette-rustup-toolchains-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
-      - name: cargo check (all targets)
+      - name: cargo check
         run: cargo check --workspace --all-targets --locked
 
   clippy:
@@ -125,7 +125,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install stable Rust (clippy)
+      - name: Install clippy toolchain
         id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -133,7 +133,7 @@ jobs:
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
@@ -144,7 +144,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    name: test (all suites)
+    name: test
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -157,7 +157,7 @@ jobs:
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
@@ -165,7 +165,7 @@ jobs:
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
-      - name: Install Node.js (for the @actions/cache toolkit fixture)
+      - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -173,7 +173,7 @@ jobs:
           # toolkit; the fixture's `npm ci` then makes no registry fetches.
           cache: "npm"
           cache-dependency-path: tests/fixtures/package-lock.json
-      - name: Install Go (for the go-actions-cache fixture)
+      - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
@@ -185,7 +185,7 @@ jobs:
         uses: https://github.com/Swatinem/rust-cache@v2
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
-      - name: Assert real-client toolchains are present (fail, never skip)
+      - name: Assert real-client toolchains are present
         run: |
           set -euo pipefail
           node --version
@@ -194,11 +194,11 @@ jobs:
       # EVERY suite the workspace has runs here, in this single step: unit +
       # integration + v1/v2 real clients + the multi-node cluster suites.
       # `--workspace` already includes them all, so each test runs exactly once.
-      - name: cargo test (entire workspace)
+      - name: cargo test
         run: cargo test --workspace --locked
 
   docs:
-    name: docs (example config + compose)
+    name: docs
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -211,7 +211,7 @@ jobs:
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
@@ -221,7 +221,7 @@ jobs:
       # The embedded example must resolve end to end (env + file + derived
       # defaults validated); --print-config masks secrets and exits non-zero on
       # any invalid key.
-      - name: Validate the embedded example config (--print-config)
+      - name: Validate the embedded example config
         run: |
           set -euo pipefail
           cargo run --locked --quiet -- --config cachette.example.toml --print-config > /dev/null
@@ -235,12 +235,12 @@ jobs:
       # locate package docker-cli") while the identical block ran green in
       # push-checks minutes later. The mirror is the hazard - drop it, don't
       # retry it.
-      - name: Cache the pinned docker-compose binary (cachette-backed)
+      - name: Cache the pinned docker-compose binary
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
           key: cachette-docker-compose-5.6.0-linux-amd64
-      - name: Install docker-compose (standalone release binary, retried)
+      - name: Install compose
         run: |
           set -euo pipefail
           # Cache hit: the pinned binary was restored - skip the download.
@@ -271,7 +271,7 @@ jobs:
   # regexYbot-shaped: pushed on the release branch, validated elsewhere.
   # ---------------------------------------------------------------------------
   docker:
-    name: docker (publish on release push, validate otherwise)
+    name: docker
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -292,7 +292,7 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Cache the pinned docker CLI (cachette-backed)
+      - name: Cache the pinned docker CLI
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker
@@ -302,7 +302,7 @@ jobs:
       # exact runners) - avoids apt and deb.debian.org entirely. Only the
       # client is needed: buildx (set up just below) runs buildkit in its own
       # container; no dockerd is involved in this job.
-      - name: Install docker CLI (static tarball, retried)
+      - name: Install docker CLI
         run: |
           set -euo pipefail
           # Cache hit: the pinned binary was restored - skip the download.
@@ -323,13 +323,13 @@ jobs:
           echo "::error::could not install the docker CLI after 3 attempts"
           exit 1
 
-      - name: Set up QEMU (arm64 builder stage emulation)
+      - name: Set up QEMU
         uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
 
-      - name: Log in to the forge registry (release pushes only)
+      - name: Log in to the forge registry
         if: github.ref == 'refs/heads/release'
         uses: https://hangar.nixthedev.ru/docker/login-action@v3
         with:
@@ -408,7 +408,7 @@ jobs:
 
       # Non-release refs: validation build only (amd64, --load, nothing leaves
       # the runner); the built binary must RUN and print the exact version.
-      - name: Validation build (amd64 --load)
+      - name: Validation build
         if: github.ref != 'refs/heads/release'
         shell: bash
         run: |

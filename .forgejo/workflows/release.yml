@@ -138,7 +138,7 @@ jobs:
           echo "ref=${GITHUB_REF} version=$version tag=v$version publish=$publish"
 
   build:
-    name: build (${{ matrix.target }})
+    name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -173,7 +173,7 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Install stable Rust (${{ matrix.target }})
+      - name: Install stable Rust ${{ matrix.target }}
         id: toolchain
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
@@ -182,7 +182,7 @@ jobs:
       # Cache the per-target toolchain + std libs (the slow rustup leg on these
       # runners); matrix.target keeps the different std libraries apart, and
       # dtolnay's `cachekey` output pins the exact stable version.
-      - name: Cache rustup toolchains (cachette-backed)
+      - name: Cache rustup toolchains
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
@@ -196,7 +196,7 @@ jobs:
       # ---- Linux musl legs: cargo-zigbuild (justification block at top) ----
       # If a zig release ever regresses cargo-zigbuild, pin a known-good one
       # here (e.g. `with: { version: 0.14.1 }`) and note it in the header.
-      - name: Install zig (C toolchain for cargo-zigbuild)
+      - name: Install zig
         if: matrix.zigbuild == true
         uses: https://github.com/mlugg/setup-zig@v2
 
@@ -204,12 +204,12 @@ jobs:
         if: matrix.zigbuild == true
         run: cargo install cargo-zigbuild --locked
 
-      - name: Build (cargo zigbuild -> static musl)
+      - name: Build
         if: matrix.zigbuild == true
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       # ---- Smoke: native artifacts actually RUN --version ----
-      - name: Smoke - run native binary (--version -> "cachette 0.1.0")
+      - name: Smoke - run native binary --version
         if: matrix.smoke == 'run'
         shell: bash
         run: |
@@ -224,7 +224,7 @@ jobs:
           fi
 
       # ---- Smoke: cross Linux artifact (file/uname - cannot execute) ----
-      - name: Smoke - cross linux artifact (file + uname)
+      - name: Smoke - cross linux artifact
         if: matrix.smoke == 'cross-linux'
         shell: bash
         run: |
@@ -242,7 +242,7 @@ jobs:
       # ---- Smoke: cross Windows artifact ----
       # file(1) may be absent from the runner's Git Bash - run it when present,
       # then ALWAYS assert the PE COFF machine field below (stronger/equal proof).
-      - name: Smoke - cross windows artifact (file, if available)
+      - name: Smoke - cross windows artifact file
         if: matrix.smoke == 'cross-windows'
         shell: bash
         run: |
@@ -255,7 +255,7 @@ jobs:
             echo "file(1) not on this runner - PE machine asserted in the next step"
           fi
 
-      - name: Smoke - cross windows artifact (PE machine)
+      - name: Smoke - cross windows artifact PE machine
         if: matrix.smoke == 'cross-windows'
         shell: pwsh
         run: |
@@ -296,7 +296,7 @@ jobs:
           if-no-files-found: error
 
   checksums:
-    name: checksums (SHA256SUMS)
+    name: checksums
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -332,7 +332,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: publish release (${{ needs.version.outputs.tag }})
+    name: publish release
     needs: [build, checksums, version]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -345,7 +345,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish release and attach assets (retry)
+      - name: Publish release and attach assets
         shell: bash
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
