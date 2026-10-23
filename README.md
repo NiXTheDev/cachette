@@ -13,6 +13,10 @@ the runner-facing endpoints, the other serves the clustering needs (see
 - Optional peer-to-peer clustering discovers nodes, tracks capacity, and places
   a cache write on the least-loaded healthy owner.
 
+> **Dogfooded.** cachette serves cachette: this project's own CI uses a live
+> deployment as the `docker buildx` layer cache for every build (see
+> [CI & releases](#ci--releases)).
+
 ## Features
 
 - **Dual protocol on the cache port.** v1 `/_apis/artifactcache/*` and v2
