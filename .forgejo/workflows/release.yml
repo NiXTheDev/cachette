@@ -55,14 +55,29 @@
 #     the exact fact `file(1)` would report; a `file`-based check runs too
 #     whenever `file` exists on the runner.
 #
+#     MSVC windows binaries are NOT shipped (recorded decision, v1.0.0 cut):
+#     `*-pc-windows-msvc` is unreachable through cargo-zigbuild - `zig cc`
+#     covers only the GNU (mingw) PE ABI - so a real msvc cross build means a
+#     SECOND toolchain: cargo-xwin (or xwin + lld-link), LLVM clang-cl, and
+#     the ~1 GiB MSVC CRT / Windows SDK download from Microsoft with its own
+#     cache step. The gnu binaries run fine on Windows 10/11, so wiring
+#     unproven msvc legs days before the cut was declined on purpose. If the
+#     need ever materializes (users whose tooling insists on msvc linkage),
+#     add two msvc matrix legs driven by
+#     `cargo xwin build --release --target <triple>` with `~/.xwin` cached,
+#     and record the change HERE - this header is the toolchain contract,
+#     not the commit log.
+#
 # Local-dev limitation (recorded by task 36): the dev workstation has NO
 # zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
 # installed, so the cross legs are CI-validated only; the YAML itself is
 # gated locally with `actionlint` (0 errors).
 #
-# Native artifacts (linux x86_64-musl, windows x86_64-msvc) RUN
-# `cachette --version` and assert stdout == `cachette 1.0.0`; cross artifacts
-# are verified via `file`/`uname` (linux) and the PE-machine equivalent.
+# Smoke tests: the native linux-x86_64-musl artifact RUNs and asserts
+# `cachette 1.0.0` on `--version`; the cross artifacts (aarch64-musl, both
+# windows legs) cannot execute on the runner, so they are verified
+# structurally instead - `file`(1)/`uname` on linux, the PE machine field
+# asserted unconditionally on windows (`file` too whenever present).
 #
 # =============================================================================
 # PUBLISHING (plan task 53): the forge release + its binaries. Binaries +
@@ -162,13 +177,13 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-pc-windows-gnu
             zigbuild: true
-            artifact: cachette-x86_64-pc-windows-msvc
+            artifact: cachette-x86_64-pc-windows-gnu
             bin: cachette.exe
             smoke: cross-windows
           - os: ubuntu-latest
             target: aarch64-pc-windows-gnu
             zigbuild: true
-            artifact: cachette-aarch64-pc-windows-msvc
+            artifact: cachette-aarch64-pc-windows-gnu
             bin: cachette.exe
             smoke: cross-windows
     steps:
