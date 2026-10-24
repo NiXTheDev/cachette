@@ -47,12 +47,15 @@
 # be ignored. Use Authorized Integrations ...". Capabilities come from the
 # forge's Authorized Integrations, so none is declared here.
 #
-# NOTE (timeouts): the budgets below are deliberately GENEROUS. `static.rust-lang.org`
-# is very slow from these runners (~65 KB/s), so a cold `rustup toolchain install`
-# alone can eat 20-25 min. The rustup toolchains dir is itself cached (keyed on
-# dtolnay's `cachekey` output), so the download happens once per stable version;
-# a cold run still needs the wide budget, and a job killed mid-install seeds
-# nothing. Tighten only once the install is known to be fast.
+# NOTE (job budgets): the per-job `timeout-minutes` caps were removed - the
+# runner-level job timeout (24h on every runner of the fleet) now applies
+# per job: docker gets 24h, docs gets 24h, and so on, each with its own
+# window. Lesson worth keeping visible: `static.rust-lang.org` is very slow
+# from these runners (~65 KB/s), so a cold `rustup toolchain install` alone
+# can eat 20-25 min. The rustup toolchains dir is itself cached (keyed on
+# dtolnay's `cachekey` output), so the download happens once per stable
+# version - but a job killed mid-install seeds nothing, so the clock needs
+# real headroom, and a killed compile also loses its in-flight layer cache.
 name: Push Checks
 
 on:
@@ -75,7 +78,6 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,7 +102,6 @@ jobs:
   check:
     name: check
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,7 +124,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,7 +149,6 @@ jobs:
     name: test
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -203,7 +202,6 @@ jobs:
     name: docs
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -283,7 +281,6 @@ jobs:
     name: docker
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
       # buildkit layer cache <-> cachette (the same server this workflow tests

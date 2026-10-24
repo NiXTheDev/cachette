@@ -117,7 +117,6 @@ jobs:
   version:
     name: resolve version
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -157,7 +156,6 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -316,7 +314,6 @@ jobs:
     name: checksums
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Download all built binaries
         uses: actions/download-artifact@v4
@@ -353,7 +350,6 @@ jobs:
     needs: [build, checksums, version]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     # Release publish needs `contents: write` - granted via Authorized Integrations.
     steps:
       - name: Download every built binary + SHA256SUMS

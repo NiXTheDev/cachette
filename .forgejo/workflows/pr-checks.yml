@@ -1,5 +1,5 @@
 # PR gate for cachette (was ci.yml; the push twin is push-checks.yml).
-# Same five jobs, same budgets, same semantics - split out only so that a
+# Same five jobs, same semantics - split out only so that a
 # pull-request run and a push run no longer auto-cancel each other, and so
 # the two triggers read independently.
 #
@@ -32,7 +32,6 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,7 +56,6 @@ jobs:
   check:
     name: check
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,7 +78,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -106,7 +103,6 @@ jobs:
     name: test
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -152,7 +148,6 @@ jobs:
     name: docs
     needs: [fmt, check, clippy]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -226,7 +221,6 @@ jobs:
     name: docker
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
       CACHE_ARGS: >-
