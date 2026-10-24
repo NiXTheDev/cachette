@@ -87,6 +87,11 @@ fn plant_rowless_blob(data_dir: &Path, id: &str, age_secs: u64) {
 /// Spawn the real binary against `config_path` and wait for it to exit,
 /// bounded by the 10s grace window. `test_trigger_ms` arms the documented
 /// test-only shutdown trigger.
+///
+/// Both output streams are drained into in-memory buffers while the child
+/// runs, so a timed-out wait still reports every byte the child logged plus
+/// its pid and termination state — a hung child must never vanish silently
+/// into a killed pipe.
 async fn run_binary(config_path: &Path, test_trigger_ms: Option<u64>) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_cachette"));
     command
@@ -100,11 +105,45 @@ async fn run_binary(config_path: &Path, test_trigger_ms: Option<u64>) -> std::pr
     if let Some(ms) = test_trigger_ms {
         command.env("CACHETTE_TEST_SHUTDOWN_AFTER_MS", ms.to_string());
     }
-    let child = command.spawn().expect("spawn cachette");
-    tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
-        .await
-        .expect("process exits within 10s")
-        .expect("wait succeeds")
+    let mut child = command.spawn().expect("spawn cachette");
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut err_buf: Vec<u8> = Vec::new();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let (status, out_done, err_done) = tokio::join!(
+            child.wait(),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut out_buf),
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut err_buf),
+        );
+        out_done.expect("stdout read");
+        err_done.expect("stderr read");
+        status.expect("wait succeeds")
+    })
+    .await;
+
+    match result {
+        Ok(status) => std::process::Output {
+            status,
+            stdout: out_buf,
+            stderr: err_buf,
+        },
+        Err(elapsed) => {
+            let state = child.try_wait().expect("try_wait");
+            child.kill().await.ok();
+            panic!(
+                "process exits within 10s: {elapsed:?} (pid {pid:?}, try_wait {state:?})\n\
+                 --- captured stdout ({}) bytes ---\n{}\n\
+                 --- captured stderr ({}) bytes ---\n{}",
+                out_buf.len(),
+                String::from_utf8_lossy(&out_buf),
+                err_buf.len(),
+                String::from_utf8_lossy(&err_buf),
+            );
+        }
+    }
 }
 
 fn combined_output(output: &std::process::Output) -> String {
