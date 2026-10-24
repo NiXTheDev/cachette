@@ -280,7 +280,7 @@ jobs:
   docker:
     name: docker
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64
     env:
       CARGO_TERM_COLOR: always
       # buildkit layer cache <-> cachette (the same server this workflow tests
@@ -302,7 +302,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker
-          key: cachette-docker-cli-28.0.4-${{ runner.arch }}
+          key: docker-cli-28.0.4-${{ runner.arch }}
 
       # Docker CLI as a STATIC binary (the recipe regexYbot's proven on these
       # exact runners) - avoids apt and deb.debian.org entirely. Only the
@@ -332,8 +332,71 @@ jobs:
       - name: Set up QEMU
         uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
-        uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
+      # The buildx CLI plugin: Cache the pinned binary and skip the per-job
+      # GitHub gamble. The setup-buildx-action re-downloaded the buildx
+      # binary from github.com on EVERY job and died three times in a row
+      # on a flaky proxy window (empty ::error:: after 21s in the download
+      # group). The pin means the download is a cold, cache-evicted-miss
+      # corner case instead of a per-job dice roll.
+      - name: Cache the pinned buildx CLI
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/lib/docker/cli-plugins/docker-buildx
+          key: buildx-0.38.1-${{ runner.arch }}
+
+      - name: Pin the buildx CLI
+        run: |
+          set -euo pipefail
+          # Cache hit: the pinned binary was restored - assert the docker
+          # CLI sees the plugin - skip the download.
+          if /usr/local/lib/docker/cli-plugins/docker-buildx version 2>/dev/null | grep -q 'v0.38.1'; then
+            echo "buildx present from cache: $(/usr/local/lib/docker/cli-plugins/docker-buildx version)"
+            docker buildx version
+            exit 0
+          fi
+          # The daemon may bundle its own buildx (Docker Desktop does) -
+          # version-matched against the pin, so the cache key stays honest.
+          if docker buildx version 2>/dev/null | grep -q 'v0.38.1'; then
+            echo "buildx bundled by the daemon matches the pin: $(docker buildx version)"
+            exit 0
+          fi
+          case "$(uname -m)" in
+            x86_64)  asset="buildx-v0.38.1.linux-amd64" ;;
+            aarch64) asset="buildx-v0.38.1.linux-arm64" ;;
+            *) echo "::error::unsupported arch for buildx: $(uname -m)"; exit 1 ;;
+          esac
+          url="https://github.com/docker/buildx/releases/download/v0.38.1/${asset}"
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          for attempt in 1 2 3; do
+            echo "== buildx download attempt $attempt =="
+            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/lib/docker/cli-plugins/docker-buildx && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx; then
+              /usr/local/lib/docker/cli-plugins/docker-buildx version
+              exit 0
+            fi
+            rm -f /usr/local/lib/docker/cli-plugins/docker-buildx
+            echo "attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::could not install the buildx CLI after 3 attempts"
+          exit 1
+
+      # Same builder contract the setup-buildx-action kept: a docker-container
+      # driver, used in context, released after the job (its `cleanup: true`).
+      # The builder name is random per attempt so concurrent legs on one host
+      # (push + PR round, re-runs) never collide on the daemon.
+      - name: Create the buildx builder
+        id: builder
+        run: |
+          set -euo pipefail
+          builder="cachette-ci-${RANDOM}${RANDOM}"
+          echo "name=${builder}" >> "$GITHUB_OUTPUT"
+          docker buildx create --name "${builder}" --driver docker-container --use
+          docker buildx inspect --bootstrap "${builder}" | sed -n '1,16p'
+        shell: bash
+
+      - name: Release the buildx builder
+        if: always()
+        run: docker buildx rm "${{ steps.builder.outputs.name }}" >/dev/null 2>&1 || true
 
       # Account-wide registry token (the same credentials regexYbot's pipelines
       # use): the default GITHUB_TOKEN has no registry write on Forgejo.
