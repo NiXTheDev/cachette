@@ -47,7 +47,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: rustfmt --check
@@ -69,7 +69,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: cargo check
@@ -93,7 +93,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: clippy -D warnings
@@ -116,7 +116,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -161,7 +161,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
       - name: Validate the embedded example config
@@ -177,7 +177,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
-          key: cachette-docker-compose-5.6.0-${{ runner.arch }}
+          key: docker-compose-5.6.0-${{ runner.arch }}
       - name: Install compose
         run: |
           set -euo pipefail

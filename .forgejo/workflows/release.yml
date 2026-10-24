@@ -201,7 +201,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: cachette-rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
 
       - name: Cache cargo registry/build
         uses: https://github.com/Swatinem/rust-cache@v2
