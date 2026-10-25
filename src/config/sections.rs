@@ -49,6 +49,9 @@ impl Default for ServerConfig {
 pub struct StorageConfig {
     pub backend: Backend,
     pub fs: FsConfig,
+    /// Finalize-time content-defined chunking (v1.1); `[storage.cdc]` may
+    /// be absent entirely - everything defaults off.
+    pub cdc: CdcConfig,
 }
 
 impl Default for StorageConfig {
@@ -56,6 +59,7 @@ impl Default for StorageConfig {
         Self {
             backend: Backend::Fs,
             fs: FsConfig::default(),
+            cdc: CdcConfig::default(),
         }
     }
 }
@@ -83,6 +87,30 @@ impl Default for FsConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Fs,
+}
+
+/// `[storage.cdc]` - finalize-time content-defined chunking (v1.1; the
+/// contract lives in `docs/cdc.md`). Off by default: entries are stored
+/// whole exactly as in v1.0, and the read path stays chunk-aware regardless
+/// of the flag, so flipping it off never orphans already-chunked data.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdcConfig {
+    /// Cut finalized payloads into deduplicated content chunks at rest.
+    pub enabled: bool,
+    /// Target mean chunk size in bytes; validation keeps it within
+    /// [`MIN_AVG_CHUNK_BYTES`](crate::storage::cdc::MIN_AVG_CHUNK_BYTES)
+    /// ..[`MAX_AVG_CHUNK_BYTES`](crate::storage::cdc::MAX_AVG_CHUNK_BYTES).
+    pub avg_chunk_bytes: u64,
+}
+
+impl Default for CdcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            avg_chunk_bytes: crate::storage::cdc::DEFAULT_AVG_CHUNK_BYTES,
+        }
+    }
 }
 
 /// `[cache]` - local size accounting + eviction knobs.

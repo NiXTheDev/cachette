@@ -37,8 +37,9 @@ dedup contract. The algorithm version gets a constant
 would be namespaced under the new version before any code rolls content
 (nowhere do chunks mix attrs).
 
-Fixed bounds (`avg` configurable, `min = avg/4`, `max = avg/2` - documented
-per FastCDC convention):
+Fixed bounds (`avg` configurable, `min = avg/4`, `max = avg * 4`), so the
+cutting window keeps finalize-time per-chunk buffering bounded (4 MiB at
+the default average) and the tracked bounds carry real file-size meaning:
 
 - default `avg_chunk_bytes = 131072` (128 KiB) -> min 32 KiB, max 512 KiB.
 

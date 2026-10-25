@@ -30,6 +30,17 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     if config.server.max_chunk_bytes == 0 {
         return Err(ConfigError::ZeroMaxChunkBytes);
     }
+    // `[storage.cdc] avg_chunk_bytes` outside the chunker window — checked
+    // regardless of `enabled` (docs/cdc.md §Config surface): a bad value
+    // must not hide until the flag one day flips on.
+    let cdc = config.storage.cdc;
+    if cdc.avg_chunk_bytes < crate::storage::cdc::MIN_AVG_CHUNK_BYTES
+        || cdc.avg_chunk_bytes > crate::storage::cdc::MAX_AVG_CHUNK_BYTES
+    {
+        return Err(ConfigError::CdcAvgRange {
+            value: cdc.avg_chunk_bytes,
+        });
+    }
     if let Some(cert_path) = config.cluster.cert_path.as_ref()
         && *cert_path == config.storage.fs.path
     {
@@ -282,6 +293,35 @@ mod tests {
             matches!(err, ConfigError::ZeroMaxChunkBytes),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// The avg window is validated regardless of `enabled` (docs/cdc.md):
+    /// a value outside `[32KiB, 1MiB]` must be named wherever it is edited.
+    #[test]
+    fn cdc_avg_chunk_bytes_is_capped_either_side() {
+        for value in [32 * 1024 - 1, 1024 * 1024 + 1, 0, 1024 * 1024 * 1024] {
+            let mut config = Config::default();
+            config.storage.cdc.avg_chunk_bytes = value;
+            let err = validate(&config).expect_err("outside the chunker window");
+            match &err {
+                ConfigError::CdcAvgRange { value: got } if *got == value => {}
+                other => panic!("for {value}: expected CdcAvgRange, got {other:?}"),
+            }
+            // ...and the same bad value is rejected disabled or not.
+            config.storage.cdc.enabled = true;
+            assert!(
+                matches!(validate(&config), Err(ConfigError::CdcAvgRange { .. })),
+                "the enabled flag must not dodge the cap check"
+            );
+        }
+
+        let mut config = Config::default();
+        config.storage.cdc.avg_chunk_bytes = 32 * 1024;
+        assert!(validate(&config).is_ok());
+        config.storage.cdc.avg_chunk_bytes = 1024 * 1024;
+        assert!(validate(&config).is_ok());
+        config.storage.cdc.enabled = true;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

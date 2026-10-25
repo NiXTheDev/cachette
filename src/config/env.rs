@@ -45,6 +45,8 @@ const FIELDS: &[Field] = &[
     field(&["storage"], "backend", Kind::Str),
     field(&["storage", "fs"], "path", Kind::Str),
     field(&["storage", "fs"], "min_free", Kind::MinFree),
+    field(&["storage", "cdc"], "enabled", Kind::Bool),
+    field(&["storage", "cdc"], "avg_chunk_bytes", Kind::U64),
     field(&["cache"], "max_size", Kind::U64),
     field(&["cache"], "eviction", Kind::Str),
     field(&["cache"], "key_case", Kind::Str),
@@ -242,23 +244,26 @@ mod tests {
 
     #[test]
     fn bare_unique_key_prefix_matches_its_section() {
-        // `listen` exists in both `[server]` and `[cluster]`, so a bare
-        // `LISTEN` is ambiguous and rejected; the full names still work.
+        // `listen` exists in both `[server]` and `[cluster]`, and `enabled`
+        // in both `[cluster]` and `[storage.cdc]`, so bare keys for either
+        // are ambiguous and rejected; the full names still work.
         let listen = apply_one("CACHETTE__SERVER__LISTEN", "127.0.0.1:9002").expect("applies");
         assert_eq!(listen["server"]["listen"], "127.0.0.1:9002");
-        let ambiguous =
-            apply_one("CACHETTE__LISTEN", "127.0.0.1:9002").expect_err("ambiguous bare key");
-        assert!(
-            matches!(&ambiguous, ConfigError::UnknownEnvVar(var) if var == "CACHETTE__LISTEN"),
-            "unexpected error: {ambiguous:?}"
-        );
+        for bare in ["CACHETTE__LISTEN", "CACHETTE__ENABLED"] {
+            let ambiguous = apply_one(bare, "true").expect_err("ambiguous bare key");
+            assert!(
+                matches!(&ambiguous, ConfigError::UnknownEnvVar(var) if var == bare),
+                "unexpected error: {ambiguous:?}"
+            );
+        }
+        let cluster_enabled = apply_one("CACHETTE__CLUSTER__ENABLED", "true").expect("applies");
+        assert_eq!(cluster_enabled["cluster"]["enabled"], json!(true));
+        let cdc_enabled = apply_one("CACHETTE__STORAGE__CDC__ENABLED", "false").expect("applies");
+        assert_eq!(cdc_enabled["storage"]["cdc"]["enabled"], json!(false));
 
         // `advertise_addr` exists only in `[cluster]`, so a bare prefix maps.
         let advertise = apply_one("CACHETTE__ADVERTISE_ADDR", "cache-a:9001").expect("applies");
         assert_eq!(advertise["cluster"]["advertise_addr"], "cache-a:9001");
-
-        let enabled = apply_one("CACHETTE__ENABLED", "true").expect("applies");
-        assert_eq!(enabled["cluster"]["enabled"], json!(true));
     }
 
     #[test]

@@ -64,6 +64,12 @@ pub enum ConfigError {
     #[error("cluster.cert_path must differ from storage.fs.path")]
     CertPathCollides,
 
+    /// `[storage.cdc] avg_chunk_bytes` outside the chunker's useful window;
+    /// validated regardless of `enabled` so a bad value cannot hide until
+    /// the flag flips on.
+    #[error("storage.cdc.avg_chunk_bytes must be within 32768..=1048576 (got {value})")]
+    CdcAvgRange { value: u64 },
+
     /// `[auth] secret` missing at serve time (not checked by `--print-config`).
     #[error(
         "auth.secret is required to serve: set [auth] secret in the config file or the \
