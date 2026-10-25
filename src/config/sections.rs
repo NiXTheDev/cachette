@@ -140,6 +140,8 @@ pub struct AuthConfig {
     pub tokens: Vec<String>,
     /// 0 = disabled (GitHub parity, M14).
     pub hmac_max_age_seconds: u64,
+    /// OIDC RS256 bearer acceptance (v1.1); `None` = table absent = disabled.
+    pub oidc: Option<OidcConfig>,
 }
 
 impl Default for AuthConfig {
@@ -149,6 +151,7 @@ impl Default for AuthConfig {
             secret: None,
             tokens: Vec::new(),
             hmac_max_age_seconds: 600,
+            oidc: None,
         }
     }
 }
@@ -160,6 +163,51 @@ pub enum AuthMode {
     Hmac,
     Bearer,
     Merge,
+}
+
+/// `[auth.oidc]` - OIDC RS256 bearer acceptance (v1.1 workstream A;
+/// docs/oidc.md is the contract). Entirely default-off: omitting the table
+/// (or leaving `enabled = false`) leaves v1.0 behavior byte-identical.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcConfig {
+    pub enabled: bool,
+    /// IdPs whose tokens are accepted; required when `enabled`.
+    pub issuers: Vec<String>,
+    /// `aud` values a token may state (any of); required when `enabled`.
+    pub audiences: Vec<String>,
+    /// `issuer -> explicit JWKS URL` override; the default endpoint is
+    /// `{issuer}/.well-known/jwks.json` (docs/oidc.md §JWKS handling).
+    pub jwks_urls: BTreeMap<String, String>,
+    /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
+    /// Array-valued claims authorize when they contain the value.
+    pub require: BTreeMap<String, String>,
+    /// Clock skew tolerated on `exp`/`nbf` (seconds).
+    pub leeway_seconds: u64,
+    /// Periodic JWKS re-fetch interval (lazy unknown-kid refresh happens
+    /// regardless); 0 is rejected by `config::validate`.
+    pub jwks_refresh_seconds: u64,
+    /// Hard cap on cached keys server-wide (rotation-flooding guard).
+    pub jwks_max_keys: usize,
+    /// PEM bundle serving as the JWKS fetcher's trust roots (self-hosted
+    /// IdPs commonly need it); required when `enabled`.
+    pub jwks_ca_pem: Option<PathBuf>,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuers: Vec::new(),
+            audiences: Vec::new(),
+            jwks_urls: BTreeMap::new(),
+            require: BTreeMap::new(),
+            leeway_seconds: 30,
+            jwks_refresh_seconds: 1800,
+            jwks_max_keys: 32,
+            jwks_ca_pem: None,
+        }
+    }
 }
 
 /// `[v1]` - artifactcache protocol knobs.

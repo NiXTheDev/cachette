@@ -11,7 +11,9 @@
 
 pub mod bearer;
 pub mod hmac;
+pub mod jwks;
 pub mod jwt;
+pub mod oidc;
 pub mod tokens;
 pub mod urls;
 

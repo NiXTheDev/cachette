@@ -93,10 +93,14 @@ accounting/loss surfaces.
   (`jwks_refresh_seconds`, default 1800), and **lifted on a unknown kid hit**
   (lazy refresh, singleflighted - one fetch in flight, other requests await or
   fail with the current knowledge cerated).
-- Signature verification uses `ring::signature::RSA_PKCS1_SHA256`.
-  `ring` is **already compiled in the tree via rustls**; this design promotes
-  it to an explicit direct dependency. Zero new compilation units, but it is a
-  direct dep addition - flagged for approval per the no-new-crates rule.
+- Signature verification uses `aws_lc_rs::signature::RsaPublicKeyComponents`
+  with RSA PKCS#1 SHA-256 (2048-8192-bit params). `aws-lc-rs` is the crypto
+  provider rustls *already resolves in this tree* (default since rustls 0.23,
+  see `cluster/tls_client.rs`), so this design promotes it to an explicit
+  direct dependency. Zero new compilation units, but it is a direct dep
+  addition - flagged for approval per the no-new-crates rule. (The original
+  draft named `ring`: same API surface - aws-lc-rs is the maintained fork
+  ring merged into - but wrong driver; corrected during implementation.)
 - `ES256`/`PS256` stays out of scope; single-alg keeps the pin meaningful.
 
 ### Fetching

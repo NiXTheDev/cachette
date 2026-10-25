@@ -75,6 +75,26 @@ pub enum ConfigError {
     #[error("auth.secret must be at least 16 characters (got {len})")]
     ShortSecret { len: usize },
 
+    /// `[auth.oidc]` enabled without a required list, pin or CA bundle.
+    #[error("auth.oidc is enabled but {field} must be configured")]
+    OidcMissingRequired { field: &'static str },
+
+    /// `[auth.oidc] jwks_refresh_seconds` is zero.
+    #[error("auth.oidc.jwks_refresh_seconds must be greater than 0")]
+    OidcZeroRefresh,
+
+    /// `[auth.oidc] jwks_max_keys` is zero.
+    #[error("auth.oidc.jwks_max_keys must be greater than 0")]
+    OidcZeroMaxKeys,
+
+    /// `auth.oidc.jwks_urls` names an issuer missing from `issuers`.
+    #[error("auth.oidc.jwks_urls key {issuer:?} is not listed in auth.oidc.issuers")]
+    OidcJwksIssuerUnknown { issuer: String },
+
+    /// A `jwks_urls` endpoint (or a default derivation target) is not HTTPS.
+    #[error("auth.oidc JWKS endpoint for {issuer:?} must be https (got {url})")]
+    OidcJwksPlaintext { issuer: String, url: String },
+
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.
     #[error("internal config serialization error: {0}")]
