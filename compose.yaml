@@ -1,0 +1,87 @@
+# cachette - sample compose deployment (plan task 36)
+#
+# Single node (active below) + an OPTIONAL second node for the cluster demo
+# (fully commented out by default). To run the two-node demo, uncomment BOTH:
+#   1. the CACHETTE__CLUSTER__* lines in the `cachette` service environment
+#   2. the whole `cachette-node2` service
+# then `docker compose up -d`.
+#
+# Quick start:
+#   docker compose build            # builds cachette:local from ./Dockerfile
+#   docker compose up -d
+#   docker compose logs -f          # wait for: cachette listening on http://0.0.0.0:8080
+#   curl http://127.0.0.1:8080/health   # plain HTTP (no -k needed)
+#   docker compose down
+#
+# Notes:
+#   * Image is scratch-based (musl static, non-root uid 65532): no shell inside,
+#     therefore no in-container healthcheck - readiness = the log line above.
+#   * Port 8080 is [server] listen = "0.0.0.0:8080"; the main listener is
+#     plaintext HTTP unless the mounted config sets tls_cert/tls_key (see the
+#     commented tls volume below) - terminate public TLS at a reverse proxy.
+#   * When clustering is enabled, peers dial the dedicated [cluster] listen
+#     port (default 0.0.0.0:8081 inside the container), which is always TLS
+#     and needs no CA - trust is by peer fingerprint.
+#   * Auth secret must be >= 16 chars; the default below is demo-only. Set
+#     CACHETTE_AUTH_SECRET in the environment to override. The same secret is
+#     shared by both nodes in the cluster demo.
+#   * To consume a published image instead of building locally, replace
+#     `image: cachette:local` with the pushed tag, e.g.
+#     hangar.nixthedev.ru/<owner>/cachette:1.0.0 (see .forgejo/workflows/release.yml).
+
+name: cachette
+
+services:
+  cachette:
+    image: cachette:local
+    build:
+      context: .
+    ports:
+      # [server] listen = "0.0.0.0:8080" (plain HTTP unless tls_cert/tls_key
+      # are set in the config - TLS on the edge is the proxy's job by default)
+      - "8080:8080"
+    environment:
+      # Serving requires an auth secret >= 16 chars (override in real use):
+      CACHETTE__AUTH__SECRET: ${CACHETTE_AUTH_SECRET:-compose-demo-secret-please-override}
+      # --- cluster demo (node "cache-a"): uncomment together with cachette-node2 ---
+      # Peers dial the dedicated [cluster] listen port (8081 inside the
+      # container, always TLS); the [server] port stays the runner-facing edge.
+      # CACHETTE__CLUSTER__ENABLED: "true"
+      # CACHETTE__CLUSTER__NODE_ID: "cache-a"
+      # CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette:8081"
+      # CACHETTE__CLUSTER__SEEDS: "cachette-node2:8081"
+    volumes:
+      # Mounted config (same shape as the image's baked-in demo config):
+      - ./cachette.example.toml:/etc/cachette/cachette.toml:ro
+      # TLS material for [server] tls_cert / tls_key (uncomment when configured):
+      # - ./tls:/etc/cachette/tls:ro
+      # Persistent blob storage ([storage.fs] path = /var/lib/cachette):
+      - cachette-data:/var/lib/cachette
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # Optional SECOND NODE for the cluster demo - commented out by default.
+  # Uncomment this block together with the CACHETTE__CLUSTER__* lines in the
+  # `cachette` service above. It gets a DISTINCT data volume
+  # (cachette-node2-data) and host port (8081 -> container 8080) so both nodes
+  # can run on one host.
+  # -----------------------------------------------------------------------
+  # cachette-node2:
+  #   image: cachette:local
+  #   ports:
+  #     - "8081:8080"
+  #   environment:
+  #     CACHETTE__AUTH__SECRET: ${CACHETTE_AUTH_SECRET:-compose-demo-secret-please-override}
+  #     CACHETTE__CLUSTER__ENABLED: "true"
+  #     CACHETTE__CLUSTER__NODE_ID: "cache-b"
+  #     CACHETTE__CLUSTER__ADVERTISE_ADDR: "cachette-node2:8081"
+  #     CACHETTE__CLUSTER__SEEDS: "cachette:8081"
+  #   volumes:
+  #     - cachette-node2-data:/var/lib/cachette
+  #   restart: unless-stopped
+
+volumes:
+  # Data volume for the active single node:
+  cachette-data:
+  # Data volume for the optional second node (used once uncommented above):
+  cachette-node2-data:

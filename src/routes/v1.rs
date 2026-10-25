@@ -1,0 +1,763 @@
+//! v1 artifactcache route skeleton (plan task 18).
+//!
+//! The GitHub Actions cache v1 HTTP contract, minus the storage machinery that
+//! later tasks own. This module fixes the **status-code contract** (criterion
+//! 1) so the real logic can be dropped in behind it:
+//!
+//! - `GET  /_apis/artifactcache/cache?keys=&version=` — fully wired: exact-then
+//!   prefix lookup ([`crate::storage::lookup`]) over finalized entries, with a
+//!   signed `archiveLocation` on a hit ([`crate::auth::urls::mint`], task 16)
+//!   and an **empty** 204 on a miss.
+//! - `POST /_apis/artifactcache/caches` — reserve: rejects a duplicate finalized
+//!   `(key, version)` with 409, stages an expiry-stamped reservation under a
+//!   fresh numeric `cacheId` (GitHub's v1 contract), and reports `cacheSize =
+//!   max(0, max_size - used_bytes)`. Version siblings live behind the
+//!   artifact-key primary index (tasks 30/31).
+//! - `PATCH /_apis/artifactcache/caches/{cacheId}` — accepts a chunk and
+//!   returns 204. The parts/resume machinery lands in task 20.
+//! - `POST /_apis/artifactcache/caches/{cacheId}` `{size}` — commit: assemble
+//!   the staged chunks, verify their total equals `{size}`, publish the entry
+//!   under its artifact key (superseding a same-key sibling), and return 204
+//!   (task 21). A size mismatch is 400 and marks the reservation for reaping.
+//! - `GET  /_apis/artifactcache/artifacts/{cacheId}` — download: full 200 or a
+//!   206 slice with `Content-Range`, gated by a signed URL in bearer/merge or
+//!   clustered deployments, via [`crate::storage::StorageBackend`].
+//! - `POST /_apis/artifactcache/caches/clean` — 200 no-op.
+//!
+//! Deliberate skeleton limits (documented so later tasks can lift them):
+//! - Supersede keeps one visible entry per artifact key (last-writer-wins);
+//!   same-key versions are replaced, not stored side-by-side.
+//! - [`crate::storage::StorageBackend::list`] yields `EntryStat`, which carries
+//!   no protocol `version`; the requested version is stamped onto the candidate
+//!   entries so `lookup`'s exact-then-prefix ordering is exercised end-to-end
+//!   until task 19/21 add the versioned reservation index.
+//! - `archiveLocation` is absolute when `server.external_url` is known
+//!   (production always resolves it from `listen`) and host-relative otherwise
+//!   (unit fixtures that omit the host). Real clients GET it verbatim, so the
+//!   absolute value is required off-box (task 22).
+
+use std::collections::HashMap;
+use std::io;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::Json;
+use axum::body::{Body, to_bytes};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+use tokio::io::AsyncReadExt;
+
+use super::body_io::{BodyReader, LimitedReader};
+use crate::auth::{self, urls};
+use crate::cluster::relay::{self, RelayCommit, RelayReserve, RelayUpload};
+use crate::config::{AuthMode, KeyCase};
+use crate::error::ApiError;
+use crate::metrics::RelayFailure;
+use crate::state::AppState;
+use crate::storage::eviction::Capacity;
+use crate::storage::{
+    ByteStream, Chunk, ChunkRange, Entry, LocalRelay, RelayTransport, StorageBackend, Version,
+    lookup, normalize_key,
+};
+
+/// Signed-URL TTL for `archiveLocation` (seconds). Mirrors
+/// `config.v1.signed_url_ttl_seconds` (`V1Config::default()`); wiring the live
+/// config into `AppState` is a later task (main.rs is task-34-owned).
+const SIGNED_URL_TTL_SECONDS: u64 = 900;
+
+/// HMAC secret fallback when `auth.secret` is unset (tests / `--print-config`
+/// boots without a secret). Production always serves with a real secret.
+const FALLBACK_SECRET: &str = "cachette-v1-route-skeleton";
+
+/// Artifact URL prefix the signed `archiveLocation` points at.
+const ARTIFACT_PATH_PREFIX: &str = "/_apis/artifactcache/artifacts/";
+
+/// Error name carried in the duplicate-reserve body (GitHub v1 spec).
+const DUPLICATE_ERROR: &str = "ArtifactCacheItemAlreadyExistsException";
+
+/// `GET /_apis/artifactcache/cache` query parameters.
+#[derive(serde::Deserialize)]
+pub struct FindQuery {
+    /// Comma-separated restore keys, most specific first.
+    pub keys: Option<String>,
+    /// Protocol version marker (exact match, never case-folded).
+    pub version: Option<String>,
+}
+
+/// `POST /_apis/artifactcache/caches` request body.
+#[derive(serde::Deserialize)]
+pub struct ReserveRequest {
+    /// Cache key to reserve.
+    pub key: String,
+    /// Protocol version marker.
+    pub version: String,
+}
+
+/// `POST /_apis/artifactcache/caches/{cacheId}` request body.
+#[derive(serde::Deserialize)]
+pub struct CommitRequest {
+    /// Declared total size (used by task 21's verification).
+    pub size: u64,
+}
+
+/// `GET /_apis/artifactcache/cache` — lookup a cache entry.
+///
+/// Hit: 200 `{"result":"hit","cacheKey":"<key>","archiveLocation":"<signed>"}`.
+/// Miss (or empty `keys`): 204 with an **empty** body.
+///
+/// Plan task 32: a local miss with cluster mode on becomes a **find fan-out**
+/// to the healthy peers. The owner B answers with the artifact key it holds and
+/// its runner-visible base, A mints the signed `archiveLocation` against B's
+/// host (shared secret per M12) and returns it — A never proxies the body. A
+/// dead owner degrades to a plain 204 miss inside the fan-out's ≤1s budget.
+pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    let keys: Vec<String> = query
+        .keys
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if keys.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let version = query.version.unwrap_or_default();
+    match lookup_local(storage, &keys, &version, state.cache_limits().key_case).await {
+        Ok(Some(entry)) => {
+            let base = state.external_url.as_deref().unwrap_or_default();
+            return signed_find_hit(&state, base, &entry.key);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "v1 find: listing entries failed");
+            return ApiError::Internal.into_response();
+        }
+    }
+    // Local miss: resolve the owner durably via the peer fan-out (plan task 32).
+    let Some(relay) = state.relay.as_deref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let hits = relay.find(&keys, &version).await;
+    match relay::best_hit(&hits, &keys, state.cache_limits().key_case) {
+        Some(hit) => {
+            let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
+            tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
+            signed_find_hit(&state, &base, &hit.key)
+        }
+        None => {
+            tracing::warn!(
+                peers = hits.len(),
+                "v1 find: no owner holds the key (or all owners unreachable); miss"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// Exact-then-prefix lookup over THIS node's finalized entries, stamping the
+/// requested version onto the version-less `EntryStat` candidates so
+/// [`crate::storage::lookup`] can run its version-filtered pass. Shared by the
+/// v1 find route and the pin-gated peer find endpoint (plan task 32).
+pub(crate) async fn lookup_local(
+    storage: &dyn StorageBackend,
+    keys: &[String],
+    version: &str,
+    key_case: KeyCase,
+) -> io::Result<Option<Entry>> {
+    let finalized = storage.list().await?;
+    let candidates: Vec<Entry> = finalized
+        .into_iter()
+        .map(|stat| Entry {
+            key: stat.key,
+            version: version.to_owned(),
+            size: stat.size,
+            created_at: stat.created_at,
+            accessed_at: stat.accessed_at,
+            complete: true,
+        })
+        .collect();
+    let marker = Version::from(version);
+    Ok(lookup(&candidates, keys, &marker, key_case).cloned())
+}
+
+/// Mint the signed `archiveLocation` hit body against `base` (the host that
+/// actually holds the blob — self or a remote owner).
+fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
+    let policy = state.auth();
+    let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+    let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
+    let signed = urls::mint(
+        &path,
+        cache_key,
+        secret,
+        SIGNED_URL_TTL_SECONDS,
+        auth::now_secs(),
+    );
+    Json(json!({
+        "result": "hit",
+        "cacheKey": cache_key,
+        "archiveLocation": format!("{base}{path}{}", signed.query()),
+    }))
+    .into_response()
+}
+
+/// `POST /_apis/artifactcache/caches` — reserve a new entry.
+///
+/// 200 `{"cacheId":<n>,"cacheSize":<n>}` where the `cacheId` is a positive
+/// numeric handle (GitHub's v1 contract) and `cacheSize =
+/// max(0, cache.max_size - used_bytes)`; 409 with the GitHub
+/// duplicate body when a finalized entry already holds `(key, version)`.
+pub async fn reserve(
+    State(state): State<AppState>,
+    Json(request): Json<ReserveRequest>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    let limits = state.cache_limits();
+    let key = normalize_key(&request.key, limits.key_case);
+    // A complete entry holding the exact key is a duplicate (409); an
+    // incomplete reservation (or nothing) falls through to a fresh 200.
+    match storage.stat(&key).await {
+        Ok(Some(_)) => return duplicate_response(&request.key),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "v1 reserve: duplicate check failed");
+            return ApiError::Internal.into_response();
+        }
+    }
+    let used = match storage.used_bytes().await {
+        Ok(used) => used,
+        Err(err) => {
+            tracing::error!(error = %err, "v1 reserve: usage accounting failed");
+            return ApiError::Internal.into_response();
+        }
+    };
+    // Refresh the storage gauge off the value we just read (task 35).
+    state.metrics.set_storage_used(used);
+    // B3 admission estimate: at reserve time the artifact size is unknown
+    // (`PATCH` carries no `Content-Length` contract), so admission is judged
+    // against the `min_free` floor; the eviction service is not on the request
+    // path, so a below-floor reserve is logged, not rejected, and `cacheSize`
+    // simply clamps to 0 (criterion 1 QA).
+    if limits.max_size > 0 {
+        let capacity = Capacity::resolve(limits.min_free, limits.max_size, 0, used);
+        if !capacity.admits(None) {
+            tracing::debug!(
+                free = capacity.free(),
+                min_free = capacity.min_free,
+                "v1 reserve: below free-space floor (admission estimate)"
+            );
+        }
+    }
+    let cache_size = limits.max_size.saturating_sub(used);
+    // Cluster seam (plan tasks 30/31): when a relay is present (cluster mode),
+    // placement picks the owner. A remote owner takes the reservation and the
+    // client keeps A's `cacheId`; a self owner (or no peers yet) falls through
+    // to the local single-node reservation below.
+    if let Some(relay) = state.relay.as_deref() {
+        let client_cache_id = generate_cache_id(&key, &request.version);
+        match relay.reserve(client_cache_id, &key, &request.version).await {
+            RelayReserve::Local => {
+                state.metrics.observe_relay_hops(0);
+            }
+            RelayReserve::Relayed => {
+                state.metrics.observe_relay_hops(1);
+                return Json(json!({"cacheId": client_cache_id, "cacheSize": cache_size}))
+                    .into_response();
+            }
+            RelayReserve::Duplicate => return duplicate_response(&request.key),
+            RelayReserve::NoCapacity => {
+                state.metrics.inc_relay_failure(RelayFailure::Capacity);
+                return ApiError::Unavailable(String::from("insufficient capacity"))
+                    .into_response();
+            }
+            RelayReserve::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
+    }
+    let cache_id = generate_cache_id(&key, &request.version);
+    let cache_id_key = cache_id.to_string();
+    let expires_at = u64::try_from(auth::now_secs())
+        .unwrap_or(0)
+        .saturating_add(limits.reservation_ttl_seconds);
+    if let Err(err) = storage
+        .reserve(&cache_id_key, &key, &request.version, expires_at)
+        .await
+    {
+        tracing::error!(error = %err, "v1 reserve: staging reservation failed");
+        return ApiError::Internal.into_response();
+    }
+    state.metrics.add_reservations(1);
+    Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
+}
+
+/// `PATCH /_apis/artifactcache/caches/{cacheId}` — accept an upload chunk.
+///
+/// `Content-Range: bytes start-end/*` (end inclusive) addresses the chunk;
+/// the bytes are streamed to `parts/{cacheId}/{start}.part` without assembling
+/// the blob (task 21 owns commit/assembly). 204 on success (including an
+/// idempotent re-PATCH of an already-received range); 400 for a malformed
+/// header, an overlapping range, a length mismatch, or `cacheId=0`; 404 for an
+/// unknown/expired reservation; 409 when the entry is already complete.
+pub async fn patch_chunk(
+    State(state): State<AppState>,
+    Path(cache_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    if cache_id == "0" {
+        return ApiError::BadRequest(String::from("cacheId 0 is not a valid reservation"))
+            .into_response();
+    }
+    let Some(range) = parse_content_range(headers.get(header::CONTENT_RANGE)) else {
+        return ApiError::BadRequest(String::from("invalid or missing Content-Range"))
+            .into_response();
+    };
+    let expected = range.len();
+    if expected > state.cache_limits().max_chunk_bytes {
+        return ApiError::BadRequest(String::from("chunk exceeds the maximum size"))
+            .into_response();
+    }
+    // Cluster relay (plan task 31): a `cacheId` reserved on a peer forwards the
+    // chunk to the owner. The hand-rolled peer client needs the bytes, so this
+    // is the one path that buffers a chunk — bounded by the cap just checked.
+    if let Some(relay) = state.relay.as_deref() {
+        let limit = usize::try_from(expected).unwrap_or(usize::MAX);
+        let bytes = match to_bytes(body, limit).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return ApiError::BadRequest(String::from("chunk body could not be read"))
+                    .into_response();
+            }
+        };
+        if bytes.len() as u64 != expected {
+            return ApiError::BadRequest(String::from("chunk length does not match Content-Range"))
+                .into_response();
+        }
+        match relay.upload(&cache_id, range.start, &bytes).await {
+            // No relay session: a self-owned or single-node reservation. Fall
+            // through to the local write with the bytes already in hand.
+            RelayUpload::NoSession => {
+                let chunk = Chunk {
+                    range,
+                    body: Box::pin(std::io::Cursor::new(bytes)),
+                };
+                return match LocalRelay.stream_to_owner(storage, &cache_id, chunk).await {
+                    Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                    Err(err) => chunk_error(err),
+                };
+            }
+            RelayUpload::Written => return StatusCode::NO_CONTENT.into_response(),
+            RelayUpload::NotFound => return ApiError::not_found().into_response(),
+            RelayUpload::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
+            RelayUpload::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
+            RelayUpload::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
+    }
+    // Single-node (the common case): stream the body straight into storage. The
+    // body is never held whole; `LimitedReader` fails the copy if it runs past
+    // the declared `Content-Range`, and `write_chunk` rejects a short body.
+    let stream: ByteStream<'_> = Box::pin(LimitedReader::new(BodyReader::new(body), expected));
+    let chunk = Chunk {
+        range,
+        body: stream,
+    };
+    let relay = LocalRelay;
+    match relay.stream_to_owner(storage, &cache_id, chunk).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => chunk_error(err),
+    }
+}
+
+/// `POST /_apis/artifactcache/caches/{cacheId}` — commit an upload.
+///
+/// Assembles the reservation's staged chunks into the final blob, verifies
+/// their total equals `{size}` and publishes the entry (superseding a same-key
+/// sibling). 204 on success; 400 when the chunks do not match `{size}` (the
+/// reservation is marked failed for the reaper); 404 for an unknown/expired
+/// reservation; 400 for `cacheId=0`.
+pub async fn commit(
+    State(state): State<AppState>,
+    Path(cache_id): Path<String>,
+    Json(request): Json<CommitRequest>,
+) -> Response {
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    if cache_id == "0" {
+        return ApiError::BadRequest(String::from("cacheId 0 is not a valid reservation"))
+            .into_response();
+    }
+    // Cluster relay (plan task 31): forward the commit to the owner; a
+    // committed session is an idempotent 204. No session means a self-owned or
+    // single-node reservation, which commits locally as before.
+    if let Some(relay) = state.relay.as_deref() {
+        match relay.commit(&cache_id, request.size).await {
+            RelayCommit::NoSession => {}
+            RelayCommit::Committed => return StatusCode::NO_CONTENT.into_response(),
+            RelayCommit::NotFound => return ApiError::not_found().into_response(),
+            RelayCommit::BadRequest(msg) => return ApiError::BadRequest(msg).into_response(),
+            RelayCommit::Conflict(msg) => return ApiError::Conflict(msg).into_response(),
+            RelayCommit::Unreachable => {
+                state.metrics.inc_relay_failure(RelayFailure::Unreachable);
+                return ApiError::BadGateway(String::from("storage owner unreachable"))
+                    .into_response();
+            }
+        }
+    }
+    match storage.commit_chunks(&cache_id, request.size).await {
+        Ok(()) => {
+            state.metrics.add_reservations(-1);
+            if let Ok(used) = storage.used_bytes().await {
+                state.metrics.set_storage_used(used);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => commit_error(err),
+    }
+}
+
+/// `GET /_apis/artifactcache/artifacts/{cacheId}` — download an entry.
+///
+/// No `Range`: 200 with the full body. With `Range: bytes=a-b`: 206 with the
+/// slice and `Content-Range: bytes a-b/<size>`. Unknown id: 404 JSON.
+///
+/// Authorization (M2/M3): when signed URLs are enforced (bearer/merge modes, or
+/// any cluster), the request must carry a valid `?id&exp&mac` minted by find →
+/// 403 otherwise. In pure HMAC single-node mode the global HMAC gate already
+/// authorizes the request, so a bare signed-URL-less GET is allowed.
+pub async fn download(
+    State(state): State<AppState>,
+    Path(cache_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
+    if requires_signed_url(&state) {
+        let policy = state.auth();
+        let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
+        if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
+            return ApiError::from(err).into_response();
+        }
+    }
+    let Some(storage) = state.storage.as_deref() else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
+    let size = match storage.stat(&cache_id).await {
+        Ok(Some(stat)) => stat.size,
+        Ok(None) => return ApiError::not_found().into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "v1 download: stat failed");
+            return ApiError::Internal.into_response();
+        }
+    };
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    match range {
+        None => match read_range(storage, &cache_id, 0..size).await {
+            Some(bytes) => (
+                StatusCode::OK,
+                [(header::ACCEPT_RANGES, String::from("bytes"))],
+                bytes,
+            )
+                .into_response(),
+            None => ApiError::not_found().into_response(),
+        },
+        Some(raw) => {
+            let Some((start, end)) = parse_range(raw, size) else {
+                return range_not_satisfiable(size);
+            };
+            let Some(bytes) = read_range(storage, &cache_id, start..end + 1).await else {
+                return range_not_satisfiable(size);
+            };
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}")),
+                    (header::ACCEPT_RANGES, String::from("bytes")),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /_apis/artifactcache/caches/clean` — 200 no-op.
+pub async fn clean() -> Response {
+    StatusCode::OK.into_response()
+}
+
+/// GitHub v1 duplicate-reserve body:
+/// `{"error":"ArtifactCacheItemAlreadyExistsException","type":"key","key":"<k>"}`.
+pub(crate) fn duplicate_response(key: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": DUPLICATE_ERROR,
+            "type": "key",
+            "key": key,
+        })),
+    )
+        .into_response()
+}
+
+/// Read a finalized entry's `range` into memory (test/skeleton-scale payloads).
+/// Shared with the v2 artifact download (plan task 26) so both protocols slice
+/// bytes identically.
+pub(crate) async fn read_range(
+    storage: &dyn StorageBackend,
+    key: &str,
+    range: Range<u64>,
+) -> Option<Vec<u8>> {
+    let mut stream = storage.get_range(key, range).await.ok()?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.ok()?;
+    Some(bytes)
+}
+
+/// Parse a single `Range: bytes=a-b` request against `size` into an inclusive
+/// `(start, end)`. Supports open ends (`bytes=a-`) and suffixes (`bytes=-n`);
+/// multi-range and out-of-bounds requests return `None` (→ 416).
+pub(crate) fn parse_range(raw: &str, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
+    let spec = raw.trim().strip_prefix("bytes=")?;
+    let (start_raw, end_raw) = spec.split_once('-')?;
+    let last = size - 1;
+    let start_raw = start_raw.trim();
+    let end_raw = end_raw.trim();
+    if start_raw.is_empty() {
+        let suffix: u64 = end_raw.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        return Some((size.saturating_sub(suffix), last));
+    }
+    let start: u64 = start_raw.parse().ok()?;
+    if start > last {
+        return None;
+    }
+    let end = if end_raw.is_empty() {
+        last
+    } else {
+        end_raw.parse::<u64>().ok()?.min(last)
+    };
+    (end >= start).then_some((start, end))
+}
+
+/// 416 response with `Content-Range: bytes */<size>` (RFC 9110).
+pub(crate) fn range_not_satisfiable(size: u64) -> Response {
+    (
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        [
+            (header::CONTENT_RANGE, format!("bytes */{size}")),
+            (header::ACCEPT_RANGES, String::from("bytes")),
+        ],
+    )
+        .into_response()
+}
+
+/// Parse a PATCH `Content-Range: bytes start-end/*` header into an inclusive
+/// [`ChunkRange`]. The total is `*` on the upload path (the size is only known
+/// at commit); a numeric total is tolerated and ignored. Malformed input —
+/// wrong unit, missing `-`/`/`, non-numeric bounds, or `end < start` — yields
+/// `None` (→ 400).
+fn parse_content_range(value: Option<&HeaderValue>) -> Option<ChunkRange> {
+    let raw = value?.to_str().ok()?.trim();
+    let spec = raw
+        .strip_prefix("bytes ")
+        .or_else(|| raw.strip_prefix("bytes="))?;
+    let (range_part, total_part) = spec.split_once('/')?;
+    let total = total_part.trim();
+    if total != "*" && (total.is_empty() || !total.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let (start_raw, end_raw) = range_part.split_once('-')?;
+    let start = start_raw.trim().parse::<u64>().ok()?;
+    let end = end_raw.trim().parse::<u64>().ok()?;
+    (end >= start).then_some(ChunkRange { start, end })
+}
+
+/// Map a chunk-staging `io::Error` to its HTTP contract: 404 unknown/expired
+/// reservation, 409 already-complete entry, 400 overlap/length, 500 otherwise.
+/// Shared with the pin-gated peer upload route (plan task 31).
+pub(crate) fn chunk_error(err: io::Error) -> Response {
+    match err.kind() {
+        io::ErrorKind::NotFound => ApiError::not_found().into_response(),
+        io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
+        io::ErrorKind::InvalidInput => ApiError::BadRequest(err.to_string()).into_response(),
+        _ => {
+            tracing::error!(error = %err, "v1 patch: chunk staging failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+/// Map a commit `io::Error` to its HTTP contract: 404 unknown/expired
+/// reservation, 409 already-complete entry, 400 size mismatch, 500 otherwise.
+/// Shared with the pin-gated peer commit route (plan task 31).
+pub(crate) fn commit_error(err: io::Error) -> Response {
+    match err.kind() {
+        io::ErrorKind::NotFound => ApiError::not_found().into_response(),
+        io::ErrorKind::AlreadyExists => ApiError::Conflict(err.to_string()).into_response(),
+        io::ErrorKind::InvalidInput => ApiError::BadRequest(err.to_string()).into_response(),
+        _ => {
+            tracing::error!(error = %err, "v1 commit: assembly failed");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+/// Whether a download must present a signed URL: bearer/merge auth or any
+/// cluster deployment. Pure HMAC single-node serving relies on the HMAC gate.
+fn requires_signed_url(state: &AppState) -> bool {
+    let policy = state.auth();
+    policy.cluster_enabled || matches!(policy.mode, AuthMode::Bearer | AuthMode::Merge)
+}
+
+/// Generate a fresh numeric `cacheId`.
+///
+/// GitHub's v1 contract is a unique (notionally incrementing) positive integer
+/// (api.md: "Numeric unique ID used in next requests"); the vendored
+/// `go-actions-cache` parses it into `int` and rejects `0`, and the JS
+/// `@actions/cache` toolkit round-trips it through a `number`, so it must stay
+/// within `Number.MAX_SAFE_INTEGER` (2^53 - 1) or the toolkit's rounded value
+/// 404s the subsequent `PATCH`/`POST`. No `uuid`/`rand` dependency is available
+/// (and none may be added), so this is a FNV-1a hash of
+/// `key|version|now|sequence` with a splitmix64 avalanche, masked to 53 bits
+/// (`hash & (2^53 - 1) | 1`, nonzero and JS-safe). The process-wide atomic
+/// sequence keeps ids unique even for identical key/version reservations
+/// within the same second. Shared with the peer reserve route (plan task 31),
+/// which issues the owner-side `cacheId`.
+pub(crate) fn generate_cache_id(key: &str, version: &str) -> u64 {
+    /// `Number.MAX_SAFE_INTEGER`; larger ids lose precision in the JS toolkit.
+    const MAX_SAFE_CACHE_ID: u64 = (1 << 53) - 1;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+
+    let mut input = Vec::with_capacity(key.len() + version.len() + 17);
+    input.extend_from_slice(key.as_bytes());
+    input.push(b'|');
+    input.extend_from_slice(version.as_bytes());
+    input.extend_from_slice(&auth::now_secs().to_le_bytes());
+    input.extend_from_slice(&sequence.to_le_bytes());
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+
+    // Force nonzero (`go-actions-cache` treats `cacheID == 0` as a failure).
+    (hash & MAX_SAFE_CACHE_ID) | 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_handles_bounded_open_and_suffix_forms() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=990-2000", 1000), Some((990, 999)));
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(parse_range("bytes=5-5", 1000), Some((5, 5)));
+    }
+
+    #[test]
+    fn parse_range_rejects_multi_unsatisfiable_and_malformed_forms() {
+        assert_eq!(parse_range("bytes=0-1,3-4", 1000), None);
+        assert_eq!(parse_range("bytes=1000-1001", 1000), None);
+        assert_eq!(parse_range("items=0-1", 1000), None);
+        assert_eq!(parse_range("bytes=0-1", 0), None);
+        assert_eq!(parse_range("bytes=-0", 1000), None);
+    }
+
+    #[test]
+    fn cache_id_is_positive_nonzero_and_unique_per_call() {
+        let first = generate_cache_id("k", "2");
+        let second = generate_cache_id("k", "2");
+        assert!(first > 0, "cacheId must be nonzero: {first}");
+        // Bounded by JS `Number.MAX_SAFE_INTEGER` so the toolkit's `number`
+        // round trip does not round the id and 404 the next request.
+        assert!(
+            first <= 9_007_199_254_740_991,
+            "cacheId must be a safe JS integer: {first}"
+        );
+        assert_ne!(first, second, "sequence must keep ids unique");
+    }
+
+    #[test]
+    fn content_range_accepts_star_total_and_inclusive_bounds() {
+        let h = |s: &str| HeaderValue::from_str(s).expect("header value");
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 0-4194303/*"))),
+            Some(ChunkRange {
+                start: 0,
+                end: 4194303
+            })
+        );
+        assert_eq!(
+            parse_content_range(Some(&h("bytes=4194304-8388607/*"))),
+            Some(ChunkRange {
+                start: 4194304,
+                end: 8388607
+            })
+        );
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 5-5/*"))),
+            Some(ChunkRange { start: 5, end: 5 })
+        );
+        // A numeric total is tolerated (the upload path only knows it at commit).
+        assert_eq!(
+            parse_content_range(Some(&h("bytes 0-99/100"))),
+            Some(ChunkRange { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn content_range_rejects_malformed_forms() {
+        let h = |s: &str| HeaderValue::from_str(s).expect("header value");
+        assert_eq!(parse_content_range(None), None);
+        assert_eq!(parse_content_range(Some(&h("items 0-1/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0-1"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes a-b/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 5-4/*"))), None);
+        assert_eq!(parse_content_range(Some(&h("bytes 0-1/abc"))), None);
+    }
+}

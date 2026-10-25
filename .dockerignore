@@ -1,0 +1,8 @@
+# Build context exclusions for the cachette image (plan task 36).
+target/
+.git/
+.omo/
+.github/
+.gitignore
+.rustfmt.toml
+handoff-actions-cache.md

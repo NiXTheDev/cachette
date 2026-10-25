@@ -1,0 +1,3 @@
+# Standalone fixture crate: its build artifacts are never committed. The root
+# `.gitignore` only anchors `/target` at the repo root, so this one is local.
+/target

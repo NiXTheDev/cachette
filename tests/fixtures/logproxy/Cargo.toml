@@ -1,0 +1,16 @@
+[package]
+name = "logproxy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "B4 probe: logging pass-through proxy for docker buildx --cache-to type=gha"
+
+[[bin]]
+name = "logproxy"
+path = "src/main.rs"
+
+[dependencies]
+axum = "=0.8.9"
+tokio = { version = "=1.53.2", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "http2"] }
+serde_json = "=1.0.151"

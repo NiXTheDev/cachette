@@ -1,0 +1,138 @@
+# Canonical example configuration for cachette
+# This file documents all configuration options with their defaults.
+# Values shown are the built-in defaults unless otherwise noted.
+#
+# Default search locations (used when --config is NOT passed):
+#   *nix (Linux/BSD/macOS): /etc/cachette/cachette.toml
+#   Windows:                %APPDATA%\cachette\cachette.toml
+#   Docker image:           /config/cachette.toml (the image's CMD passes
+#                           --config /config/cachette.toml explicitly)
+# If the default file is absent, cachette starts on built-in defaults.
+# An explicit `--config <path>` always overrides these locations.
+
+[server]
+# Address and port to listen on (host:port). IPv6 literals: [::1]:8080
+listen = "0.0.0.0:8080"
+
+# Optional external URL advertised to clients (e.g. https://cache.example.com)
+# external_url = "https://cache.example.com"
+
+# TLS certificate and key paths. Set BOTH to terminate TLS on the main
+# listener; with both unset (the default) the listener is plain HTTP and the
+# edge terminates TLS. The cluster port always serves the self-signed identity.
+# tls_cert = "/etc/cachette/tls.crt"
+# tls_key  = "/etc/cachette/tls.key"
+
+# Largest single upload chunk / Azure block accepted, in bytes. Bounds the
+# memory one upload request can hold. Default 64 MiB (2x the largest chunk the
+# real go-actions-cache client sends).
+max_chunk_bytes = 67108864
+
+# Graceful-shutdown drain window in seconds. On SIGTERM/SIGINT the node
+# advertises draining, refuses new uploads with 503 + Retry-After, keeps
+# serving in-flight requests, and exits after at most this long.
+drain_grace_seconds = 30
+
+[storage]
+# Storage backend. Only "fs" is supported in v1.
+backend = "fs"
+
+[storage.fs]
+# Blob root directory
+path = "/var/lib/cachette"
+
+# Free-space floor before eviction triggers (B3 capacity model).
+# Accepts: fraction (0.2), percent ("20%"), or bytesize ("2GiB"/"2GB", 1024-based).
+# Examples:
+# min_free = 0.2        # 20% of total
+# min_free = "20%"     # percent form
+# min_free = "2GiB"    # 2*1024^3 bytes (1024-based)
+# min_free = "2GB"     # also 1024-based per spec
+min_free = 0.2
+
+[cache]
+# Maximum cache size in bytes (0 = unlimited)
+max_size = 0
+
+# Eviction policy: "lru", "oldest", or "none"
+# "none" refuses new reservations when below free-space floor
+eviction = "lru"
+
+# Key normalization: "preserve" (GitHub parity - keys are case-sensitive) or
+# "lower" (Forgejo-style case-insensitive fold)
+key_case = "preserve"
+
+# Reservation TTL in seconds (must be > 0)
+reservation_ttl_seconds = 3600
+
+[auth]
+# Auth mode: "hmac", "bearer", or "merge" (both)
+mode = "merge"
+
+# Shared secret for HMAC/JWT (required to serve; min 16 chars).
+# Set via [auth] secret or CACHETTE__AUTH__SECRET. Unset allowed only for --print-config.
+secret = "CHANGE_ME_MIN_16_CHARS"
+
+# Static bearer tokens (optional). Empty list by default.
+tokens = []
+
+# Max age for HMAC signatures in seconds (0 = disabled)
+hmac_max_age_seconds = 600
+
+[v1]
+# Signed URL TTL for v1 artifactcache in seconds
+signed_url_ttl_seconds = 900
+
+[v2]
+# JWT secret for Twirp v2 (falls back to [auth] secret if unset)
+jwt_secret = "CHANGE_ME_MIN_16_CHARS"
+
+# JWT TTL in seconds
+jwt_ttl_seconds = 300
+
+[cluster]
+# Enable peer-to-peer clustering (standalone if false)
+enabled = false
+
+# Dedicated mTLS listener for peer traffic (host:port). Only bound when
+# `enabled = true`; always TLS with the self-signed node identity cert.
+listen = "0.0.0.0:8081"
+
+# Node ID (optional; generated if unset)
+# node_id = "cache-a"
+
+# Advertise address (host:port). Defaults to cluster.listen if unset
+# advertise_addr = "cache-a:8081"
+
+# Enable mDNS discovery
+mdns = true
+
+# Seed peer addresses (host:port)
+seeds = []
+
+# Seed peer fingerprints (node_id -> hex fingerprint)
+seed_fingerprints = {}
+
+# Tie-breaker when equally least-loaded: "random", "roundrobin", or "progressive"
+tiebreak = "random"
+
+# Path to node identity/cert (defaults to <storage.fs.path>/identity if unset)
+# cert_path = "/var/lib/cachette/identity"
+
+# Heartbeat interval in seconds
+heartbeat_interval_seconds = 5
+
+# Peer timeout in seconds
+peer_timeout_seconds = 15
+
+[log]
+# Log level: "trace", "debug", "info", "warn", or "error"
+level = "info"
+
+# Log format: "text" or "json"
+format = "text"
+
+# Optional. When set, cachette writes its own log file here (parent
+# directories are created, the file is appended to) instead of stderr.
+# Leave unset to log to stderr (the default).
+# file = "/var/log/cachette/cachette.log"

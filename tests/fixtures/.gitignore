@@ -1,0 +1,6 @@
+# Installed on demand by `tests/v1_real_clients.rs` via `npm ci` (thousands of
+# files); deliberately not committed.
+node_modules/
+
+# Go fixture binary built on demand by `tests/v1_real_clients.rs`.
+gac/gac.exe

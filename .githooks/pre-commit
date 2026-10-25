@@ -1,0 +1,117 @@
+#!/bin/sh
+# cachette pre-commit gate.
+#
+# Runs the repo's quality gates before every commit and, when one fails, prints
+# EXACTLY which gate failed, the command to reproduce it, and the usual fix.
+#
+#   Manual run:        sh .githooks/pre-commit
+#   Emergency bypass:  git commit --no-verify   (CI `lint`/`test` still gate the push)
+#
+# NOTE: core.hooksPath is LOCAL git config and is not cloned, so a fresh clone
+# must enable this hook once with:
+#     git config core.hooksPath .githooks
+set -u
+
+# pipefail where the shell supports it (older dash does not); harmless either
+# way because every pipeline below already uses the last command's status.
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
+
+# fail_exit <gate> <remedy> -- print a boxed diagnosis and stop the commit.
+fail_exit() {
+    printf '\n' >&2
+    printf '========================================================\n' >&2
+    printf 'PRE-COMMIT FAILED: %s\n' "$1" >&2
+    printf '%s\n' '--------------------------------------------------------' >&2
+    printf '%s\n' "$2" >&2
+    printf '========================================================\n' >&2
+    printf 'Fix the problem above, then re-stage and commit again.\n' >&2
+    printf '(Do NOT reach for --no-verify unless the gate itself is broken.)\n' >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------- toolchain --
+if ! command -v cargo >/dev/null 2>&1; then
+    fail_exit "toolchain (cargo not found)" "Rust is not on PATH, so NONE of the gates could run.
+Install it from https://rustup.rs, or add it to PATH first:
+    export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+fi
+
+# ------------------------------------------------------- staged sample checks --
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    against=HEAD
+else
+    against=$(git hash-object -t tree /dev/null)
+fi
+
+allownonascii=$(git config --type=bool hooks.allownonascii 2>/dev/null) || allownonascii=false
+if [ "$allownonascii" != "true" ]; then
+    if git diff-index --cached --name-only --diff-filter=A -z "$against" 2>/dev/null |
+         tr '\0' '\n' |
+         LC_ALL=C grep -q '[^ -~]'; then
+        printf 'Offending new file name(s):\n' >&2
+        git diff-index --cached --name-only --diff-filter=A -z "$against" 2>/dev/null |
+            tr '\0' '\n' |
+            LC_ALL=C grep '[^ -~]' >&2 || true
+        printf '\n' >&2
+        fail_exit "non-ASCII filename(s)" "Newly added file names must be ASCII.
+Rename the file(s) above, or, if the name is genuinely intended:
+    git config hooks.allownonascii true"
+    fi
+fi
+
+if ! git diff-index --check --cached "$against" --; then
+    fail_exit "whitespace errors (see lines above)" "The flagged lines have trailing whitespace, a space before a tab, or
+are missing a final newline. Locate and fix them with:
+    git diff --cached --check
+Strip trailing whitespace (per file):
+    sed -i 's/[[:space:]]*\$//' <file>
+Then re-stage:  git add <file>"
+fi
+
+# --------------------------------------------------------------- rust gates --
+# run_gate <label> <remedy> <command...> -- run one gate; diagnose on failure.
+run_gate() {
+    label=$1
+    remedy=$2
+    shift 2
+    printf '\n==> %s\n    $ %s\n' "$label" "$*"
+    if "$@"; then
+        return 0
+    fi
+    fail_exit "$label" "$remedy"
+}
+
+run_gate "cargo fmt --check (formatting)" "Formatting differs from rustfmt's output. Reformat in place, then re-stage:
+    cargo fmt
+    git add -u
+If a file is intentionally left unformatted, add it to rustfmt.toml exclude /
+#[rustfmt::skip] rather than fighting the gate." \
+    cargo fmt --check
+
+run_gate "cargo check --workspace (compile)" "The workspace does not compile (errors above). Reproduce with:
+    cargo check --workspace
+Narrow to one crate while iterating:
+    cargo check -p <crate>
+Fix the errors; there is no bypass that is not a lie about the tree compiling." \
+    cargo check --workspace
+
+run_gate "cargo clippy --all-targets -- -D warnings (lints)" "Clippy warnings are denied, so any warning fails the commit (see above).
+Reproduce with:
+    cargo clippy --all-targets -- -D warnings
+Auto-apply what clippy can:
+    cargo clippy --all-targets --fix --allow-dirty
+Fix the rest by hand. Prefer fixing over #[allow]; if you must allow, scope it
+to the single item and add a comment saying why." \
+    cargo clippy --all-targets -- -D warnings
+
+run_gate "cargo test --workspace (tests)" "One or more tests failed (names above). Reproduce with:
+    cargo test --workspace
+Focus a single test and see its output:
+    cargo test --workspace <test_name> -- --nocapture
+Fix the failure. Do NOT delete or #[ignore] a failing test to get past this --
+a flaky test is a real bug to chase." \
+    cargo test --workspace
+
+printf '\nAll pre-commit checks passed. Safe to commit.\n'
