@@ -31,6 +31,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::jwks::RsaKeySource;
+use crate::auth::jwks_cache::{JwksCache, JwksCacheError};
+use crate::config::Config;
+use crate::state::AppState;
 
 const ALGORITHM: &str = "RS256";
 
@@ -210,6 +213,35 @@ impl OidcVerifier {
             _ => false,
         }
     }
+}
+
+/// Boot wiring (v1.1): when `[auth.oidc] enabled`, build the [`JwksCache`]
+/// from the configured CA bundle and hang a verifier on `state`. A failure
+/// is boot-fatal — a broken IdP trust configuration must never serve. A
+/// disabled or absent table is a silent no-op, leaving v1.0 behavior
+/// byte-identical. SIGHUP reloads never install or remove the verifier
+/// (docs/oidc.md rollout: toggling `enabled` requires only a restart);
+/// `apply_reload` only warns on a detected config change.
+///
+/// # Errors
+/// [`JwksCacheError`] when the CA bundle cannot back a fetch client.
+pub fn install(state: &AppState, config: &Config) -> Result<(), JwksCacheError> {
+    let Some(oidc) = config.auth.oidc.as_ref().filter(|oidc| oidc.enabled) else {
+        return Ok(());
+    };
+    let keys = JwksCache::try_new(oidc)?;
+    state.install_oidc(
+        OidcVerifier::new(
+            oidc.issuers.clone(),
+            oidc.audiences.clone(),
+            oidc.require.clone(),
+            oidc.leeway_seconds,
+            keys,
+        ),
+        oidc,
+    );
+    tracing::info!(issuers = ?oidc.issuers, "oidc bearer verification installed");
+    Ok(())
 }
 
 /// Integer-valued claim; anything non-numeric is structurally broken.

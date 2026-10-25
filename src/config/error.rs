@@ -95,6 +95,15 @@ pub enum ConfigError {
     #[error("auth.oidc JWKS endpoint for {issuer:?} must be https (got {url})")]
     OidcJwksPlaintext { issuer: String, url: String },
 
+    /// An issuer URL is not HTTPS: the default JWKS endpoint would be
+    /// derived as `{issuer}/.well-known/jwks.json`, so a plaintext issuer
+    /// would mean a plaintext fetch. Only explicit overrides may deviate,
+    /// and those are already pinned to `https` themselves.
+    #[error(
+        "auth.oidc issuer {issuer:?} must be an https URL (default JWKS endpoints derive from it)"
+    )]
+    OidcIssuerPlaintext { issuer: String },
+
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.
     #[error("internal config serialization error: {0}")]

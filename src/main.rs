@@ -2,6 +2,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cachette::auth;
 use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::Cli;
 use cachette::cluster::heartbeat;
@@ -141,6 +142,11 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.set_auth(AuthPolicy::from_config(&config));
+    // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
+    // enabled, build the JWKS cache + verifier and hang them on the state.
+    // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
+    // v1.0 behavior stays byte-identical. Reloads never swap the verifier.
+    auth::oidc::install(&state, &config)?;
     // Runner-visible base URL for capability URLs (`/v2/*`); the config
     // resolver always derives it from `listen` when `external_url` is unset.
     state.external_url = config.server.external_url.clone();

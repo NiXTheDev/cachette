@@ -71,6 +71,19 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     if oidc.jwks_max_keys == 0 {
         return Err(ConfigError::OidcZeroMaxKeys);
     }
+    // Every issuer must itself be an https URL: the default JWKS endpoint is
+    // derived as `{issuer}/.well-known/jwks.json`, so a plaintext issuer
+    // would mean a plaintext fetch. Explicit overrides cannot rescue it —
+    // verification binds tokens to the issuer string whatever URL serves
+    // keys, and the fetch layer is https-only as depth defense.
+    for issuer in &oidc.issuers {
+        let scheme = url::Url::parse(issuer).is_ok_and(|url| url.scheme() == "https");
+        if !scheme {
+            return Err(ConfigError::OidcIssuerPlaintext {
+                issuer: issuer.clone(),
+            });
+        }
+    }
     for (issuer, url) in &oidc.jwks_urls {
         if !oidc.issuers.contains(issuer) {
             return Err(ConfigError::OidcJwksIssuerUnknown {
@@ -136,6 +149,16 @@ mod tests {
         oidc_config(|oidc| {
             oidc.enabled = true;
             oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
+            oidc.audiences = vec![String::from("cachette")];
+            oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+        })
+    }
+
+    /// Enabled surface with a specific issuer list (issuer-scheme tests).
+    fn enabled_oidc_with_issuers(issuers: Vec<String>) -> Config {
+        oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.issuers = issuers;
             oidc.audiences = vec![String::from("cachette")];
             oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
         })
@@ -410,5 +433,57 @@ mod tests {
             );
         });
         assert!(validate(&config).is_ok());
+    }
+
+    /// A plaintext issuer means a plaintext *derived* JWKS endpoint
+    /// (`{issuer}/.well-known/jwks.json`), so only https issuer URLs are
+    /// ever valid.
+    #[test]
+    fn plaintext_issuers_are_rejected() {
+        let err = validate(&enabled_oidc_with_issuers(vec![String::from(
+            "http://idp.example.org/realms/ci",
+        )]))
+        .expect_err("plaintext issuer");
+        match &err {
+            ConfigError::OidcIssuerPlaintext { issuer } => {
+                assert_eq!(issuer, "http://idp.example.org/realms/ci");
+            }
+            other => panic!("expected OidcIssuerPlaintext, got {other:?}"),
+        }
+
+        // A relative string is not a URL at all — also rejected (it cannot
+        // back a derivation, and tokens carry it as an untrusted index).
+        let err = validate(&enabled_oidc_with_issuers(vec![String::from(
+            "idp.example.org/realms/ci",
+        )]))
+        .expect_err("non-URL issuer");
+        assert!(
+            matches!(err, ConfigError::OidcIssuerPlaintext { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // Trailing-slash https issuers remain fine (the fetch layer trims).
+        assert!(
+            validate(&enabled_oidc_with_issuers(vec![String::from(
+                "https://idp.example.org/realms/ci/"
+            )]))
+            .is_ok()
+        );
+    }
+
+    /// Multiple issuers, one bad: the loop names the offending one.
+    #[test]
+    fn one_bad_issuer_names_it() {
+        let err = validate(&enabled_oidc_with_issuers(vec![
+            String::from("https://good.example.org/realms/ci"),
+            String::from("http://bad.example.org/realms/ci"),
+        ]))
+        .expect_err("mixed scheme issuer set");
+        match &err {
+            ConfigError::OidcIssuerPlaintext { issuer } => {
+                assert_eq!(issuer, "http://bad.example.org/realms/ci");
+            }
+            other => panic!("expected OidcIssuerPlaintext, got {other:?}"),
+        }
     }
 }
