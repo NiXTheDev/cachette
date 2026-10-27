@@ -4,10 +4,19 @@
 //!
 //! ```text
 //! <root>/cachette.sqlite3   metadata + accounting index (rusqlite, WAL)
-//! <root>/blobs/{id}.blob    finalized (visible) blob payloads
+//! <root>/blobs/{id}.blob    finalized whole-blob payloads
+//! <root>/chunks/{id}.chunk  finalized content-defined chunk payloads (CDC)
 //! <root>/parts/{id}.part    staged payload awaiting finalize
 //! <root>/tmp/               scratch for atomic temp-file + rename writes
 //! ```
+//!
+//! Entries carry a `layout` column (`whole` | `chunked`, docs/cdc.md): CDC-off
+//! finalizations publish whole blobs exactly as v1.0; CDC-on finalizations cut
+//! the staged payload into deduplicated content chunks ([`cdc::CdcSplitter`])
+//! referenced from a per-entry manifest. The read path branches on `layout`,
+//! so chunked at-rest data stays readable whatever the current flag says.
+//! Accounting counts unique bytes at rest: whole blob sizes plus chunk sizes
+//! with `refs > 0`.
 //!
 //! `id` is the lowercase hex SHA-256 of the opaque key: keys never become
 //! path segments (no POSIX coupling) and the [`StorageBackend`] contract
@@ -28,23 +37,28 @@
 //! (plan rule: never delete a blob that has a complete row — orphans belong
 //! to the reaper).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::RwLock;
 
 use super::{
-    BoxFuture, ByteStream, Chunk, ChunkOutcome, ChunkRange, EntryStat, StorageBackend, complete,
+    BoxFuture, ByteStream, Chunk, ChunkOutcome, ChunkRange, EntryStat, StorageBackend,
+    cdc::{self, CdcParams},
+    complete,
     digest::{self, DigestWriter},
     invalid_range, not_found,
 };
@@ -64,12 +78,26 @@ const SCHEMA: &str = "
         owner_node              TEXT NOT NULL DEFAULT '',
         reservation_expires_at  INTEGER,
         artifact_key            TEXT NOT NULL DEFAULT '',
-        digest                  TEXT NOT NULL DEFAULT ''
+        digest                  TEXT NOT NULL DEFAULT '',
+        layout                  TEXT NOT NULL DEFAULT 'whole'
     );
     CREATE INDEX IF NOT EXISTS entries_key_idx ON entries(key);
     CREATE TABLE IF NOT EXISTS accounting (used_bytes INTEGER NOT NULL);
     INSERT INTO accounting (used_bytes)
         SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM accounting);
+    CREATE TABLE IF NOT EXISTS chunks (
+        id          TEXT PRIMARY KEY,
+        size        INTEGER NOT NULL,
+        refs        INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS entry_chunks (
+        entry_id  TEXT NOT NULL,
+        seq       INTEGER NOT NULL,
+        chunk_id  TEXT NOT NULL,
+        PRIMARY KEY (entry_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS entry_chunks_chunk_idx ON entry_chunks(chunk_id);
 ";
 
 /// Per-reservation serialization for chunk staging (plan task 20): one async
@@ -85,6 +113,14 @@ pub enum EntryHealth {
     Ok,
     /// The index has a complete row but `blobs/{id}.blob` is gone.
     MissingBlob,
+    /// A `chunked` entry's manifest names a `chunks/{id}.chunk` file that is
+    /// gone (docs/cdc.md failure model). Reported as "missing M of N chunks".
+    MissingChunk {
+        /// Number of manifest chunks whose file is missing.
+        missing: u64,
+        /// Total chunks in the entry's manifest.
+        total: u64,
+    },
     /// The row predates task 50 and carries no digest to check against.
     MissingDigest,
     /// Size on disk disagrees with the size committed in the index.
@@ -135,6 +171,10 @@ pub struct FsStorage {
     gate: RwLock<()>,
     /// Per-reservation chunk locks (see [`ChunkLocks`]).
     chunk_locks: ChunkLocks,
+    /// CDC cutting params (v1.1 workstream B): `None` publishes whole blobs
+    /// like v1.0. Only shapes new finalizations; reads are layout-aware
+    /// regardless (docs/cdc.md).
+    cdc: Option<CdcParams>,
 }
 
 impl std::fmt::Debug for FsStorage {
@@ -148,10 +188,19 @@ impl std::fmt::Debug for FsStorage {
 impl FsStorage {
     /// Open (creating when missing) the storage at `root`, initialise the
     /// schema, and run boot reconciliation. Blocking (rusqlite + mkdirs):
-    /// call during startup or tests, never on the request path.
+    /// call during startup or tests, never on the request path. Finalizes
+    /// publish whole blobs (CDC off).
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_cdc(root, None)
+    }
+
+    /// [`FsStorage::open`] with `[storage.cdc]` applied: passing
+    /// [`Some`](Option)`(params)` makes every new finalization cut its payload
+    /// into deduplicated content chunks; `None` behaves like `open`. Reads and
+    /// deletes are layout-aware either way (docs/cdc.md).
+    pub fn open_cdc(root: impl AsRef<Path>, cdc: Option<CdcParams>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
-        for dir in ["blobs", "parts", "tmp"] {
+        for dir in ["blobs", "chunks", "parts", "tmp"] {
             std::fs::create_dir_all(root.join(dir))?;
         }
         let conn = Connection::open(root.join("cachette.sqlite3")).map_err(sql)?;
@@ -165,6 +214,7 @@ impl FsStorage {
             conn: Arc::new(Mutex::new(conn)),
             gate: RwLock::new(()),
             chunk_locks: Mutex::new(HashMap::new()),
+            cdc,
         };
         storage.reconcile()?;
         Ok(storage)
@@ -179,45 +229,55 @@ impl FsStorage {
     /// blob); a blob that has gone missing or was modified comes back as an
     /// [`EntryHealth`] that is not [`EntryHealth::Ok`].
     pub fn verify_all(&self) -> io::Result<Vec<VerifyReport>> {
-        let rows: Vec<(String, String, i64, String)> = {
+        let rows: Vec<(String, String, i64, String, String)> = {
             let conn = lock(&self.conn)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, key, size, digest FROM entries \
+                    "SELECT id, key, size, digest, layout FROM entries \
                      WHERE complete = 1 ORDER BY key",
                 )
                 .map_err(sql)?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })
                 .map_err(sql)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
         };
         let mut reports = Vec::with_capacity(rows.len());
-        for (id, key, size, stored) in rows {
+        for (id, key, size, stored, layout) in rows {
             let recorded = u64::try_from(size).unwrap_or(0);
-            let blob = self.blob_path(&id);
-            let health = match std::fs::metadata(&blob) {
-                Err(err) if err.kind() == io::ErrorKind::NotFound => EntryHealth::MissingBlob,
-                Err(err) => return Err(err),
-                Ok(meta) => {
-                    let on_disk = meta.len();
-                    if on_disk != recorded {
-                        EntryHealth::SizeMismatch {
-                            expected: recorded,
-                            actual: on_disk,
-                        }
-                    } else if stored.is_empty() {
-                        EntryHealth::MissingDigest
-                    } else {
-                        let actual = digest::hash_file(&blob)?;
-                        if actual == stored {
-                            EntryHealth::Ok
+            let health = if layout == "chunked" {
+                self.verify_chunked(&id, recorded, &stored)?
+            } else {
+                let blob = self.blob_path(&id);
+                match std::fs::metadata(&blob) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => EntryHealth::MissingBlob,
+                    Err(err) => return Err(err),
+                    Ok(meta) => {
+                        let on_disk = meta.len();
+                        if on_disk != recorded {
+                            EntryHealth::SizeMismatch {
+                                expected: recorded,
+                                actual: on_disk,
+                            }
+                        } else if stored.is_empty() {
+                            EntryHealth::MissingDigest
                         } else {
-                            EntryHealth::DigestMismatch {
-                                expected: stored,
-                                actual,
+                            let actual = digest::hash_file(&blob)?;
+                            if actual == stored {
+                                EntryHealth::Ok
+                            } else {
+                                EntryHealth::DigestMismatch {
+                                    expected: stored,
+                                    actual,
+                                }
                             }
                         }
                     }
@@ -230,6 +290,65 @@ impl FsStorage {
             });
         }
         Ok(reports)
+    }
+
+    /// Integrity of one `chunked` entry (docs/cdc.md §verify semantics):
+    /// every manifest chunk file must exist, the summed on-disk sizes must
+    /// equal the recorded entry size, and the chunk bytes folded in sequence
+    /// order must recompute the recorded whole-payload digest.
+    fn verify_chunked(&self, id: &str, recorded: u64, stored: &str) -> io::Result<EntryHealth> {
+        let manifest: Vec<(String, i64)> = {
+            let conn = lock(&self.conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.id, c.size FROM entry_chunks ec \
+                     JOIN chunks c ON c.id = ec.chunk_id \
+                     WHERE ec.entry_id = ?1 ORDER BY ec.seq",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(sql)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
+        };
+        let mut on_disk = 0_u64;
+        let mut missing = 0_u64;
+        let mut files = Vec::with_capacity(manifest.len());
+        for (chunk_id, _size) in &manifest {
+            let path = self.chunk_path(chunk_id);
+            match std::fs::metadata(&path) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => missing += 1,
+                Err(err) => return Err(err),
+                Ok(meta) => {
+                    on_disk += meta.len();
+                    files.push(path);
+                }
+            }
+        }
+        if missing > 0 {
+            return Ok(EntryHealth::MissingChunk {
+                missing,
+                total: u64::try_from(manifest.len()).unwrap_or(u64::MAX),
+            });
+        }
+        if on_disk != recorded {
+            return Ok(EntryHealth::SizeMismatch {
+                expected: recorded,
+                actual: on_disk,
+            });
+        }
+        if stored.is_empty() {
+            return Ok(EntryHealth::MissingDigest);
+        }
+        let actual = digest::hash_files(&files)?;
+        Ok(if actual == stored {
+            EntryHealth::Ok
+        } else {
+            EntryHealth::DigestMismatch {
+                expected: stored.to_owned(),
+                actual,
+            }
+        })
     }
 
     /// Reservation TTL reaper (plan task 11 / M4): delete staged
@@ -372,6 +491,11 @@ impl FsStorage {
         self.root.join("parts").join(format!("{id}.part"))
     }
 
+    /// Path of one at-rest CDC chunk payload (docs/cdc.md storage layout).
+    fn chunk_path(&self, id: &str) -> PathBuf {
+        self.root.join("chunks").join(format!("{id}.chunk"))
+    }
+
     fn tmp_path(&self, id: &str) -> PathBuf {
         self.root.join("tmp").join(format!("{id}.tmp"))
     }
@@ -404,24 +528,44 @@ impl FsStorage {
     /// scratch. Rowless blob files stay put for the task-11 reaper.
     fn reconcile(&self) -> io::Result<()> {
         let conn = lock(&self.conn)?;
-        let ids: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT id FROM entries").map_err(sql)?;
+        let ids: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, layout FROM entries")
+                .map_err(sql)?;
             let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(sql)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
         };
         let mut dropped = 0_u64;
-        for id in ids {
-            if !self.blob_path(&id).exists() {
+        for (id, layout) in ids {
+            // `whole` entries die at boot when their blob file is gone
+            // (unchanged v1.0 rule); `chunked` entries when any manifest
+            // chunk file is missing, since the row can no longer serve its
+            // contract. Broken entries release their chunk references so
+            // the files' refcounts and accounting stay truthful.
+            let intact = if layout == "chunked" {
+                self.chunked_entry_intact(&conn, &id)?
+            } else {
+                self.blob_path(&id).exists()
+            };
+            if !intact {
+                release_entry_manifest(&conn, &id)?;
                 conn.execute("DELETE FROM entries WHERE id = ?1", [&id])
                     .map_err(sql)?;
                 dropped += 1;
             }
         }
+        // Unique bytes at rest (docs/cdc.md accounting invariant): whole
+        // blob sizes plus chunk sizes with live references. The chunk half
+        // is exact even under dedup; blob-less chunked entries never
+        // double-count.
         conn.execute(
             "UPDATE accounting SET used_bytes = \
-             COALESCE((SELECT SUM(size) FROM entries WHERE complete = 1), 0)",
+             COALESCE((SELECT SUM(size) FROM entries WHERE complete = 1 AND layout = 'whole'), 0) \
+             + COALESCE((SELECT SUM(size) FROM chunks WHERE refs > 0), 0)",
             [],
         )
         .map_err(sql)?;
@@ -432,6 +576,40 @@ impl FsStorage {
         let _ = std::fs::create_dir(self.root.join("tmp"));
         tracing::debug!(dropped_rows = dropped, "storage reconciliation done");
         Ok(())
+    }
+
+    /// Whether a `chunked` entry's manifest still backs its row: every
+    /// manifest chunk file exists, and the manifest's summed sizes match the
+    /// recorded whole-payload size. Checked at boot (reconcile) only.
+    fn chunked_entry_intact(&self, conn: &Connection, id: &str) -> io::Result<bool> {
+        let size: i64 = conn
+            .query_row(
+                "SELECT COALESCE((SELECT SUM(c.size) FROM entry_chunks ec \
+                 JOIN chunks c ON c.id = ec.chunk_id WHERE ec.entry_id = ?1), 0)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let recorded: i64 = conn
+            .query_row("SELECT size FROM entries WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .map_err(sql)?;
+        if size != recorded {
+            return Ok(false);
+        }
+        let chunk_ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT chunk_id FROM entry_chunks WHERE entry_id = ?1")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([id], |row| row.get::<_, String>(0))
+                .map_err(sql)?;
+            rows.collect::<Result<_, _>>().map_err(sql)?
+        };
+        Ok(chunk_ids
+            .iter()
+            .all(|chunk_id| self.chunk_path(chunk_id).exists()))
     }
 }
 
@@ -476,19 +654,21 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.read().await;
             let id = entry_id(key);
             let key = key.to_owned();
+            let key_hint = key.clone();
             let blob = self.blob_path(&id);
             let conn = Arc::clone(&self.conn);
-            let file = blocking(move || {
+            let chunks_dir = self.root.join("chunks");
+            let resolved = blocking(move || {
                 let conn = lock(&conn)?;
-                let size: Option<u64> = conn
+                let row: Option<(u64, String)> = conn
                     .query_row(
-                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
+                        "SELECT size, layout FROM entries WHERE id = ?1 AND complete = 1",
                         [&id],
-                        |row| row.get(0),
+                        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()
                     .map_err(sql)?;
-                let Some(size) = size else {
+                let Some((size, layout)) = row else {
                     return Err(not_found(&key));
                 };
                 if range.start > size {
@@ -499,22 +679,90 @@ impl StorageBackend for FsStorage {
                     params![unix_now(), id],
                 )
                 .map_err(sql)?;
-                let mut file = File::open(&blob).map_err(|err| {
-                    if err.kind() == io::ErrorKind::NotFound {
-                        not_found(&key)
-                    } else {
-                        err
+                if layout == "chunked" {
+                    let manifest: Vec<(String, u64)> = {
+                        let mut stmt = conn
+                            .prepare(
+                                "SELECT c.id, c.size FROM entry_chunks ec \
+                                 JOIN chunks c ON c.id = ec.chunk_id \
+                                 WHERE ec.entry_id = ?1 ORDER BY ec.seq",
+                            )
+                            .map_err(sql)?;
+                        let rows = stmt
+                            .query_map([id], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                            })
+                            .map_err(sql)?;
+                        rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
+                    };
+                    // Intersect each chunk's span with the clamped range:
+                    // the emitted slices `skip` into the first chunk and cut
+                    // off wherever `range.end` (or the entry size) lands.
+                    let end = range.end.min(size);
+                    let mut pos = 0_u64;
+                    let mut parts = Vec::new();
+                    let mut planned = 0_u64;
+                    for (chunk_id, chunk_size) in manifest {
+                        let stop = pos.saturating_add(chunk_size);
+                        if stop > range.start && pos < end {
+                            let skip = range.start.saturating_sub(pos);
+                            let take = stop.min(end) - range.start.max(pos);
+                            if take > 0 {
+                                planned = planned.saturating_add(take);
+                                parts.push((
+                                    chunks_dir.join(format!("{chunk_id}.chunk")),
+                                    skip,
+                                    take,
+                                ));
+                            }
+                        }
+                        pos = stop;
                     }
-                })?;
-                if range.start > 0 {
-                    file.seek(SeekFrom::Start(range.start))?;
+                    if planned != end - range.start {
+                        return Err(io::Error::other(
+                            "chunked entry's manifest does not tile its recorded size",
+                        ));
+                    }
+                    // Covering chunk files are called out at range time, the
+                    // same way the plain layout's eager blob open is: a
+                    // vanished chunk file fails here with the key named
+                    // (reads must not discover breakage at first poll_read).
+                    for (path, ..) in &parts {
+                        if std::fs::metadata(path).is_err() {
+                            return Err(not_found(&key));
+                        }
+                    }
+                    Ok(ResolvedReader::Chunked {
+                        parts,
+                        remaining: end - range.start,
+                    })
+                } else {
+                    let mut file = File::open(&blob).map_err(|err| {
+                        if err.kind() == io::ErrorKind::NotFound {
+                            not_found(&key)
+                        } else {
+                            err
+                        }
+                    })?;
+                    if range.start > 0 {
+                        file.seek(SeekFrom::Start(range.start))?;
+                    }
+                    Ok(ResolvedReader::Whole {
+                        file,
+                        len: range.end.saturating_sub(range.start),
+                    })
                 }
-                Ok(file)
             })
             .await?;
-            // `take` clamps at EOF, matching the trait's end-clamping rule.
-            let len = range.end.saturating_sub(range.start);
-            let stream: ByteStream<'a> = Box::pin(tokio::fs::File::from_std(file).take(len));
+            let stream: ByteStream<'a> = match resolved {
+                ResolvedReader::Whole { file, len } => {
+                    // `take` clamps at EOF, matching the trait's end-clamping rule.
+                    Box::pin(tokio::fs::File::from_std(file).take(len))
+                }
+                ResolvedReader::Chunked { parts, remaining } => {
+                    Box::pin(ChunkedReader::new(parts, remaining, key_hint))
+                }
+            };
             Ok(stream)
         })
     }
@@ -525,35 +773,36 @@ impl StorageBackend for FsStorage {
             let id = entry_id(key);
             let blob = self.blob_path(&id);
             let part = self.part_path(&id);
+            let chunks_dir = self.root.join("chunks");
             let conn = Arc::clone(&self.conn);
             blocking(move || {
                 let mut conn = lock(&conn)?;
                 let tx = conn.transaction().map_err(sql)?;
-                let size: Option<u64> = tx
-                    .query_row(
-                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
-                        [&id],
-                        |row| row.get(0),
-                    )
+                // Layout-aware release (docs/cdc.md accounting): a `chunked`
+                // entry frees only its EXCLUSIVE chunk bytes — chunks shared
+                // with a sibling stay at rest for it; a `whole` entry frees
+                // its blob size, the exact legacy math for v1.0 rows.
+                let (removed, _superseded_blob, chunk_unlinks) = release_previous(&tx, &id)?;
+                let used: i64 = tx
+                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
                     .optional()
+                    .map_err(sql)?
+                    .unwrap_or(0);
+                let used = used.saturating_sub(removed);
+                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
                     .map_err(sql)?;
-                if let Some(size) = size {
-                    let used: i64 = tx
-                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                        .optional()
-                        .map_err(sql)?
-                        .unwrap_or(0);
-                    let used = used.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
-                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                        .map_err(sql)?;
-                }
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&id])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
                 // Files last: a crash in between leaves rowless blobs/parts
-                // for reconciliation/reaper, never a dangling row.
+                // for reconciliation/reaper, never a dangling row. Chunk
+                // files whose refs hit 0 go best-effort in the same window —
+                // the chunk sweeper is the convergence backstop.
                 let _ = std::fs::remove_file(&blob);
                 let _ = std::fs::remove_file(&part);
+                for chunk_id in &chunk_unlinks {
+                    let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                }
                 Ok(())
             })
             .await
@@ -624,6 +873,8 @@ impl StorageBackend for FsStorage {
             let key = key.to_owned();
             let part = self.part_path(&id);
             let blob = self.blob_path(&id);
+            let chunks_dir = self.root.join("chunks");
+            let cdc: Option<CdcParams> = self.cdc;
             let conn = Arc::clone(&self.conn);
             blocking(move || {
                 if !part.exists() {
@@ -645,6 +896,68 @@ impl StorageBackend for FsStorage {
                     };
                 }
                 let created_at = modified_unix(&part)?;
+                if let Some(params) = cdc {
+                    // CDC: chunking is a finalize-time pass (docs/cdc.md §Write
+                    // path). The task-50 digest still means "whole payload" and
+                    // falls out of the same single read pass over the part.
+                    // The staged part survives until the index commit, then is
+                    // deleted — a crash before the commit leaves it for the
+                    // parts sweeper, exactly like the whole path's staging.
+                    let mut input = File::open(&part)?;
+                    let payload = chunk_payload(&chunks_dir, params, &mut input)?;
+                    let size = i64::try_from(payload.size)
+                        .map_err(|_| io::Error::other("payload exceeds SQLite integer range"))?;
+                    let mut conn = lock(&conn)?;
+                    let tx = conn.transaction().map_err(sql)?;
+                    let version: String = tx
+                        .query_row("SELECT version FROM entries WHERE id = ?1", [&id], |row| {
+                            row.get(0)
+                        })
+                        .optional()
+                        .map_err(sql)?
+                        .unwrap_or_default();
+                    // One tx: release any superseded manifest + refs, stamp
+                    // the chunked entry row, register chunks + refs.
+                    let (removed, supersedes_blob, mut chunk_unlinks) = release_previous(&tx, &id)?;
+                    tx.execute(
+                        "INSERT INTO entries \
+                             (id, key, version, size, created_at, accessed_at, complete, \
+                              owner_node, artifact_key, digest, layout) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'chunked') \
+                             ON CONFLICT(id) DO UPDATE SET \
+                                 key = excluded.key, version = excluded.version, \
+                                 size = excluded.size, \
+                                 created_at = excluded.created_at, \
+                                 accessed_at = excluded.accessed_at, complete = 1, \
+                                 artifact_key = '', digest = excluded.digest, \
+                                 layout = 'chunked'",
+                        params![id, key, version, size, created_at, payload.digest],
+                    )
+                    .map_err(sql)?;
+                    let added = acquire_chunk_manifest(&tx, &id, &payload, &mut chunk_unlinks)?;
+                    let used: i64 = tx
+                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                        .optional()
+                        .map_err(sql)?
+                        .unwrap_or(0);
+                    let used = used.saturating_sub(removed).saturating_add(added);
+                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
+                        .map_err(sql)?;
+                    tx.commit().map_err(sql)?;
+                    drop(conn);
+                    // Files last (B5 convention): zero-ref chunk files and a
+                    // superseded whole blob go best-effort after the commit;
+                    // the staged part's deletion is likewise best-effort (the
+                    // parts sweeper covers a lost delete).
+                    if supersedes_blob {
+                        let _ = std::fs::remove_file(&blob);
+                    }
+                    for chunk_id in &chunk_unlinks {
+                        let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                    }
+                    let _ = std::fs::remove_file(&part);
+                    return Ok(());
+                }
                 // Task 50: `finalize` has no streaming write to fold the hash
                 // into (the part is already on disk), so read it back in
                 // bounded chunks. The chunk and block publish paths hash while
@@ -657,14 +970,6 @@ impl StorageBackend for FsStorage {
                     .map_err(|_| io::Error::other("blob exceeds SQLite integer range"))?;
                 let mut conn = lock(&conn)?;
                 let tx = conn.transaction().map_err(sql)?;
-                let previous: Option<i64> = tx
-                    .query_row(
-                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
-                        [&id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sql)?;
                 let version: String = tx
                     .query_row("SELECT version FROM entries WHERE id = ?1", [&id], |row| {
                         row.get(0)
@@ -672,17 +977,24 @@ impl StorageBackend for FsStorage {
                     .optional()
                     .map_err(sql)?
                     .unwrap_or_default();
+                // Release anything the CDC era left behind: when this finalize
+                // supersedes an already-chunked entry (a `[storage.cdc]`
+                // flip-off), its manifest and refs go with the row here. A
+                // `whole` previous row releases nothing — the rename below
+                // replaces its blob outright.
+                let (removed, _supersedes_blob, chunk_unlinks) = release_previous(&tx, &id)?;
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, digest) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6) \
+                          owner_node, artifact_key, digest, layout) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'whole') \
                          ON CONFLICT(id) DO UPDATE SET \
                              key = excluded.key, version = excluded.version, \
                              size = excluded.size, \
                              created_at = excluded.created_at, \
                              accessed_at = excluded.accessed_at, complete = 1, \
-                             artifact_key = '', digest = excluded.digest",
+                             artifact_key = '', digest = excluded.digest, \
+                             layout = 'whole'",
                     params![id, key, version, size, created_at, digest],
                 )
                 .map_err(sql)?;
@@ -691,12 +1003,14 @@ impl StorageBackend for FsStorage {
                     .optional()
                     .map_err(sql)?
                     .unwrap_or(0);
-                let used = used
-                    .saturating_sub(previous.unwrap_or(0))
-                    .saturating_add(size);
+                let used = used.saturating_sub(removed).saturating_add(size);
                 tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
+                drop(conn);
+                for chunk_id in &chunk_unlinks {
+                    let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                }
                 Ok(())
             })
             .await
@@ -869,6 +1183,7 @@ impl StorageBackend for FsStorage {
             let conn = Arc::clone(&self.conn);
             let res_id = entry_id(cache_id);
             let cache_id = cache_id.to_owned();
+            let cdc: Option<CdcParams> = self.cdc;
             blocking(move || {
                 let now = unix_now();
                 let reservation: Option<(String, String, Option<i64>)> = {
@@ -906,8 +1221,72 @@ impl StorageBackend for FsStorage {
                     ));
                 }
                 let blob_id = entry_id(&artifact_key);
-                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
+                let chunks_dir = root.join("chunks");
+                if let Some(params) = cdc {
+                    // CDC: the staged parts are read back concatenated and cut
+                    // into content chunks (docs/cdc.md §Write path); the
+                    // published entry holds no blob file at all. The digest
+                    // keeps its whole-payload meaning and comes from the same
+                    // single pass.
+                    let payload = chunk_payload(
+                        &chunks_dir,
+                        params,
+                        MultiReader::new(
+                            parts
+                                .iter()
+                                .map(|(_start, _len, path)| path.clone())
+                                .collect(),
+                        ),
+                    )?;
+                    let size = i64::try_from(payload.size)
+                        .map_err(|_| io::Error::other("payload exceeds SQLite integer range"))?;
+                    let mut conn = lock(&conn)?;
+                    let tx = conn.transaction().map_err(sql)?;
+                    let (removed, supersedes_blob, mut chunk_unlinks) =
+                        release_previous(&tx, &blob_id)?;
+                    tx.execute(
+                        "INSERT INTO entries \
+                             (id, key, version, size, created_at, accessed_at, complete, \
+                              owner_node, artifact_key, reservation_expires_at, digest, layout) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked') \
+                          ON CONFLICT(id) DO UPDATE SET \
+                              key = excluded.key, version = excluded.version, \
+                              size = excluded.size, created_at = excluded.created_at, \
+                              accessed_at = excluded.accessed_at, complete = 1, \
+                              artifact_key = '', reservation_expires_at = NULL, \
+                              digest = excluded.digest, layout = 'chunked'",
+                        params![blob_id, artifact_key, version, size, now, payload.digest],
+                    )
+                    .map_err(sql)?;
+                    tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
+                        .map_err(sql)?;
+                    let added =
+                        acquire_chunk_manifest(&tx, &blob_id, &payload, &mut chunk_unlinks)?;
+                    let used: i64 = tx
+                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                        .optional()
+                        .map_err(sql)?
+                        .unwrap_or(0);
+                    let used = used.saturating_sub(removed).saturating_add(added);
+                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
+                        .map_err(sql)?;
+                    tx.commit().map_err(sql)?;
+                    drop(conn);
+                    // Files last: superseded blob + zero-ref chunks + the
+                    // staging area, best-effort after the commit (crashes
+                    // converge through the boot/parts/chunk sweeps).
+                    if supersedes_blob {
+                        let _ = std::fs::remove_file(&blob);
+                    }
+                    for chunk_id in &chunk_unlinks {
+                        let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                    }
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                    return Ok(());
+                }
+                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let digest = {
                     let mut out = DigestWriter::new(File::create(&tmp)?);
                     for (_start, _len, path) in &parts {
@@ -925,25 +1304,21 @@ impl StorageBackend for FsStorage {
                     .map_err(|_| io::Error::other("blob exceeds SQLite integer range"))?;
                 let mut conn = lock(&conn)?;
                 let tx = conn.transaction().map_err(sql)?;
-                let previous: Option<i64> = tx
-                    .query_row(
-                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
-                        [&blob_id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sql)?;
+                // Release anything the CDC era left behind (a chunked previous
+                // row under a flipped-off flag); a `whole` previous row
+                // releases nothing — the rename above replaced its blob.
+                let (removed, _supersedes_blob, chunk_unlinks) = release_previous(&tx, &blob_id)?;
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at, digest) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6) \
+                          owner_node, artifact_key, reservation_expires_at, digest, layout) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole') \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
                          artifact_key = '', reservation_expires_at = NULL, \
-                         digest = excluded.digest",
+                         digest = excluded.digest, layout = 'whole'",
                     params![blob_id, artifact_key, version, size, now, digest],
                 )
                 .map_err(sql)?;
@@ -954,13 +1329,14 @@ impl StorageBackend for FsStorage {
                     .optional()
                     .map_err(sql)?
                     .unwrap_or(0);
-                let used = used
-                    .saturating_sub(previous.unwrap_or(0))
-                    .saturating_add(size);
+                let used = used.saturating_sub(removed).saturating_add(size);
                 tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
                 drop(conn);
+                for chunk_id in &chunk_unlinks {
+                    let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                }
                 let _ = std::fs::remove_dir_all(&dir);
                 let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
                 Ok(())
@@ -1047,6 +1423,7 @@ impl StorageBackend for FsStorage {
             let res_id = entry_id(cache_id);
             let cache_id = cache_id.to_owned();
             let ordered = ordered_block_ids.to_vec();
+            let cdc: Option<CdcParams> = self.cdc;
             blocking(move || {
                 let now = unix_now();
                 let reservation: Option<(String, String, Option<i64>)> = {
@@ -1068,8 +1445,78 @@ impl StorageBackend for FsStorage {
                 }
                 let blocks = root.join("parts").join(&cache_id).join("blocks");
                 let blob_id = entry_id(&artifact_key);
-                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
+                let chunks_dir = root.join("chunks");
+                if let Some(params) = cdc {
+                    // Same unknown-block verdict as the whole path — before any
+                    // chunk bytes are written.
+                    for block_id in &ordered {
+                        let path = blocks.join(format!("{block_id}.block"));
+                        if !path.exists() {
+                            return Err(invalid_range("blocklist references an unknown block"));
+                        }
+                    }
+                    // CDC: the listed blocks are read in order and cut into
+                    // content chunks (docs/cdc.md §Write path); the published
+                    // entry holds no blob file. The digest keeps its
+                    // whole-payload meaning and comes from the same pass.
+                    let payload = chunk_payload(
+                        &chunks_dir,
+                        params,
+                        MultiReader::new(
+                            ordered
+                                .iter()
+                                .map(|block_id| blocks.join(format!("{block_id}.block")))
+                                .collect(),
+                        ),
+                    )?;
+                    let size = i64::try_from(payload.size)
+                        .map_err(|_| io::Error::other("payload exceeds SQLite integer range"))?;
+                    let mut conn = lock(&conn)?;
+                    let tx = conn.transaction().map_err(sql)?;
+                    let (removed, supersedes_blob, mut chunk_unlinks) =
+                        release_previous(&tx, &blob_id)?;
+                    tx.execute(
+                        "INSERT INTO entries \
+                             (id, key, version, size, created_at, accessed_at, complete, \
+                              owner_node, artifact_key, reservation_expires_at, digest, layout) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked') \
+                          ON CONFLICT(id) DO UPDATE SET \
+                              key = excluded.key, version = excluded.version, \
+                              size = excluded.size, created_at = excluded.created_at, \
+                              accessed_at = excluded.accessed_at, complete = 1, \
+                              artifact_key = '', reservation_expires_at = NULL, \
+                              digest = excluded.digest, layout = 'chunked'",
+                        params![blob_id, artifact_key, version, size, now, payload.digest],
+                    )
+                    .map_err(sql)?;
+                    tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
+                        .map_err(sql)?;
+                    let added =
+                        acquire_chunk_manifest(&tx, &blob_id, &payload, &mut chunk_unlinks)?;
+                    let used: i64 = tx
+                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
+                        .optional()
+                        .map_err(sql)?
+                        .unwrap_or(0);
+                    let used = used.saturating_sub(removed).saturating_add(added);
+                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
+                        .map_err(sql)?;
+                    tx.commit().map_err(sql)?;
+                    drop(conn);
+                    // Files last: superseded blob + zero-ref chunks + the
+                    // staging area, best-effort after the commit.
+                    if supersedes_blob {
+                        let _ = std::fs::remove_file(&blob);
+                    }
+                    for chunk_id in &chunk_unlinks {
+                        let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                    }
+                    let _ = std::fs::remove_dir_all(&blocks);
+                    let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                    return Ok(u64::try_from(size).unwrap_or(u64::MAX));
+                }
+                let tmp = root.join("tmp").join(format!("{blob_id}.assemble"));
                 let mut total = 0_u64;
                 let digest = {
                     let mut out = DigestWriter::new(File::create(&tmp)?);
@@ -1095,25 +1542,21 @@ impl StorageBackend for FsStorage {
                     .map_err(|_| io::Error::other("blob exceeds SQLite integer range"))?;
                 let mut conn = lock(&conn)?;
                 let tx = conn.transaction().map_err(sql)?;
-                let previous: Option<i64> = tx
-                    .query_row(
-                        "SELECT size FROM entries WHERE id = ?1 AND complete = 1",
-                        [&blob_id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sql)?;
+                // Release anything the CDC era left behind (a chunked previous
+                // row under a flipped-off flag); a `whole` previous row
+                // releases nothing — the rename above replaced its blob.
+                let (removed, _supersedes_blob, chunk_unlinks) = release_previous(&tx, &blob_id)?;
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at, digest) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6) \
+                          owner_node, artifact_key, reservation_expires_at, digest, layout) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole') \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
                          artifact_key = '', reservation_expires_at = NULL, \
-                         digest = excluded.digest",
+                         digest = excluded.digest, layout = 'whole'",
                     params![blob_id, artifact_key, version, size, now, digest],
                 )
                 .map_err(sql)?;
@@ -1124,13 +1567,14 @@ impl StorageBackend for FsStorage {
                     .optional()
                     .map_err(sql)?
                     .unwrap_or(0);
-                let used = used
-                    .saturating_sub(previous.unwrap_or(0))
-                    .saturating_add(size);
+                let used = used.saturating_sub(removed).saturating_add(size);
                 tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
                 drop(conn);
+                for chunk_id in &chunk_unlinks {
+                    let _ = std::fs::remove_file(chunks_dir.join(format!("{chunk_id}.chunk")));
+                }
                 let _ = std::fs::remove_dir_all(&blocks);
                 let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
                 Ok(total)
@@ -1138,6 +1582,376 @@ impl StorageBackend for FsStorage {
             .await
         })
     }
+}
+
+/// What a resolved [`get_range`](StorageBackend::get_range) hands out: a
+/// positioned whole-blob file, or a manifest-driven slice plan for the
+/// chunked layout.
+enum ResolvedReader {
+    Whole {
+        file: File,
+        len: u64,
+    },
+    Chunked {
+        /// `(path, skip-inside-chunk, take)` per manifest chunk intersected
+        /// with the clamped range, in stream order.
+        parts: Vec<(PathBuf, u64, u64)>,
+        remaining: u64,
+    },
+}
+
+/// Stitches manifest-ordered chunk files into one byte stream, honoring a
+/// range's skip/take, keeping ONE file open at a time. The blocking
+/// [`File::read`] inside `poll_read` is the accepted pattern here
+/// (tokio-util chunk streams are out of scope by design): at-rest chunks
+/// live on the node's own disk and every poll reads at most one bounded
+/// slice, so per-request buffering stays at one chunk window max.
+struct ChunkedReader {
+    parts: VecDeque<(PathBuf, u64, u64)>,
+    remaining: u64,
+    open: Option<File>,
+    /// Included in read-time errors so a vanished chunk file names both the
+    /// cache key and the missing content id.
+    key_hint: String,
+}
+
+impl ChunkedReader {
+    fn new(parts: Vec<(PathBuf, u64, u64)>, remaining: u64, key_hint: String) -> Self {
+        Self {
+            parts: parts.into(),
+            remaining,
+            open: None,
+            key_hint,
+        }
+    }
+}
+
+impl AsyncRead for ChunkedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // One bounded read per poll; the reader's own state machine (front
+        // part's skip/take budget, one open file at a time) carries on across
+        // polls, so cancellation and stream resumption never lose position.
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            // Take-clamped EOF: end-clamping is the trait's contract.
+            return Poll::Ready(Ok(()));
+        }
+        let Some((path, skip, take)) = this.parts.front().cloned() else {
+            return Poll::Ready(Err(io::Error::other(
+                "chunk manifest shorter than the entry's recorded size",
+            )));
+        };
+        if this.open.is_none() {
+            let mut file = File::open(&path).map_err(|err| {
+                if err.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("chunk file missing for {}: {path:?}", this.key_hint),
+                    )
+                } else {
+                    err
+                }
+            })?;
+            if skip > 0 {
+                file.seek(SeekFrom::Start(skip))?;
+            }
+            this.open = Some(file);
+        }
+        let file = this.open.as_mut().expect("file just opened");
+        let want = take
+            .min(this.remaining)
+            .min(u64::try_from(buf.remaining()).unwrap_or(u64::MAX)) as usize;
+        if want == 0 {
+            // Buffer full: resume on the next poll mid-chunk.
+            return Poll::Ready(Ok(()));
+        }
+        let spare = buf.initialize_unfilled_to(want);
+        let read = file.read(spare)?;
+        if read == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("chunk file shorter than its recorded size: {path:?}"),
+            )));
+        }
+        buf.advance(read);
+        this.remaining -= read as u64;
+        let (_, _, take_left) = this.parts.front_mut().expect("checked above");
+        *take_left -= read as u64;
+        if *take_left == 0 {
+            this.parts.pop_front();
+            this.open = None;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Concatenates a fixed, ordered list of files into one [`Read`] stream —
+/// the reader-side input for assembled payload publishes (commit chunks in
+/// offset order, listed blocks in list order).
+struct MultiReader {
+    paths: std::vec::IntoIter<PathBuf>,
+    open: Option<File>,
+}
+
+impl MultiReader {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter(),
+            open: None,
+        }
+    }
+}
+
+impl Read for MultiReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.open.is_none() {
+                let Some(path) = self.paths.next() else {
+                    return Ok(0);
+                };
+                self.open = Some(File::open(&path)?);
+            }
+            let read = self.open.as_mut().expect("just opened").read(buf)?;
+            if read == 0 {
+                self.open = None; // advance to the next file
+                continue;
+            }
+            return Ok(read);
+        }
+    }
+}
+
+/// A finalize-time chunking pass output (docs/cdc.md §Write path): the
+/// per-seq manifest (content id, chunk size), the whole-payload digest, and
+/// the total payload size the manifest covers.
+struct CdcPayload {
+    chunks: Vec<(String, u64)>,
+    digest: String,
+    size: u64,
+}
+
+/// Stream `input` once: fold the whole-payload blake3, cut content-defined
+/// chunks ([`cdc::CdcSplitter`]) and write each chunk payload to
+/// `chunks/{id}.chunk` — dedup is the raw existence check, same bytes same
+/// id. Memory stays bounded: batches are fixed-size and per-chunk buffering
+/// never exceeds the `[min, max]` window (4 MiB at the default average).
+/// A crash mid-pass leaves at most rowless chunk files, which the sweeps
+/// converge on (docs/cdc.md §failure model).
+fn chunk_payload(
+    chunks_dir: &Path,
+    params: CdcParams,
+    mut input: impl Read,
+) -> io::Result<CdcPayload> {
+    const READ_BATCH: usize = 256 * 1024;
+    let mut splitter = cdc::CdcSplitter::new(params);
+    let mut whole = Hasher::new();
+    let mut chunks: Vec<(String, u64)> = Vec::new();
+    // In-progress chunk bytes; a cut can never lag past `max_chunk_bytes`.
+    let mut pend: Vec<u8> = Vec::new();
+    let mut batch = vec![0_u8; READ_BATCH];
+    loop {
+        let read = input.read(&mut batch)?;
+        if read == 0 {
+            break;
+        }
+        let batch = &batch[..read];
+        whole.update(batch);
+        // The splitter's state advances over the raw stream bytes; returned
+        // lengths carve the fed prefix, and the first length may complete a
+        // chunk whose head bytes sit in `pend` from an earlier batch.
+        let mut consumed = 0;
+        for len in splitter.feed(batch) {
+            if pend.is_empty() {
+                chunks.push(publish_chunk_file(
+                    chunks_dir,
+                    &batch[consumed..consumed + len],
+                )?);
+                consumed += len;
+            } else {
+                let head = pend.len();
+                pend.extend_from_slice(&batch[consumed..consumed + len - head]);
+                chunks.push(publish_chunk_file(chunks_dir, &pend)?);
+                consumed += len - head;
+                pend.clear();
+            }
+        }
+        pend.extend_from_slice(&batch[consumed..]);
+    }
+    if !pend.is_empty() {
+        // Stream end flushes the trailing chunk: shorter than `min` is
+        // allowed only here, never longer than `max` (docs/cdc.md bounds).
+        chunks.push(publish_chunk_file(chunks_dir, &pend)?);
+    }
+    let size = chunks.iter().map(|(_, len)| len).sum();
+    Ok(CdcPayload {
+        digest: digest::hex16(whole.finalize().as_bytes()),
+        chunks,
+        size,
+    })
+}
+
+/// Write one chunk payload under its content id; returns `(id, len)`. The
+/// blake3-16 hex id IS the file name, so the existence check is the dedup
+/// test; the write itself is atomic (scratch + fsync + rename).
+fn publish_chunk_file(chunks_dir: &Path, chunk: &[u8]) -> io::Result<(String, u64)> {
+    let id = digest::hash_bytes(chunk);
+    let dest = chunks_dir.join(format!("{id}.chunk"));
+    if !dest.exists() {
+        let tmp = chunks_dir.join(format!("{id}.chunk.tmp"));
+        write_atomic(&tmp, &dest, chunk)?;
+    }
+    Ok((id, chunk.len() as u64))
+}
+
+/// Inside the caller's transaction: release the complete row `id`'s at-rest
+/// state ahead of a supersede/delete. A `chunked` row drops its manifest and
+/// decrements its chunks' refs, freeing — accounting-wise — only the chunk
+/// bytes exclusive to it (`refs == 1` pre-decrement, the docs/cdc.md bound);
+/// a `whole` row frees its blob size, the v1.0 math byte-for-byte, with the
+/// blob file left for the caller's post-commit unlink. Nothing to release
+/// (staged/reservation rows carry no rest state) is `(0, false, [])`.
+fn release_previous(conn: &Connection, id: &str) -> io::Result<(i64, bool, Vec<String>)> {
+    let previous: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT size, layout FROM entries WHERE id = ?1 AND complete = 1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some((size, layout)) = previous else {
+        return Ok((0, false, Vec::new()));
+    };
+    if layout == "chunked" {
+        let removed: i64 = conn
+            .query_row(
+                "SELECT COALESCE((SELECT SUM(size) FROM chunks \
+                 WHERE refs = 1 AND id IN \
+                 (SELECT DISTINCT chunk_id FROM entry_chunks WHERE entry_id = ?1)), 0)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let unlinked = release_entry_manifest(conn, id)?;
+        Ok((removed, false, unlinked))
+    } else {
+        Ok((size, true, Vec::new()))
+    }
+}
+
+/// Drop `id`'s manifest rows and decrement its chunks' refs, once per
+/// DISTINCT chunk id — `refs` counts referencing ENTRIES, not manifest
+/// occurrences. Chunks that hit `refs == 0` leave the `chunks` table; their
+/// ids are returned for the caller's post-commit (best-effort) unlink.
+fn release_entry_manifest(conn: &Connection, id: &str) -> io::Result<Vec<String>> {
+    let chunk_ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT chunk_id FROM entry_chunks WHERE entry_id = ?1")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(sql)?;
+        rows.collect::<Result<_, _>>().map_err(sql)?
+    };
+    conn.execute("DELETE FROM entry_chunks WHERE entry_id = ?1", [id])
+        .map_err(sql)?;
+    let mut unlinked = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        conn.execute(
+            "UPDATE chunks SET refs = refs - 1 WHERE id = ?1 AND refs > 0",
+            [&chunk_id],
+        )
+        .map_err(sql)?;
+        let refs: i64 = conn
+            .query_row(
+                "SELECT refs FROM chunks WHERE id = ?1",
+                [&chunk_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0);
+        if refs <= 0 {
+            conn.execute("DELETE FROM chunks WHERE id = ?1", [&chunk_id])
+                .map_err(sql)?;
+            unlinked.push(chunk_id);
+        }
+    }
+    Ok(unlinked)
+}
+
+/// Inside the caller's transaction: register a fresh manifest's chunks. Each
+/// DISTINCT id gains one ref (this entry adds one ref, no matter how often
+/// it reoccurs across seqs); chunks going `0 -> 1` add their size to the
+/// returned delta — the unique bytes newly at rest. Manifest rows land
+/// keyed `(entry_id, seq)`. Ids a same-transaction release queued for
+/// unlinking are pruned from `unlink` when this entry still holds them.
+fn acquire_chunk_manifest(
+    conn: &Connection,
+    id: &str,
+    payload: &CdcPayload,
+    unlink: &mut Vec<String>,
+) -> io::Result<i64> {
+    let created_at = unix_now();
+    let mut added = 0_i64;
+    let mut seen: HashSet<&str> = HashSet::with_capacity(payload.chunks.len());
+    for (seq, (chunk_id, chunk_size)) in payload.chunks.iter().enumerate() {
+        let seq = i64::try_from(seq).map_err(|_| io::Error::other("manifest exceeds i64 seqs"))?;
+        if seen.insert(chunk_id.as_str()) {
+            let existing: Option<i64> = conn
+                .query_row("SELECT refs FROM chunks WHERE id = ?1", [chunk_id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(sql)?;
+            let requeued = |unlink: &mut Vec<String>| {
+                if let Some(pos) = unlink.iter().position(|queued| queued == chunk_id) {
+                    unlink.swap_remove(pos);
+                }
+            };
+            match existing {
+                None => {
+                    // Fresh at-rest content (or a same-tx release that hit
+                    // 0 and dropped its row): registered at one ref.
+                    conn.execute(
+                        "INSERT INTO chunks (id, size, refs, created_at) \
+                         VALUES (?1, ?2, 1, ?3)",
+                        params![chunk_id, chunk_size, created_at],
+                    )
+                    .map_err(sql)?;
+                    added = added.saturating_add(i64::try_from(*chunk_size).unwrap_or(i64::MAX));
+                    requeued(unlink);
+                }
+                Some(refs) => {
+                    conn.execute(
+                        "UPDATE chunks SET refs = ?1 WHERE id = ?2",
+                        params![refs + 1, chunk_id],
+                    )
+                    .map_err(sql)?;
+                    if refs == 0 {
+                        added =
+                            added.saturating_add(i64::try_from(*chunk_size).unwrap_or(i64::MAX));
+                        requeued(unlink);
+                    }
+                }
+            }
+        }
+        conn.execute(
+            "INSERT INTO entry_chunks (entry_id, seq, chunk_id) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(entry_id, seq) DO UPDATE SET chunk_id = excluded.chunk_id",
+            params![id, seq, chunk_id],
+        )
+        .map_err(sql)?;
+    }
+    Ok(added)
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -1184,6 +1998,23 @@ fn migrate(conn: &Connection) -> io::Result<()> {
     if has_digest == 0 {
         conn.execute(
             "ALTER TABLE entries ADD COLUMN digest TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(sql)?;
+    }
+    // v1.1 (workstream B): the at-rest layout of the row (`whole` | `chunked`,
+    // docs/cdc.md). Pre-v1.1 rows are whole by definition; the default back-
+    // fills them, and the chunked manifest lives in `chunks` / `entry_chunks`.
+    let has_layout: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'layout'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if has_layout == 0 {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN layout TEXT NOT NULL DEFAULT 'whole'",
             [],
         )
         .map_err(sql)?;
@@ -2703,5 +3534,766 @@ mod storage_fs {
             .await
             .expect_err("put block on expired reservation");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // ---- v1.1 workstream B: CDC at-rest layout (docs/cdc.md §Test plan) ----
+
+    /// One xorshift step; nonzero seeds never collapse to the zero state.
+    fn xorshift(state: u64) -> u64 {
+        let mut next = state;
+        next ^= next << 13;
+        next ^= next >> 7;
+        next ^= next << 17;
+        next
+    }
+
+    /// Deterministic pseudo-random bytes: differing content makes the
+    /// content-defined cuts land variedly, while an identical seed reproduces
+    /// an identical stream (dedup tests rely on that).
+    fn pattern(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 8);
+        let mut state = seed;
+        while out.len() < len {
+            state = xorshift(state);
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// `prefix` followed by 8 KiB of seeded pseudo-random tail bytes.
+    fn extended(prefix: &[u8], seed: u64) -> Vec<u8> {
+        let mut payload = prefix.to_vec();
+        payload.extend(pattern(8 * 1024, seed));
+        payload
+    }
+
+    /// Open the storage with CDC on at avg 4096 (min 1024 / max 16384, per the
+    /// docs/cdc.md bounds min = avg/4, max = avg*4).
+    fn open_cdc(dir: &TestDir) -> FsStorage {
+        FsStorage::open_cdc(dir.path(), Some(CdcParams::new(4096))).expect("open cdc storage")
+    }
+
+    /// Open the storage CDC-off: publishes are v1.0 whole blobs, reads keep
+    /// branching on the row's layout.
+    fn open_plain(dir: &TestDir) -> FsStorage {
+        FsStorage::open(dir.path()).expect("open whole-only storage")
+    }
+
+    /// `(id, size, refs)` of every registered chunk.
+    fn chunk_rows(storage: &FsStorage) -> Vec<(String, u64, u64)> {
+        let conn = lock(&storage.conn).expect("lock");
+        let mut stmt = conn
+            .prepare("SELECT id, size, refs FROM chunks")
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })
+            .expect("query");
+        rows.collect::<Result<Vec<_>, _>>().expect("rows")
+    }
+
+    /// DISTINCT chunk ids backing one entry, in first-occurrence order.
+    fn manifest_ids(storage: &FsStorage, id: &str) -> Vec<String> {
+        let conn = lock(&storage.conn).expect("lock");
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_id FROM entry_chunks WHERE entry_id = ?1 \
+                 GROUP BY chunk_id ORDER BY MIN(seq)",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .expect("query");
+        rows.collect::<Result<Vec<_>, _>>().expect("rows")
+    }
+
+    /// Manifest ROW count for one entry (occurrences, dedup included).
+    fn manifest_len(storage: &FsStorage, id: &str) -> usize {
+        let conn = lock(&storage.conn).expect("lock");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_chunks WHERE entry_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        usize::try_from(count).expect("small count")
+    }
+
+    /// At-rest layout of the finalized entry `key`.
+    fn layout_of(storage: &FsStorage, key: &str) -> Option<String> {
+        let conn = lock(&storage.conn).expect("lock");
+        conn.query_row(
+            "SELECT layout FROM entries WHERE id = ?1 AND complete = 1",
+            [entry_id(key)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query")
+    }
+
+    /// docs/cdc.md accounting invariant, straight from the index: whole-entry
+    /// bytes plus chunk bytes with live references.
+    fn at_rest_invariant(storage: &FsStorage) -> u64 {
+        let conn = lock(&storage.conn).expect("lock");
+        let sum: i64 = conn
+            .query_row(
+                "SELECT COALESCE((SELECT SUM(size) FROM entries \
+                     WHERE complete = 1 AND layout = 'whole'), 0) \
+                 + COALESCE((SELECT SUM(size) FROM chunks WHERE refs > 0), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("invariant query");
+        u64::try_from(sum).expect("non-negative sum")
+    }
+
+    async fn used_of(storage: &FsStorage) -> u64 {
+        storage.used_bytes().await.expect("used bytes")
+    }
+
+    /// Sorted `chunks/{id}.chunk` file names on disk.
+    fn chunk_files(dir: &TestDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("chunks"))
+            .expect("list chunks directory")
+            .map(|entry| {
+                entry
+                    .expect("chunk entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf8")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Test plan #2: CDC rows are `chunked` (no whole blob), identical
+    /// prefixes cut identically for sibling entries, refs count the two
+    /// sharing entries, and the accounting rests the shared bytes once.
+    #[tokio::test]
+    async fn cdc_publishes_chunked_rows_and_dedups_the_shared_prefix() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+
+        let prefix = pattern(64 * 1024, 1);
+        let mut a = prefix.clone();
+        a.extend(pattern(24 * 1024, 2));
+        let mut b = prefix;
+        b.extend(pattern(24 * 1024, 3));
+
+        storage.put_stream("a", bytes(&a)).await.expect("put a");
+        storage.finalize("a").await.expect("finalize a");
+        storage.put_stream("b", bytes(&b)).await.expect("put b");
+        storage.finalize("b").await.expect("finalize b");
+
+        for key in ["a", "b"] {
+            assert_eq!(
+                layout_of(&storage, key),
+                Some("chunked".to_owned()),
+                "{key}"
+            );
+            let blob = dir
+                .path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id(key)));
+            assert!(!blob.exists(), "chunked {key} must not rest a whole blob");
+        }
+
+        let ids_a = manifest_ids(&storage, &entry_id("a"));
+        let ids_b = manifest_ids(&storage, &entry_id("b"));
+        assert!(
+            ids_a.iter().any(|id| ids_b.contains(id)),
+            "the shared prefix must dedup into shared chunks"
+        );
+        let rows = chunk_rows(&storage);
+        assert!(
+            rows.iter().any(|(_, _, refs)| *refs == 2),
+            "refs = 2 for shared"
+        );
+        assert!(
+            rows.iter().any(|(_, _, refs)| *refs == 1),
+            "tails rest exclusively"
+        );
+        assert!(
+            rows.iter().all(|(_, _, refs)| *refs == 1 || *refs == 2),
+            "refs snapshot is exactly shared-or-exclusive"
+        );
+
+        let used = used_of(&storage).await;
+        assert_eq!(used, at_rest_invariant(&storage), "accounting invariant");
+        // Identical prefixes cut identically, so at least 64 KiB minus one
+        // max-bound seam chunk of shared bytes rests exactly once.
+        assert!(
+            used < (a.len() + b.len()) as u64,
+            "dedup must not rest the shared prefix twice (used={used})"
+        );
+        assert!(
+            used <= (a.len() + b.len()) as u64 - 48 * 1024,
+            "at least 48 KiB of the 64 KiB prefix deduped (used={used})"
+        );
+
+        // Byte-exactness while we are here: both keys read back whole.
+        for (key, payload) in [("a", a.as_slice()), ("b", b.as_slice())] {
+            let read = read_all(
+                storage
+                    .get_range(key, 0..payload.len() as u64)
+                    .await
+                    .expect("read full"),
+            )
+            .await;
+            assert_eq!(read, payload, "{key} round trip");
+        }
+    }
+
+    /// Test plan #2 (refs semantics): manifest rows count chunk OCCURRENCES,
+    /// but `chunks.refs` counts referencing ENTRIES - a payload containing the
+    /// same material twice dedups within itself to one ref.
+    #[tokio::test]
+    async fn cdc_refs_count_entries_not_manifest_occurrences() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+
+        // The seam chunk (its content spans the copy's split point) differs;
+        // every chunk that ends inside the repeated material reappears.
+        let mut payload = pattern(48 * 1024, 4);
+        payload.extend(pattern(48 * 1024, 4));
+        storage
+            .put_stream("dup", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("dup").await.expect("finalize");
+
+        let id = entry_id("dup");
+        let rows = manifest_len(&storage, &id);
+        let distinct = manifest_ids(&storage, &id).len();
+        assert!(
+            distinct < rows,
+            "repeated material must dedup within one entry \
+             (manifest {rows} rows, {distinct} distinct chunks)"
+        );
+
+        let wrong_refs: Vec<String> = chunk_rows(&storage)
+            .into_iter()
+            .filter(|(_, _, refs)| *refs != 1)
+            .map(|(chunk_id, _, _)| chunk_id)
+            .collect();
+        assert!(
+            wrong_refs.is_empty(),
+            "refs count entries, not occurrences: {wrong_refs:?}"
+        );
+
+        let used = used_of(&storage).await;
+        assert_eq!(used, at_rest_invariant(&storage), "accounting invariant");
+        // Distinct content rests once: 48 KiB of material plus at most one
+        // max-bound seam chunk of extra content.
+        assert!(
+            used < payload.len() as u64,
+            "repeated ids must rest once each (used={used})"
+        );
+    }
+
+    /// Test plan #3: chunked reads are byte-exact everywhere, including tiny
+    /// edge windows and a dense grid that crosses the real (content-determined)
+    /// chunk boundaries.
+    #[tokio::test]
+    async fn cdc_get_range_is_byte_exact_across_chunk_boundaries() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(96 * 1024, 5);
+        storage.put_stream("r", bytes(&payload)).await.expect("put");
+        storage.finalize("r").await.expect("finalize");
+        let len = payload.len() as u64;
+
+        let whole = read_all(storage.get_range("r", 0..len).await.expect("read whole")).await;
+        assert_eq!(whole, payload);
+
+        // Edge windows: first/last bytes, a two-byte slip, and the empty range.
+        for (start, end) in [(0_u64, 1_u64), (1, 3), (len - 3, len), (0, 0)] {
+            let slice = &payload[start as usize..end.min(len) as usize];
+            let got = read_all(storage.get_range("r", start..end).await.expect("edge read")).await;
+            assert_eq!(got, slice, "edge range {start}..{end}");
+        }
+        // A coarse grid steps over every chunk boundary somewhere.
+        for start in (1024..len - 512).step_by(1021) {
+            let end = start + 512;
+            let got = read_all(storage.get_range("r", start..end).await.expect("grid read")).await;
+            assert_eq!(
+                got,
+                &payload[start as usize..end as usize],
+                "grid range {start}..{end}"
+            );
+        }
+        // A fine grid over the first 16 KiB probes single-window offsets.
+        for start in (0..16 * 1024).step_by(517) {
+            let end = start + 64;
+            let got = read_all(storage.get_range("r", start..end).await.expect("fine read")).await;
+            assert_eq!(
+                got,
+                &payload[start as usize..end as usize],
+                "fine range {start}..{end}"
+            );
+        }
+
+        // End clamping at the entry size (trait contract) still applies.
+        let tail = read_all(
+            storage
+                .get_range("r", len - 7..len + 9_999)
+                .await
+                .expect("clamped"),
+        )
+        .await;
+        assert_eq!(tail, &payload[(len - 7) as usize..], "clamped tail");
+
+        let err = match storage.get_range("r", len + 1..len + 2).await {
+            Ok(_) => panic!("start past the end of a chunked entry"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Test plan #4: delete and supersede relieve exactly the entry's EXCLUSIVE
+    /// bytes; shared chunks drop references instead of disappearing, and their
+    /// files survive the sibling's removal (files unlinked once refs hit 0).
+    #[tokio::test]
+    async fn cdc_delete_relieves_exclusive_bytes_and_supersede_restores_sharing() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+
+        let prefix = pattern(32 * 1024, 6);
+        // Distinct tail seeds: identical seeds on these same-length keys
+        // would yield identical tails and break the exclusive-bytes math.
+        for (i, key) in ["a", "b", "s"].into_iter().enumerate() {
+            storage
+                .put_stream(key, bytes(&extended(&prefix, 61 + i as u64)))
+                .await
+                .expect("put a/b/s");
+            storage.finalize(key).await.expect("finalize a/b/s");
+        }
+
+        let rows = chunk_rows(&storage);
+        assert!(
+            rows.iter().any(|(_, _, refs)| *refs == 3),
+            "prefix shared by three"
+        );
+        assert!(
+            rows.iter().any(|(_, _, refs)| *refs == 1),
+            "tails exclusive"
+        );
+        assert!(
+            rows.iter().all(|(_, _, refs)| *refs == 1 || *refs == 3),
+            "refs snapshot is shared-or-exclusive"
+        );
+        let used_before = used_of(&storage).await;
+        assert_eq!(used_before, at_rest_invariant(&storage));
+
+        // Delete sibling b: only ITS exclusive bytes leave; shared prefix
+        // chunks drop to refs=2 and keep their files.
+        let b_ids: HashSet<String> = manifest_ids(&storage, &entry_id("b")).into_iter().collect();
+        let exclusive_b: u64 = rows
+            .iter()
+            .filter(|(id, _, refs)| *refs == 1 && b_ids.contains(id))
+            .map(|(_, size, _)| *size)
+            .sum();
+        assert!(exclusive_b > 0, "b's tail bytes are exclusive to b");
+
+        storage.delete("b").await.expect("delete b");
+        let rows_after = chunk_rows(&storage);
+        assert!(
+            !rows_after.iter().any(|(_, _, refs)| *refs < 1),
+            "no zero-ref rows"
+        );
+        for id in rows_after.iter().map(|(id, _, _)| id) {
+            assert!(
+                dir.path()
+                    .join("chunks")
+                    .join(format!("{id}.chunk"))
+                    .exists(),
+                "referenced chunk {id} must keep its file"
+            );
+        }
+        assert!(
+            rows_after.iter().any(|(id, _, refs)| *refs == 2
+                && dir
+                    .path()
+                    .join("chunks")
+                    .join(format!("{id}.chunk"))
+                    .exists()),
+            "prefix chunks survive the sibling's delete with refs=2"
+        );
+        assert_eq!(
+            rows_after.len(),
+            chunk_files(&dir).len(),
+            "index rows and rest files agree"
+        );
+
+        let used_after = used_of(&storage).await;
+        assert_eq!(used_after, at_rest_invariant(&storage));
+        assert_eq!(
+            used_before - used_after,
+            exclusive_b,
+            "delete relieves exactly the exclusive bytes"
+        );
+
+        // Supersede s (re-put same key): the old exclusive tail frees, the
+        // shared prefix re-dedups against sibling a.
+        storage
+            .put_stream("s", bytes(&extended(&prefix, 64)))
+            .await
+            .expect("re-put s");
+        storage.finalize("s").await.expect("re-finalize s");
+        let rows_superseded = chunk_rows(&storage);
+        assert!(
+            rows_superseded.iter().any(|(_, _, refs)| *refs == 2),
+            "prefix chunks re-shared by a and the new s"
+        );
+        for id in rows_superseded.iter().map(|(id, _, _)| id) {
+            assert!(
+                dir.path()
+                    .join("chunks")
+                    .join(format!("{id}.chunk"))
+                    .exists(),
+                "referenced chunk {id} must keep its file"
+            );
+        }
+        assert_eq!(
+            rows_superseded.len(),
+            chunk_files(&dir).len(),
+            "index rows and rest files agree after supersede"
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting invariant after supersede"
+        );
+
+        // Wipe the rest: rows and files converge to zero (files-last unlink
+        // covers full zero-ref convergence in series).
+        storage.delete("a").await.expect("delete a");
+        storage.delete("s").await.expect("delete s");
+        assert_eq!(used_of(&storage).await, 0);
+        assert!(chunk_rows(&storage).is_empty(), "chunk table emptied");
+        assert!(chunk_files(&dir).is_empty(), "chunk files unlinked");
+    }
+
+    /// Test plan #7: with `[storage.cdc]` off, publishes are whole blobs again,
+    /// chunked HISTORY stays readable, and flipping off mid-life supersedes the
+    /// chunked row through the same release path (refs + exclusive files freed).
+    #[tokio::test]
+    async fn cdc_flip_off_supersedes_chunked_entries_and_reads_stay_layout_aware() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let prefix = pattern(48 * 1024, 8);
+        let g_payload = extended(&prefix, 82);
+        storage
+            .put_stream("f", bytes(&extended(&prefix, 81)))
+            .await
+            .expect("put f");
+        storage.finalize("f").await.expect("finalize f");
+        storage
+            .put_stream("g", bytes(&g_payload))
+            .await
+            .expect("put g");
+        storage.finalize("g").await.expect("finalize g");
+        assert_eq!(layout_of(&storage, "g"), Some("chunked".to_owned()));
+        drop(storage);
+
+        let storage = open_plain(&dir);
+        storage
+            .put_stream("n", bytes(b"plain v1.0 payload"))
+            .await
+            .expect("put n");
+        storage.finalize("n").await.expect("finalize n");
+        assert_eq!(layout_of(&storage, "n"), Some("whole".to_owned()));
+
+        // Supersede the chunked f with a whole finalize: the manifest and refs
+        // go, exclusive chunk files unlink, g's share re-counts.
+        storage
+            .put_stream("f", bytes(b"whole now"))
+            .await
+            .expect("re-put f");
+        storage.finalize("f").await.expect("re-finalize f");
+        assert_eq!(layout_of(&storage, "f"), Some("whole".to_owned()));
+        assert!(
+            dir.path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id("f")))
+                .exists(),
+            "f now rests a whole blob"
+        );
+        for id in manifest_ids(&storage, &entry_id("g")) {
+            assert!(
+                dir.path()
+                    .join("chunks")
+                    .join(format!("{id}.chunk"))
+                    .exists(),
+                "g's chunks survive their sibling's supersede"
+            );
+        }
+        // And g needs no flag: the read path branches on the ROW's layout.
+        let read = read_all(
+            storage
+                .get_range("g", 0..g_payload.len() as u64)
+                .await
+                .expect("chunked history read"),
+        )
+        .await;
+        assert_eq!(read, g_payload);
+
+        assert_eq!(used_of(&storage).await, at_rest_invariant(&storage));
+
+        // Deleting a chunked row under the flag OFF is layout-aware too.
+        storage.delete("g").await.expect("delete g");
+        assert_eq!(layout_of(&storage, "g"), None, "chunked g deleted");
+        assert_eq!(used_of(&storage).await, at_rest_invariant(&storage));
+        assert!(
+            chunk_rows(&storage).is_empty(),
+            "g was the last chunked row"
+        );
+        assert!(chunk_files(&dir).is_empty(), "g's files unlinked at refs 0");
+    }
+
+    /// Test plan #6: verify sees both layouts; a missing chunk file and a
+    /// missing blob each flag distinctly; reads of the broken rows fail
+    /// NotFound with the key; reopening reconciles the rows away and recomputes
+    /// the unique-bytes accounting (orphaned chunk FILES are commit-3 sweep
+    /// work, out of scope here).
+    #[tokio::test]
+    async fn cdc_verify_mixed_layouts_flags_missing_chunk_and_reopen_reconciles() {
+        let dir = TestDir::new();
+        let y_payload = pattern(64 * 1024, 9);
+        {
+            let storage = open_cdc(&dir);
+            storage
+                .put_stream("y", bytes(&y_payload))
+                .await
+                .expect("put y");
+            storage.finalize("y").await.expect("finalize y");
+        }
+        // Flip off for a mixed-layout index: two whole rows join one chunked.
+        let storage = open_plain(&dir);
+        let x_payload = pattern(16 * 1024, 91);
+        storage
+            .put_stream("x", bytes(&x_payload))
+            .await
+            .expect("put x");
+        storage.finalize("x").await.expect("finalize x");
+        storage
+            .put_stream("z", bytes(b"small whole row"))
+            .await
+            .expect("put z");
+        storage.finalize("z").await.expect("finalize z");
+
+        let reports = storage.verify_all().expect("verify all");
+        let bad: Vec<&VerifyReport> = reports.iter().filter(|r| !r.is_ok()).collect();
+        assert!(bad.is_empty(), "fresh storage must verify clean: {bad:?}");
+
+        // Corrupt the at-rest data both ways: a chunk file gone on the chunked
+        // row, a blob gone on a whole row.
+        let victim = manifest_ids(&storage, &entry_id("y"))[0].clone();
+        std::fs::remove_file(dir.path().join("chunks").join(format!("{victim}.chunk")))
+            .expect("delete a chunk file");
+        std::fs::remove_file(
+            dir.path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id("x"))),
+        )
+        .expect("delete a blob file");
+
+        let reports = storage.verify_all().expect("verify broken");
+        let y_report = reports.iter().find(|r| r.key == "y").expect("y reported");
+        match &y_report.health {
+            EntryHealth::MissingChunk { missing, total } => {
+                assert_eq!(*missing, 1);
+                assert!(
+                    *total > 1,
+                    "a 64 KiB payload yields many chunks (got {total})"
+                );
+            }
+            other => panic!("expected a missing chunk, got {other:?}"),
+        }
+        let x_report = reports.iter().find(|r| r.key == "x").expect("x reported");
+        assert_eq!(x_report.health, EntryHealth::MissingBlob);
+        let z_report = reports.iter().find(|r| r.key == "z").expect("z reported");
+        assert_eq!(z_report.health, EntryHealth::Ok);
+
+        // The broken chunked row fails at read time with the key in the error.
+        let err = match storage.get_range("y", 0..y_payload.len() as u64).await {
+            Ok(_) => panic!("read of a missing-chunk entry must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("y"), "must name the key: {err}");
+        let err = match storage.get_range("x", 0..x_payload.len() as u64).await {
+            Ok(_) => panic!("read of a missing-blob entry must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // Reboot: reconcile drops broken rows (their contracts are dead) and
+        // recomputes the unique-bytes accounting.
+        drop(storage);
+        let storage = open_plain(&dir);
+        let survivors: Vec<String> = storage
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|stat| stat.key)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec!["z"],
+            "broken y and x die, intact z survives"
+        );
+        let z_size = storage
+            .stat("z")
+            .await
+            .expect("stat")
+            .expect("z visible")
+            .size;
+        assert_eq!(used_of(&storage).await, z_size, "accounting = the survivor");
+        assert!(
+            chunk_rows(&storage).is_empty(),
+            "released chunk rows purged"
+        );
+    }
+
+    /// An empty payload publishes a `chunked` row with an empty manifest;
+    /// empty and clamped reads stay empty and the digest folds to itself.
+    #[tokio::test]
+    async fn cdc_empty_payload_publishes_a_zero_chunk_entry() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+
+        storage
+            .put_stream("e", bytes(b""))
+            .await
+            .expect("put empty");
+        storage.finalize("e").await.expect("finalize empty");
+
+        assert_eq!(layout_of(&storage, "e"), Some("chunked".to_owned()));
+        assert_eq!(
+            storage
+                .stat("e")
+                .await
+                .expect("stat")
+                .expect("visible")
+                .size,
+            0,
+            "no bytes, no chunks"
+        );
+        assert_eq!(
+            manifest_len(&storage, &entry_id("e")),
+            0,
+            "no manifest rows"
+        );
+        assert!(chunk_rows(&storage).is_empty());
+        assert_eq!(used_of(&storage).await, 0);
+
+        let empty = read_all(storage.get_range("e", 0..0).await.expect("empty read")).await;
+        assert!(empty.is_empty(), "empty range read");
+        let clamped = read_all(storage.get_range("e", 0..4096).await.expect("clamped read")).await;
+        assert!(clamped.is_empty(), "end clamp at a zero-size entry");
+
+        let reports = storage.verify_all().expect("verify");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].health,
+            EntryHealth::Ok,
+            "empty digest folds to itself"
+        );
+
+        storage.delete("e").await.expect("delete");
+        assert_eq!(used_of(&storage).await, 0);
+    }
+
+    /// v1.1 migration: a pre-v1.1 index (post task-50, so it HAS the digest
+    /// column) gains the `layout` column and its rows read as `whole`.
+    #[tokio::test]
+    async fn migration_adds_the_layout_column_to_a_pre_v11_database() {
+        let dir = TestDir::new();
+        {
+            let conn =
+                Connection::open(dir.path().join("cachette.sqlite3")).expect("open legacy index");
+            conn.execute_batch(
+                "CREATE TABLE entries (\
+                     id TEXT PRIMARY KEY, \
+                     key TEXT NOT NULL, \
+                     version TEXT NOT NULL DEFAULT '', \
+                     size INTEGER NOT NULL, \
+                     created_at INTEGER NOT NULL, \
+                     accessed_at INTEGER NOT NULL, \
+                     complete INTEGER NOT NULL DEFAULT 0, \
+                     owner_node TEXT NOT NULL DEFAULT '', \
+                     reservation_expires_at INTEGER, \
+                     artifact_key TEXT NOT NULL DEFAULT '', \
+                     digest TEXT NOT NULL DEFAULT '');\
+                 CREATE TABLE accounting (used_bytes INTEGER NOT NULL);\
+                 INSERT INTO accounting (used_bytes) VALUES (0);",
+            )
+            .expect("legacy (post-task-50) schema");
+            let old_id = entry_id("old");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, artifact_key, digest) \
+                     VALUES (?1, 'old', '', 11, 0, 0, 1, '', '')",
+                [&old_id],
+            )
+            .expect("seed a legacy published row");
+        }
+        // The v1.0 blob exists, so reconcile keeps the row alive (a plain boot
+        // only creates blobs/ on the first entry, so the seed makes it first).
+        std::fs::create_dir_all(dir.path().join("blobs")).expect("seed the blobs dir");
+        std::fs::write(
+            dir.path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id("old"))),
+            b"hello world",
+        )
+        .expect("seed the legacy blob");
+
+        let storage = open_plain(&dir);
+        {
+            // A schema probe needs the raw connection: scope it so the
+            // Statement borrows the guard instead of a moved-out copy.
+            let conn = lock(&storage.conn).expect("lock");
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('entries')")
+                .expect("prepare");
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect columns");
+            assert!(
+                columns.iter().any(|name| name == "layout"),
+                "layout column missing after migration: {columns:?}"
+            );
+        }
+
+        assert_eq!(
+            layout_of(&storage, "old"),
+            Some("whole".to_owned()),
+            "legacy rows are whole by definition"
+        );
+        let read = read_all(storage.get_range("old", 0..11).await.expect("read legacy")).await;
+        assert_eq!(read, b"hello world");
+        assert_eq!(
+            used_of(&storage).await,
+            11,
+            "reconcile re-counts the legacy row"
+        );
+
+        // Post-task-50 digests were optional: an empty one flags, not crashes.
+        let reports = storage.verify_all().expect("verify");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].health, EntryHealth::MissingDigest);
     }
 }

@@ -173,7 +173,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // exactly like `put_stream`/`finalize`/`delete`. That is what guarantees a
     // sweep never deletes a blob a download is reading and shutdown never
     // interrupts a parts-write mid-rename — both wait for the same lock.
-    let storage = Arc::new(FsStorage::open(&config.storage.fs.path)?);
+    // CDC `[storage.cdc]` (v1.1 workstream B): the flag only shapes new
+    // finalizations; reads stay layout-aware regardless of it, so flipping it
+    // off never orphans already-chunked at-rest data (docs/cdc.md).
+    let cdc = config
+        .storage
+        .cdc
+        .enabled
+        .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
+    let storage = Arc::new(FsStorage::open_cdc(&config.storage.fs.path, cdc)?);
     let backend: Arc<dyn StorageBackend> = storage.clone();
     state.storage = Some(backend.clone());
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));

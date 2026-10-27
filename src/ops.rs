@@ -208,6 +208,9 @@ fn health_label(health: &EntryHealth) -> String {
     match health {
         EntryHealth::Ok => String::from("ok"),
         EntryHealth::MissingBlob => String::from("missing-blob"),
+        EntryHealth::MissingChunk { missing, total } => {
+            format!("missing-chunk ({missing} of {total} chunk files gone)")
+        }
         EntryHealth::MissingDigest => String::from("missing-digest (pre-task-50 row)"),
         EntryHealth::SizeMismatch { expected, actual } => {
             format!("size-mismatch (expected {expected}, actual {actual})")
