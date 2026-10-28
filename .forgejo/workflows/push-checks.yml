@@ -94,8 +94,9 @@ jobs:
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+      # No cargo cache here on purpose: `cargo fmt` builds nothing, so a
+      # registry/target cache would churn bytes for nothing (cache rationale
+      # lives in the NOTE (Actions cache) block of release.yml's header).
       - name: rustfmt --check
         run: cargo fmt --all -- --check
 
@@ -117,7 +118,19 @@ jobs:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+        # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
+        # NOTE of release.yml's header. Job-scoped key (check/clippy/test
+        # keep separate targets like rust-cache's default isolation), pinned
+        # on dtolnay's rust `cachekey` + the Cargo.lock hash, with a
+        # restore-keys fallback for lockfile drift.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
 
@@ -141,7 +154,16 @@ jobs:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+        # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
+        # NOTE of release.yml's header; job-scoped key, see the check job.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
       - name: clippy -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -183,7 +205,16 @@ jobs:
       # ~/.cache/go-build + ~/go/pkg/mod by default - so the vendored fixture
       # builds below don't refetch/recompile from zero each run.
       - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+        # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
+        # NOTE of release.yml's header; job-scoped key, see the check job.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
       - name: Assert real-client toolchains are present
@@ -217,7 +248,16 @@ jobs:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+        # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
+        # NOTE of release.yml's header; job-scoped key, see the check job.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
       # The embedded example must resolve end to end (env + file + derived
       # defaults validated); --print-config masks secrets and exits non-zero on
       # any invalid key.
