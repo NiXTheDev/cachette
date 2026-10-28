@@ -98,6 +98,10 @@ const SCHEMA: &str = "
         PRIMARY KEY (entry_id, seq)
     );
     CREATE INDEX IF NOT EXISTS entry_chunks_chunk_idx ON entry_chunks(chunk_id);
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 ";
 
 /// Per-reservation serialization for chunk staging (plan task 20): one async
@@ -215,12 +219,31 @@ impl FsStorage {
         for dir in ["blobs", "chunks", "parts", "tmp"] {
             std::fs::create_dir_all(root.join(dir))?;
         }
-        let conn = Connection::open(root.join("cachette.sqlite3")).map_err(sql)?;
+        let mut conn = Connection::open(root.join("cachette.sqlite3")).map_err(sql)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(sql)?;
         conn.execute_batch(SCHEMA).map_err(sql)?;
-        migrate(&conn)?;
+        let version = schema_version(&conn)?;
+        if version > SCHEMA_VERSION {
+            return Err(io::Error::other(format!(
+                "storage index schema is at version {version}, newer than this \
+                 binary's schema version {SCHEMA_VERSION}; downgrade refused and \
+                 the index is left untouched"
+            )));
+        }
+        if version < SCHEMA_VERSION {
+            run_migrations(&mut conn, version)?;
+            tracing::info!(
+                from = version,
+                to = SCHEMA_VERSION,
+                "storage index schema migrated"
+            );
+        }
+        // The version row can lie (a hand-mangled index, a partial restore
+        // from backup): verification is unconditional on every boot, and a
+        // gap refuses to open rather than serving from a lying schema.
+        verify_schema(&conn)?;
         let storage = Self {
             root,
             conn: Arc::new(Mutex::new(conn)),
@@ -2066,12 +2089,36 @@ fn entry_id(key: &str) -> String {
     id
 }
 
-/// Bring a pre-task-21 index up to the current schema: `artifact_key` lets a
-/// reservation carry the artifact key it will publish under while `key` stays
-/// the reservation's own `cacheId` (so the reaper's `parts/{key}/` cleanup
-/// still applies), and `digest` (task 50) carries the entry's content hash so
-/// `cachette verify` can detect a later mutation of the blob.
-fn migrate(conn: &Connection) -> io::Result<()> {
+/// The index's schema version, stamped in the `meta` table once every
+/// migration step has been applied AND verified - never the crate semver
+/// (a patch release must never look like a schema event). Ledger:
+///   1: v1.0-era index - `artifact_key` (task 21) and `digest` (task 50);
+///   2: v1.1 CDC - the `layout` column (the `chunks` / `entry_chunks`
+///      tables come from SCHEMA itself, so this step is the column alone).
+const SCHEMA_VERSION: u64 = 2;
+
+/// One schema migration step: brings an index at the listed version's
+/// predecessor up to that version. Bodies stay introspection-guarded so a
+/// re-run is always a no-op on an already-current schema.
+type Migration = fn(&Connection) -> io::Result<()>;
+
+/// The migration ledger, in version order. A new schema change appends an
+/// entry and bumps [`SCHEMA_VERSION`] - nothing else.
+const MIGRATIONS: &[(u64, &str, Migration)] = &[
+    (
+        1,
+        "v1.0-era columns (artifact_key, digest)",
+        migrate_v1_columns,
+    ),
+    (2, "v1.1 CDC layout column", migrate_v2_layout),
+];
+
+/// Task 21 + task 50: `artifact_key` lets a reservation carry the artifact
+/// key it will publish under while `key` stays the reservation's own
+/// `cacheId` (so the reaper's `parts/{key}/` cleanup still applies), and
+/// `digest` carries the entry's content hash so `cachette verify` can
+/// detect a later mutation of the blob.
+fn migrate_v1_columns(conn: &Connection) -> io::Result<()> {
     let present: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'artifact_key'",
@@ -2103,9 +2150,13 @@ fn migrate(conn: &Connection) -> io::Result<()> {
         )
         .map_err(sql)?;
     }
-    // v1.1 (workstream B): the at-rest layout of the row (`whole` | `chunked`,
-    // docs/cdc.md). Pre-v1.1 rows are whole by definition; the default back-
-    // fills them, and the chunked manifest lives in `chunks` / `entry_chunks`.
+    Ok(())
+}
+
+/// v1.1 (workstream B): the at-rest layout of the row (`whole` | `chunked`,
+/// docs/cdc.md). Pre-v1.1 rows are whole by definition; the default back-
+/// fills them, and the chunked manifest lives in `chunks` / `entry_chunks`.
+fn migrate_v2_layout(conn: &Connection) -> io::Result<()> {
     let has_layout: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'layout'",
@@ -2120,6 +2171,119 @@ fn migrate(conn: &Connection) -> io::Result<()> {
         )
         .map_err(sql)?;
     }
+    Ok(())
+}
+
+/// The stored schema version; an index that predates the meta table (or has
+/// no stamp yet) reads as version 0. A corrupt value refuses rather than
+/// guessing.
+fn schema_version(conn: &Connection) -> io::Result<u64> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(text) = row else {
+        return Ok(0);
+    };
+    text.parse::<u64>().map_err(|_| {
+        io::Error::other(format!(
+            "storage index has a corrupt schema_version ({text:?}); refusing to open"
+        ))
+    })
+}
+
+/// Boot-time schema verification: the required tables exist and every
+/// required column is present by name (declared types are not policed -
+/// hand surgery on the index is not a supported path, and the version
+/// machinery exists precisely so reality and the stamp cannot drift
+/// silently). Runs on every open; a gap refuses to open and names it.
+fn verify_schema(conn: &Connection) -> io::Result<()> {
+    const REQUIRED_TABLES: &[&str] = &["entries", "accounting", "chunks", "entry_chunks", "meta"];
+    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+        (
+            "entries",
+            &[
+                "id",
+                "key",
+                "version",
+                "size",
+                "created_at",
+                "accessed_at",
+                "complete",
+                "owner_node",
+                "reservation_expires_at",
+                "artifact_key",
+                "digest",
+                "layout",
+            ],
+        ),
+        ("accounting", &["used_bytes"]),
+        ("chunks", &["id", "size", "refs", "created_at"]),
+        ("entry_chunks", &["entry_id", "seq", "chunk_id"]),
+        ("meta", &["key", "value"]),
+    ];
+    for &table in REQUIRED_TABLES {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if present == 0 {
+            return Err(io::Error::other(format!(
+                "schema verify: table `{table}` is missing"
+            )));
+        }
+    }
+    for (table, columns) in REQUIRED_COLUMNS {
+        for &column in *columns {
+            let present: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if present == 0 {
+                return Err(io::Error::other(format!(
+                    "schema verify: column `{column}` is missing from `{table}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bring an index at `from` up to [`SCHEMA_VERSION`]: apply every pending
+/// step, verify the result, and stamp the version - all in one transaction,
+/// so the stamp lands only on an applied-and-verified schema and the index
+/// either jumps wholesale or stays exactly as it was. SQLite DDL is
+/// transactional and the steps are constant-default ALTERs (O(1) metadata
+/// work regardless of index size), so one transaction is cheap.
+fn run_migrations(conn: &mut Connection, from: u64) -> io::Result<()> {
+    let tx = conn.transaction().map_err(sql)?;
+    for &(version, what, step) in MIGRATIONS {
+        if version > from {
+            step(&tx).map_err(|err| {
+                io::Error::other(format!(
+                    "schema migration to version {version} ({what}) failed: {err}"
+                ))
+            })?;
+        }
+    }
+    verify_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION.to_string()],
+    )
+    .map_err(sql)?;
+    tx.commit().map_err(sql)?;
     Ok(())
 }
 
@@ -4683,6 +4847,170 @@ mod storage_fs {
             ),
             (0, 0, 0, 0),
             "second pass is a no-op"
+        );
+    }
+
+    // ==== schema versioning (the meta table + verified migrations) ====
+
+    /// The stored schema_version stamp (works on both the storage's own
+    /// connection and a raw one).
+    fn stored_version(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("schema_version row")
+    }
+
+    /// A fresh boot stamps the verified schema version; a reboot is a no-op
+    /// on it (the stamp and the schema agree, so nothing re-runs) and the
+    /// stored data reads back byte-exact.
+    #[tokio::test]
+    async fn boot_stamps_the_schema_version_and_a_reboot_is_a_noop() {
+        let dir = TestDir::new();
+        let storage = open_plain(&dir);
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            assert_eq!(
+                stored_version(&conn),
+                SCHEMA_VERSION.to_string(),
+                "fresh boot stamps SCHEMA_VERSION"
+            );
+        }
+        storage
+            .put_stream("entry", bytes(b"payload"))
+            .await
+            .expect("put");
+        storage.finalize("entry").await.expect("finalize");
+        drop(storage);
+
+        let storage = open_plain(&dir);
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            assert_eq!(
+                stored_version(&conn),
+                SCHEMA_VERSION.to_string(),
+                "reopen keeps the stamp"
+            );
+        }
+        let read = read_all(storage.get_range("entry", 0..7).await.expect("read")).await;
+        assert_eq!(read, b"payload");
+    }
+
+    /// A newer index refuses to open (an older binary must never touch a
+    /// newer schema) and the refusal leaves the index untouched: the forged
+    /// stamp and the stored entry both survive it.
+    #[tokio::test]
+    async fn a_newer_index_refuses_to_boot_and_stays_untouched() {
+        let dir = TestDir::new();
+        let storage = open_plain(&dir);
+        storage
+            .put_stream("keep", bytes(b"keep"))
+            .await
+            .expect("put");
+        storage.finalize("keep").await.expect("finalize");
+        drop(storage);
+
+        {
+            let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("raw open");
+            conn.execute(
+                "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("forge a newer version stamp");
+        }
+
+        let err = FsStorage::open(dir.path()).expect_err("newer index must refuse");
+        assert!(
+            err.to_string().contains("downgrade refused"),
+            "refusal names the downgrade: {err}"
+        );
+
+        let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("raw open");
+        assert_eq!(
+            stored_version(&conn),
+            "99",
+            "stamp untouched by the refusal"
+        );
+        let keep_id = entry_id("keep");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id = ?1 AND complete = 1",
+                [&keep_id],
+                |row| row.get(0),
+            )
+            .expect("entry survives");
+        assert_eq!(rows, 1, "the index is left untouched");
+    }
+
+    /// A lying stamp is caught on every boot: the schema claims the current
+    /// version but the `layout` column was hand-removed - the unconditional
+    /// verify refuses to open and names the gap.
+    #[tokio::test]
+    async fn a_version_row_that_lies_refuses_to_boot() {
+        let dir = TestDir::new();
+        {
+            // The current schema minus `layout`, stamped as current: the
+            // lie the version machinery exists to catch.
+            let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE entries (\
+                     id TEXT PRIMARY KEY, \
+                     key TEXT NOT NULL, \
+                     version TEXT NOT NULL DEFAULT '', \
+                     size INTEGER NOT NULL, \
+                     created_at INTEGER NOT NULL, \
+                     accessed_at INTEGER NOT NULL, \
+                     complete INTEGER NOT NULL DEFAULT 0, \
+                     owner_node TEXT NOT NULL DEFAULT '', \
+                     reservation_expires_at INTEGER, \
+                     artifact_key TEXT NOT NULL DEFAULT '', \
+                     digest TEXT NOT NULL DEFAULT '');\
+                 CREATE TABLE accounting (used_bytes INTEGER NOT NULL);\
+                 INSERT INTO accounting (used_bytes) VALUES (0);\
+                 CREATE TABLE chunks (\
+                     id TEXT PRIMARY KEY, \
+                     size INTEGER NOT NULL, \
+                     refs INTEGER NOT NULL DEFAULT 0, \
+                     created_at INTEGER NOT NULL);\
+                 CREATE TABLE entry_chunks (\
+                     entry_id TEXT NOT NULL, \
+                     seq INTEGER NOT NULL, \
+                     chunk_id TEXT NOT NULL, \
+                     PRIMARY KEY (entry_id, seq));\
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+            )
+            .expect("tampered (layout-less) schema stamped current");
+        }
+
+        let err = FsStorage::open(dir.path()).expect_err("a lying stamp must refuse");
+        assert!(
+            err.to_string()
+                .contains("column `layout` is missing from `entries`"),
+            "verify names the gap: {err}"
+        );
+    }
+
+    /// A corrupt schema_version value refuses to boot instead of guessing.
+    #[tokio::test]
+    async fn a_corrupt_schema_version_value_refuses_to_boot() {
+        let dir = TestDir::new();
+        let storage = open_plain(&dir);
+        drop(storage);
+        {
+            let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("raw open");
+            conn.execute(
+                "UPDATE meta SET value = 'not-a-version' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("corrupt the stamp");
+        }
+        let err = FsStorage::open(dir.path()).expect_err("corrupt stamp must refuse");
+        assert!(
+            err.to_string().contains("corrupt schema_version"),
+            "refusal names the corruption: {err}"
         );
     }
 }
