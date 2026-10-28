@@ -193,6 +193,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             tracing::info!(
                 reservations = report.reservations_reaped,
                 orphans = report.orphan_blobs_swept,
+                orphan_chunks = report.orphan_chunks_swept,
+                chunk_temps = report.chunk_temps_swept,
+                zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
                 "startup sweep complete"
             );
         }
@@ -285,11 +288,17 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                     }
                     if report.reservations_reaped > 0
                         || report.orphan_blobs_swept > 0
+                        || report.orphan_chunks_swept > 0
+                        || report.chunk_temps_swept > 0
+                        || report.zero_ref_chunk_rows_purged > 0
                         || report.chunk_locks_swept > 0
                     {
                         tracing::info!(
                             reservations = report.reservations_reaped,
                             orphans = report.orphan_blobs_swept,
+                            orphan_chunks = report.orphan_chunks_swept,
+                            chunk_temps = report.chunk_temps_swept,
+                            zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
                             chunk_locks = report.chunk_locks_swept,
                             "periodic sweep reclaimed storage"
                         );

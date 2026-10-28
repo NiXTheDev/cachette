@@ -177,6 +177,18 @@ pub struct FsStorage {
     cdc: Option<CdcParams>,
 }
 
+/// What one orphan-chunk sweep pass reclaimed (docs/cdc.md §GC).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkSweep {
+    /// Rowless `chunks/{id}.chunk` files deleted.
+    pub files: u64,
+    /// Aged `chunks/{id}.chunk.tmp` finalize-scratch files deleted.
+    pub temps: u64,
+    /// Belt-and-braces `chunks` rows with `refs = 0` purged (the normal
+    /// release paths delete those in-tx, so these should never exist).
+    pub rows: u64,
+}
+
 impl std::fmt::Debug for FsStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FsStorage")
@@ -396,10 +408,12 @@ impl FsStorage {
     }
 
     /// Reservation TTL reaper (plan task 11): delete blob files with no
-    /// index row that are older than `older_than_unix` — rowless leftovers
-    /// of a crash between the B5 blob rename and the index commit. Recent
-    /// orphans are kept: they may belong to a finalize still in flight.
-    /// Returns the number of blobs swept.
+    /// owning row that are older than `older_than_unix` — rowless leftovers
+    /// of a crash between the B5 blob rename and the index commit, plus a
+    /// `chunked` row's blob file (the crash window between a whole->chunked
+    /// conversion's commit and its blob unlink: only `whole` rows own a
+    /// blob, docs/cdc.md §GC). Recent orphans are kept: they may belong to
+    /// a finalize still in flight. Returns the number of blobs swept.
     pub async fn sweep_orphan_blobs(&self, older_than_unix: u64) -> io::Result<u64> {
         let _gate = self.gate.write().await;
         let conn = Arc::clone(&self.conn);
@@ -407,7 +421,9 @@ impl FsStorage {
         blocking(move || {
             let known: std::collections::HashSet<String> = {
                 let conn = lock(&conn)?;
-                let mut stmt = conn.prepare("SELECT id FROM entries").map_err(sql)?;
+                let mut stmt = conn
+                    .prepare("SELECT id FROM entries WHERE layout = 'whole'")
+                    .map_err(sql)?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))
                     .map_err(sql)?;
@@ -439,6 +455,91 @@ impl FsStorage {
                 }
             }
             tracing::debug!(swept, "rowless blobs swept");
+            Ok(swept)
+        })
+        .await
+    }
+
+    /// docs/cdc.md §GC backstop: age out the chunk-side leftovers the
+    /// best-effort post-commit unlinks can leave behind, all under the same
+    /// grace (a fresh leftover may belong to a pass still in flight):
+    /// rowless `chunks/{id}.chunk` files, aged `chunks/{id}.chunk.tmp`
+    /// finalize scratch, and belt-and-braces `chunks` rows with `refs = 0`
+    /// (the release paths delete those in-tx, so they should not exist).
+    /// Rows with `refs > 0` are never touched, and a zero-ref purge moves
+    /// no accounting (only `refs > 0` bytes are counted). `tmp/` scratch is
+    /// not this sweep's business: boot reconciliation wipes it wholesale.
+    /// Returns the per-kind counts.
+    pub async fn sweep_orphan_chunks(&self, older_than_unix: u64) -> io::Result<ChunkSweep> {
+        let _gate = self.gate.write().await;
+        let conn = Arc::clone(&self.conn);
+        let chunks_dir = self.root.join("chunks");
+        blocking(move || {
+            let mut swept = ChunkSweep {
+                files: 0,
+                temps: 0,
+                rows: 0,
+            };
+            let cutoff = i64::try_from(older_than_unix).unwrap_or(i64::MAX);
+            let known: std::collections::HashSet<String> = {
+                let conn = lock(&conn)?;
+                // Zero-ref rows first: purging them makes their files
+                // sweepable in this same pass (one-pass convergence).
+                let stale: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare("SELECT id FROM chunks WHERE refs <= 0 AND created_at <= ?1")
+                        .map_err(sql)?;
+                    let rows = stmt
+                        .query_map([cutoff], |row| row.get::<_, String>(0))
+                        .map_err(sql)?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
+                };
+                for id in &stale {
+                    conn.execute("DELETE FROM chunks WHERE id = ?1", [id])
+                        .map_err(sql)?;
+                }
+                swept.rows = u64::try_from(stale.len()).unwrap_or(u64::MAX);
+                let mut stmt = conn.prepare("SELECT id FROM chunks").map_err(sql)?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sql)?;
+                rows.collect::<Result<_, _>>().map_err(sql)?
+            };
+            let read = match std::fs::read_dir(&chunks_dir) {
+                Ok(read) => read,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(swept),
+                Err(err) => return Err(err),
+            };
+            for dirent in read.flatten() {
+                let Some(name) = dirent.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let temp = name.ends_with(".chunk.tmp");
+                let Some(chunk_id) = name.strip_suffix(if temp { ".chunk.tmp" } else { ".chunk" })
+                else {
+                    continue;
+                };
+                if !temp && known.contains(chunk_id) {
+                    continue;
+                }
+                match modified_unix(&dirent.path()) {
+                    Ok(mtime) if mtime <= cutoff => {}
+                    _ => continue,
+                }
+                if std::fs::remove_file(dirent.path()).is_ok() {
+                    if temp {
+                        swept.temps += 1;
+                    } else {
+                        swept.files += 1;
+                    }
+                }
+            }
+            tracing::debug!(
+                files = swept.files,
+                temps = swept.temps,
+                zero_ref_rows = swept.rows,
+                "rowless chunks swept"
+            );
             Ok(swept)
         })
         .await
@@ -4295,5 +4396,293 @@ mod storage_fs {
         let reports = storage.verify_all().expect("verify");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].health, EntryHealth::MissingDigest);
+    }
+
+    // ==== docs/cdc.md §GC: the chunk-side sweeper (B commit 3) ====
+
+    /// Backdate `path`'s mtime — the sweeps' grace input (same pattern as
+    /// the eviction tests: open-for-write + `File::set_times`).
+    fn backdate(path: &Path, age: u64) {
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for times");
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .expect("backdate mtime");
+    }
+
+    /// A rowless `chunks/{id}.chunk` older than the grace is swept (the
+    /// crash between finalize's chunk writes and its commit), a fresh one
+    /// is kept (it may belong to a pass still in flight), and a file whose
+    /// row exists is never touched.
+    #[tokio::test]
+    async fn sweep_ages_out_rowless_chunk_files_only() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        storage
+            .put_stream("live", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("live").await.expect("finalize");
+        let (rowed_id, _, refs) = chunk_rows(&storage)[0].clone();
+        assert!(refs >= 1, "published chunks are referenced");
+        let live_rows = chunk_rows(&storage).len();
+
+        let chunks = dir.path().join("chunks");
+        let aged = chunks.join("deadbeefdeadbeef.chunk");
+        let fresh = chunks.join("cafebabecafebabe.chunk");
+        std::fs::write(&aged, b"stale").expect("plant aged orphan");
+        std::fs::write(&fresh, b"fresh").expect("plant fresh orphan");
+        backdate(&aged, 2 * 3600);
+
+        let now = super::super::unix_now();
+        let report = storage
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.files, 1, "only the aged rowless file");
+        assert_eq!(report.temps, 0, "no scratch planted");
+        assert_eq!(report.rows, 0, "no zero-ref rows planted");
+        assert!(!aged.exists(), "aged rowless chunk swept");
+        assert!(fresh.exists(), "fresh rowless chunk kept");
+        assert!(
+            chunks.join(format!("{rowed_id}.chunk")).exists(),
+            "referenced chunk file never swept"
+        );
+        assert_eq!(chunk_rows(&storage).len(), live_rows, "no row touched");
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting rests on the invariant"
+        );
+    }
+
+    /// Aged finalize scratch (`chunks/{id}.chunk.tmp`) is swept — including
+    /// scratch whose stem matches a live chunk id (a rename that never
+    /// happened); fresh scratch is kept, real chunk files are untouched,
+    /// and temps are never counted as chunk files.
+    #[tokio::test]
+    async fn sweep_ages_out_chunk_temp_scratch_only_when_old() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        storage
+            .put_stream("live", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("live").await.expect("finalize");
+        let (rowed_id, _, _) = chunk_rows(&storage)[0].clone();
+
+        let chunks = dir.path().join("chunks");
+        let aged_tmp = chunks.join(format!("{rowed_id}.chunk.tmp"));
+        let fresh_tmp = chunks.join("cafebabe.chunk.tmp");
+        std::fs::write(&aged_tmp, b"partial").expect("plant aged scratch");
+        std::fs::write(&fresh_tmp, b"partial").expect("plant fresh scratch");
+        backdate(&aged_tmp, 2 * 3600);
+
+        let now = super::super::unix_now();
+        let report = storage
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.temps, 1, "only the aged scratch");
+        assert_eq!(report.files, 0, "temps are not chunk files");
+        assert!(!aged_tmp.exists(), "aged scratch swept");
+        assert!(fresh_tmp.exists(), "fresh scratch kept");
+        assert!(
+            chunks.join(format!("{rowed_id}.chunk")).exists(),
+            "the real file stays"
+        );
+    }
+
+    /// Belt-and-braces: a `chunks` row with `refs = 0` (impossible via the
+    /// normal paths - the release deletes it in-tx) is purged together with
+    /// its file; referenced rows are untouched and accounting never moves.
+    #[tokio::test]
+    async fn sweep_purges_zero_ref_chunk_rows_but_never_referenced_ones() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        storage
+            .put_stream("live", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("live").await.expect("finalize");
+        let live_rows = chunk_rows(&storage);
+        assert!(live_rows.iter().all(|(_, _, refs)| *refs >= 1));
+
+        // Plant the impossible: a zero-ref row aged past the grace, with
+        // its (aged) file — the belt-and-braces sweep target.
+        let chunks = dir.path().join("chunks");
+        let ghost_path = chunks.join("deadbeefdeadbeef.chunk");
+        std::fs::write(&ghost_path, b"ghost").expect("plant ghost file");
+        backdate(&ghost_path, 2 * 3600);
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO chunks (id, size, refs, created_at) \
+                 VALUES ('deadbeefdeadbeef', 5, 0, ?1)",
+                [super::super::unix_now() as i64 - 7200],
+            )
+            .expect("plant ghost row");
+        }
+
+        let now = super::super::unix_now();
+        let report = storage
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.rows, 1, "the zero-ref row purged");
+        assert_eq!(report.files, 1, "its file went with it");
+        let rows = chunk_rows(&storage);
+        assert_eq!(rows.len(), live_rows.len(), "only the ghost row went");
+        assert!(
+            rows.iter()
+                .all(|(id, _, refs)| *refs >= 1 && id.as_str() != "deadbeefdeadbeef"),
+            "referenced rows untouched"
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "a zero-ref purge moves no accounting"
+        );
+    }
+
+    /// The conversion crash window (docs/cdc.md §GC): a blob file whose row
+    /// is `chunked` counts as rowless after the grace; a `whole` row's blob
+    /// never does; a fresh chunked-row blob is kept (it may belong to a
+    /// conversion still in flight).
+    #[tokio::test]
+    async fn sweep_treats_a_chunked_rows_blob_as_rowless_after_the_grace() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        storage
+            .put_stream("cdc", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("cdc").await.expect("finalize");
+        storage
+            .put_stream("cdc2", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("cdc2").await.expect("finalize");
+
+        // A `whole` row with its blob (the v1.0 shape).
+        let whole_id = entry_id("legacy");
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, owner_node, artifact_key, reservation_expires_at, \
+                     digest, layout) \
+                     VALUES (?1, 'legacy', '', 5, 0, 0, 1, '', '', NULL, '', 'whole')",
+                [&whole_id],
+            )
+            .expect("seed whole row");
+        }
+        let blobs = dir.path().join("blobs");
+        let whole_blob = blobs.join(format!("{whole_id}.blob"));
+        std::fs::write(&whole_blob, b"whole").expect("seed whole blob");
+
+        // The crash state: blob files under chunked rows — one aged, one
+        // fresh (the second entry's conversion "did not unlink yet").
+        let aged_orphan = blobs.join(format!("{}.blob", entry_id("cdc")));
+        std::fs::write(&aged_orphan, b"converted").expect("plant aged converted blob");
+        backdate(&aged_orphan, 2 * 3600);
+        let fresh_orphan = blobs.join(format!("{}.blob", entry_id("cdc2")));
+        std::fs::write(&fresh_orphan, b"converted").expect("plant fresh converted blob");
+
+        let now = super::super::unix_now();
+        let swept = storage.sweep_orphan_blobs(now - 3600).await.expect("sweep");
+        assert_eq!(swept, 1, "only the aged chunked-row blob");
+        assert!(!aged_orphan.exists(), "chunked-row blob swept after grace");
+        assert!(whole_blob.exists(), "a whole row owns its blob");
+        assert!(
+            fresh_orphan.exists(),
+            "fresh converted blob kept under grace"
+        );
+    }
+
+    /// The full §GC pass through `Reaper::sweep_once`: referenced chunk
+    /// files are never swept even when aged past the grace; planted
+    /// leftovers (rowless chunk, finalize scratch, rowless blob) are all
+    /// reclaimed with their counters; a second pass is a no-op; accounting
+    /// rests on the invariant throughout.
+    #[tokio::test]
+    async fn reaper_sweep_once_reclaims_chunk_garbage_and_is_idempotent() {
+        use crate::storage::eviction::Reaper;
+
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        storage
+            .put_stream("live", bytes(&payload))
+            .await
+            .expect("put");
+        storage.finalize("live").await.expect("finalize");
+        let live_rows = chunk_rows(&storage).len();
+
+        // Referenced files age past the grace: their rows protect them.
+        let chunks = dir.path().join("chunks");
+        for name in chunk_files(&dir) {
+            backdate(&chunks.join(&name), 2 * 3600);
+        }
+
+        // Plant every leftover shape, all aged past the grace.
+        let ghost = chunks.join("deadbeefdeadbeef.chunk");
+        let scratch = chunks.join("cafebabe.chunk.tmp");
+        let orphan_blob = dir.path().join("blobs").join("beefdead.blob");
+        std::fs::write(&ghost, b"ghost").expect("plant ghost chunk");
+        std::fs::write(&scratch, b"partial").expect("plant scratch");
+        std::fs::write(&orphan_blob, b"orphan").expect("plant orphan blob");
+        for path in [&ghost, &scratch, &orphan_blob] {
+            backdate(path, 2 * 3600);
+        }
+        let before = used_of(&storage).await;
+
+        let report = Reaper::new(std::time::Duration::from_secs(3600))
+            .sweep_once(&storage)
+            .await
+            .expect("sweep");
+        assert_eq!(report.orphan_chunks_swept, 1, "the ghost chunk swept");
+        assert_eq!(report.chunk_temps_swept, 1, "the scratch swept");
+        assert_eq!(report.zero_ref_chunk_rows_purged, 0, "no zero-ref rows");
+        assert_eq!(report.orphan_blobs_swept, 1, "the orphan blob swept");
+        assert!(
+            !ghost.exists() && !scratch.exists() && !orphan_blob.exists(),
+            "all planted leftovers gone"
+        );
+        assert_eq!(chunk_rows(&storage).len(), live_rows, "no row touched");
+        for name in chunk_files(&dir) {
+            assert!(
+                name.ends_with(".chunk") && !name.ends_with(".chunk.tmp"),
+                "only real chunk files remain, got {name}"
+            );
+        }
+        assert_eq!(used_of(&storage).await, before, "sweeps move no accounting");
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting rests on the invariant"
+        );
+
+        // Idempotence: the second pass finds nothing.
+        let again = Reaper::new(std::time::Duration::from_secs(3600))
+            .sweep_once(&storage)
+            .await
+            .expect("second sweep");
+        assert_eq!(
+            (
+                again.orphan_chunks_swept,
+                again.chunk_temps_swept,
+                again.zero_ref_chunk_rows_purged,
+                again.orphan_blobs_swept
+            ),
+            (0, 0, 0, 0),
+            "second pass is a no-op"
+        );
     }
 }

@@ -132,17 +132,27 @@ after every mutation.
 
 ### Garbage collection / reaper
 
-The existing sweep patterns extend:
+The existing sweep patterns extend, all under the blob sweep's 1h
+`ORPHAN_BLOB_GRACE` (a fresh leftover may belong to a pass still in
+flight):
 
-- `chunks/{id}.chunk.tmp` (crash between write and rename) - age-out sweep;
-- a `chunks/{id}.chunk` with no live chunks-row         - swept;
-- a `chunks` row with `refs = 0` but its file still present - swept;
-  (post-commit unlink is best-effort precisely so a crash window is safe);
+- `chunks/{id}.chunk.tmp` finalize scratch (crash between write and
+  rename) - age-out sweep. (The `tmp/{id}-{start}.chunk.tmp` PATCH-path
+  scratch lives in `tmp/`, which boot reconciliation already wipes
+  wholesale; the reaper stays out of `tmp/`.)
+- a `chunks/{id}.chunk` with no live chunks-row - swept (the crash window
+  of finalize's best-effort post-commit unlink);
+- a `chunks` row with `refs = 0` - purged belt-and-braces (the normal
+  release paths delete it in-tx, so this should never exist);
+- a `blobs/{id}.blob` whose row is `chunked` - rowless for sweeping (only
+  `whole` rows own a blob; this is the crash window of the whole→chunked
+  conversion, the Migration section);
 - `parts/` sweeps remain (staging that never finalized, per-reservation and
   global).
 
-No sweep ever deletes a chunks-row with `refs > 0`. Reaper runs in-process
-with the same cadence/idempotence guarantees as today.
+No sweep ever deletes a chunks-row with `refs > 0`, and a zero-ref purge
+moves no accounting (only `refs > 0` bytes are counted). Reaper runs
+in-process with the same cadence/idempotence guarantees as today.
 
 ### The failure model
 

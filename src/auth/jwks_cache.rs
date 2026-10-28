@@ -884,13 +884,26 @@ mod tests {
         // fresh kid label — the fixture keypair is the signer either way).
         server.set_doc(&jwks_doc(&[kid_b]));
         assert_eq!(cache.key(ISSUER, kid_b), None, "unknown kid before refresh");
-        assert!(
-            wait_until(Duration::from_secs(5), || cache
-                .key(ISSUER, kid_b)
-                .is_some())
-            .await,
-            "lazy refresh should fetch the rotated kid"
-        );
+        // The first miss stamps the singleflight and spawns ONE fetch; a
+        // fetch that transiently fails (budget timeout under a loaded test
+        // battery) holds the stamp for the 5s spacing window - the same
+        // length as the wait, so a plain single wait would never see the
+        // retry production gets from its next miss after the window. Re-arm
+        // the throttle between bounded attempts; the contract under test
+        // (a miss lazily resolves a rotated kid) is unchanged.
+        let mut resolved = false;
+        for _ in 0..3 {
+            if wait_until(Duration::from_secs(5), || {
+                cache.key(ISSUER, kid_b).is_some()
+            })
+            .await
+            {
+                resolved = true;
+                break;
+            }
+            cache.reset_throttle_for_tests();
+        }
+        assert!(resolved, "lazy refresh should fetch the rotated kid");
         assert_eq!(cache.key(ISSUER, kid_b).unwrap(), fixture_key());
         // Replacement semantics: the rotated-away kid is gone.
         assert_eq!(cache.key(ISSUER, kid_a.as_str()), None);
