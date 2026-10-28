@@ -9,12 +9,50 @@
 # `release` fires BOTH this pipeline (binaries + checksums + release) and
 # push-checks.yml (the image) at the same time.
 #
-# Runs on tag pushes (`v*`) AND on pushes to the long-lived `release` branch (the
-# merge commit of a `feat/*` -> release pull request), and can be dispatched
-# manually. Tag pushes publish under the tag; `release`-branch pushes publish
-# under the crate version (`v<version>` from Cargo.toml), so merging the PR is
-# what cuts a release. On a manual dispatch (no tag, non-release branch) the
-# build + checksums still run, but nothing is published.
+# Publishing follows the SAME contract as regexYbot's release.yml (the shape
+# this whole pipeline was styled after):
+#   * a `v*` tag push            -> always publishes under that tag
+#   * a PR merged into `release` -> publishes under `v<Cargo.toml version>`
+#     ONLY when the PR carries the `Release` label; the merged state and the
+#     label list come straight from the pull_request[closed] event - no
+#     subject parsing, no API re-verification. A label-less merge triggers
+#     nothing (the version job logs why and every other job is skippd by the
+#     publish flag).
+#   * a manual workflow_dispatch -> ALWAYS publishes: `version` overrides the
+#     manifest-derived version, `tag_name` overrides the derived
+#     `v<version>` (both empty = plain Cargo.toml cut at the checkout the
+#     dispatch resolves to). A dispatch is the explicit lever to cut or
+#     re-cut a release; the publish step deletes an existing tag/release for
+#     the same name first (regexY re-run semantics), so overrides cannot
+#     collide.
+#   * the regexY flow also carries a `pr_number` input used by its PR-comment
+#     step: NOT copied - cachette ships no changelog/PR-comment step.
+#
+# NOTE (Forgejo artifacts): actions/upload-artifact@v4 +
+# download-artifact@v4 ship an @actions/artifact v2 client that hard-fails
+# on any host other than github.com ("are not currently supported on
+# GHES") - proven by the 1.0.0 cut run 69 where every leg died at its
+# upload step only after the build succeeded (task 4605). Forgejo's
+# patched forks keep the identical v4 action schema (incl.
+# `merge-multiple`) minus that gate and speak the runtime backend this
+# instance implements; the forge docs mandate exactly this substitution:
+# https://forgejo.org/docs/v15.0/user/actions/advanced-features
+#
+# NOTE (Actions cache): all cargo caching below is plain actions/cache@v6,
+# NOT Swatinem/rust-cache@v2 (the check workflows swapped too, same commit).
+# Fleet reason: the runners' cache endpoint serves only the legacy v1
+# artifactcache dialect (/_apis/artifactcache paths, HMAC headers), while the
+# external cache server (acc.nixthedev.ru, falcondev
+# github-actions-cache-server) speaks only Twirp cache-v2 with GitHub-OIDC
+# auth - the two can never interoperate (full diagnosis in the repo-local,
+# untracked handoff notes), so rust-cache's cache calls surface as permanent
+# 401 noise: every restore misses, every save fails. The plain
+# actions/cache@v6 steps in these very workflows (rustup toolchains,
+# docker/buildx/compose pins) demonstrably cache on these same runners
+# (runs #76/#77 stay green in minutes), so the cargo cache uses that exact
+# action with manual keys and starts working with zero further edits the
+# moment the cache pair speaks one protocol (fleet option A: the runner
+# binary's own `cache-server` subcommand).
 #
 # =============================================================================
 # TOOLCHAIN JUSTIFICATION (required by plan): cargo-zigbuild for the Linux legs
@@ -47,31 +85,21 @@
 #   this comment (NOT silently in a follow-up commit).
 #
 # Windows legs are cross-built on Linux by cargo-zigbuild like everything else:
-#   * x86_64-pc-windows-gnu / aarch64-pc-windows-gnu are Tier 2 rustup targets
-#     whose mingw-w64 link step `zig cc` satisfies; no Windows-native toolchain
-#     (no MSVC, no windows-latest legs) is involved. A cross-built PE cannot
-#     execute on the Linux runner, so the artifacts are verified structurally:
-#     the PE COFF machine field must be 0x8664 (x86_64) or 0xAA64 (ARM64) -
-#     the exact fact `file(1)` would report; a `file`-based check runs too
-#     whenever `file` exists on the runner.
-#
-#     MSVC windows binaries are NOT shipped (recorded decision, v1.0.0 cut):
-#     `*-pc-windows-msvc` is unreachable through cargo-zigbuild - `zig cc`
-#     covers only the GNU (mingw) PE ABI - so a real msvc cross build means a
-#     SECOND toolchain: cargo-xwin (or xwin + lld-link), LLVM clang-cl, and
-#     the ~1 GiB MSVC CRT / Windows SDK download from Microsoft with its own
-#     cache step. The gnu binaries run fine on Windows 10/11, so wiring
-#     unproven msvc legs days before the cut was declined on purpose. If the
-#     need ever materializes (users whose tooling insists on msvc linkage),
-#     add two msvc matrix legs driven by
-#     `cargo xwin build --release --target <triple>` with `~/.xwin` cached,
-#     and record the change HERE - this header is the toolchain contract,
-#     not the commit log.
-#
-# Local-dev limitation (recorded by task 36): the dev workstation has NO
-# zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
-# installed, so the cross legs are CI-validated only; the YAML itself is
-# gated locally with `actionlint` (0 errors).
+#   * x86_64-pc-windows-gnu is a Tier 2 rustup target; the arm64 leg targets
+#     aarch64-pc-windows-gnullvm, NOT -pc-windows-gnu: official stable dist
+#     no longer publishes `rust-std` for plain aarch64-pc-windows-gnu (the
+#     original claim that both triples were Tier 2 was wrong - proven by the
+#     first-ever release.yml run on a release merge where the arm64 leg
+#     failed inside rustup toolchain setup, task 4604). gnullvm is the
+#     Tier-2 ARM64 Windows target (LLVM-mingw/UCRT flavor): std ships,
+#     cargo-zigbuild maps Environment::GnuLlvm onto zig's gnu userland
+#     explicitly, and the binaries run on Windows 10/11 ARM64 (UCRT ships
+#     with the OS). No Windows-native toolchain (no MSVC, no windows-latest
+#     legs) is involved. A cross-built PE cannot execute on the Linux
+#     runner, so the artifacts are verified structurally: the PE COFF
+#     machine field must be 0x8664 (x86_64) or 0xAA64 (ARM64) - the exact
+#     fact `file(1)` would report; a `file`-based check runs too whenever
+#     `file` exists on the runner.
 #
 # Smoke tests: the native linux-x86_64-musl artifact RUNs and asserts
 # `cachette 1.0.0` on `--version`; the cross artifacts (aarch64-musl, both
@@ -82,10 +110,11 @@
 # =============================================================================
 # PUBLISHING (plan task 53): the forge release + its binaries. Binaries +
 # SHA256SUMS are attached to the Forgejo release. The release tag is
-# `v<version>`: the pushed tag on a tag push, or the Cargo.toml package version
-# on a push to the `release` branch (so merging a `feat/*` PR into `release`
-# cuts the release). The image side of a release (bare-semver tags
-# `1.0.0`/`1.0`/`1` + `latest` + `release` at
+# `v<version>`: a pushed `v*` tag publishes under itself (version = tag minus
+# `v`); a Release-labeled merged PR publishes under Cargo.toml's
+# `[package] version`; a manual dispatch publishes under `tag_name` or
+# `v<version>` exactly as its inputs said. The image side of a release
+# (bare-semver tags `1.0.0`/`1.0`/`1` + `latest` + `release` at
 # `hangar.nixthedev.ru/<owner>/cachette`) is pushed by push-checks.yml's docker
 # job on the same merge. Other branches meanwhile publish regexY's dev scheme,
 # so `latest` tracks dev heads until the next release push re-points it.
@@ -93,11 +122,21 @@
 name: Release
 
 on:
+  pull_request:
+    types: [closed]
+    branches: [release]
   push:
-    # `tags` and `branches` are OR-ed: either ref starts the full pipeline.
     tags: ["v*"]
-    branches: ["release"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to cut (e.g. 1.0.0). Empty = Cargo.toml at the resolved checkout."
+        required: false
+        type: string
+      tag_name:
+        description: "Git tag to publish (e.g. v1.0.0). Empty = v<version>."
+        required: false
+        type: string
 
 # NOTE (Forgejo): a `permissions:` key is NOT supported - the instance logs
 # "Job ... has a permissions field, which is not supported in Forgejo and will
@@ -108,15 +147,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Resolve the version and whether this run publishes. There are exactly two
-  # publishing refs:
-  #   * a `v*` tag            -> version = the tag minus its leading `v`
-  #   * the `release` branch  -> version = Cargo.toml's `[package] version`
-  # Every other ref (manual dispatch on a feature branch) builds binaries +
-  # checksums but never publishes.
+  # Resolve the version and whether this run publishes. Publishing refs:
+  #   * a `v*` tag                          -> version = the tag sans its `v`
+  #   * a PR merged into `release`          -> the Cargo.toml `[package] version`
+  #                                            gated on the `Release` label
+  #                                            from the event context
+  #   * a manual dispatch                   -> inputs.version/tag_name or the
+  #                                            Cargo.toml version; publish=true
+  # Every other case builds nothing (skipped downstream jobs) and logs why.
   version:
     name: resolve version
     runs-on: ubuntu-latest
+    env:
+      EVENT_MERGED: ${{ github.event.pull_request.merged }}
+      EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_TAG: ${{ inputs.tag_name }}
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -130,32 +176,62 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            publish=true
-          elif [[ "${GITHUB_REF}" == refs/heads/release ]]; then
-            # First `version = "..."` in the manifest is the package version.
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            # pull_request[closed] on release: the event carries merged state
+            # and the label list natively (regexY contract) - nothing to
+            # re-verify through the API.
+            if [[ "$EVENT_MERGED" == "true" ]] \
+              && printf '%s' "$EVENT_LABELS" | grep -q '"Release"'; then
+              publish=true
+              echo "merged PR carries the Release label: publishing"
+            else
+              publish=false
+              echo "PR closed without merge+Release-label (merged=$EVENT_MERGED labels=$EVENT_LABELS): not publishing"
+            fi
             version="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
               | sed -E 's/[^"]*"([^"]*)".*/\1/')"
+            tag="v$version"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            tag="${GITHUB_REF_NAME}"
             publish=true
+          elif [[ "${GITHUB_REF}" == refs/heads/release ]]; then
+            # Manual dispatch default context is the default branch (release):
+            # the explicit cut/re-cut lever.
+            publish=true
+            version="$INPUT_VERSION"
+            if [[ -z "$version" ]]; then
+              version="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
+                | sed -E 's/[^"]*"([^"]*)".*/\1/')"
+            fi
+            tag="$INPUT_TAG"
+            if [[ -z "$tag" ]]; then
+              tag="v$version"
+            fi
+            echo "manual dispatch on release: publishing $tag (version $version)"
           else
             version="0.0.0-${GITHUB_SHA:0:12}"
+            tag="v$version"
             publish=false
+            echo "unsupported ref $GITHUB_REF: not publishing"
           fi
           if [[ -z "$version" ]]; then
-            echo "::error::could not resolve a version from ${GITHUB_REF}"
+            echo "::error::could not resolve a version"
             exit 1
           fi
           {
             echo "version=$version"
-            echo "tag=v$version"
+            echo "tag=$tag"
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
-          echo "ref=${GITHUB_REF} version=$version tag=v$version publish=$publish"
+          echo "ref=${GITHUB_REF} version=$version tag=$tag publish=$publish"
 
+  # Build/checksums/release are skipped unless this run actually publishes.
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [version]
+    if: needs.version.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -179,9 +255,9 @@ jobs:
             bin: cachette.exe
             smoke: cross-windows
           - os: ubuntu-latest
-            target: aarch64-pc-windows-gnu
+            target: aarch64-pc-windows-gnullvm
             zigbuild: true
-            artifact: cachette-aarch64-pc-windows-gnu
+            artifact: cachette-aarch64-pc-windows-gnullvm
             bin: cachette.exe
             smoke: cross-windows
     steps:
@@ -204,9 +280,20 @@ jobs:
           key: rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
 
       - name: Cache cargo registry/build
-        uses: https://github.com/Swatinem/rust-cache@v2
+        # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
+        # NOTE at the top of this file. Cross artifacts live under
+        # target/<triple>, so the scope is the matrix target, pinned on
+        # dtolnay's rust `cachekey` (the toolchain/stdlib behind the build)
+        # and the Cargo.lock hash, with a restore-keys fallback for lockfile
+        # drift; cargo re-fingerprints whatever else drifted.
+        uses: actions/cache@v6
         with:
-          key: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
 
       # ---- Linux musl legs: cargo-zigbuild (justification block at top) ----
       # If a zig release ever regresses cargo-zigbuild, pin a known-good one
@@ -304,7 +391,7 @@ jobs:
           ls -l dist
 
       - name: Upload ${{ matrix.artifact }}
-        uses: actions/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
@@ -312,11 +399,12 @@ jobs:
 
   checksums:
     name: checksums
-    needs: build
+    needs: [build, version]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download all built binaries
-        uses: actions/download-artifact@v4
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -339,7 +427,7 @@ jobs:
           fi
 
       - name: Upload SHA256SUMS
-        uses: actions/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
@@ -353,7 +441,7 @@ jobs:
     # Release publish needs `contents: write` - granted via Authorized Integrations.
     steps:
       - name: Download every built binary + SHA256SUMS
-        uses: actions/download-artifact@v4
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -374,10 +462,21 @@ jobs:
           echo "Publishing $TAG ($SHA) to $api"
           ls -l dist
 
-          # Create the release; a re-run returns "already exists", which we
-          # tolerate by resolving the id from the tag anyway. `target_commitish`
-          # pins the auto-created tag to the pushed commit (matters on the
-          # `release` branch, where the tag is minted here rather than pushed).
+          # regexY re-run semantics: an existing release/tag of the same name
+          # is deleted first, so a re-cut (or an override dispatch) cannot
+          # collide. Failure to delete is tolerated - creation below vetoes
+          # collisions anyway.
+          existing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
+          existing_id="$(printf '%s' "$existing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
+          if [ -n "$existing_id" ]; then
+            echo "deleting stale release $existing_id for $TAG"
+            curl -sS -X DELETE "$api/releases/$existing_id" -H "$auth" || true
+          fi
+          curl -sS -X DELETE "$api/tags/$TAG" -H "$auth" || true
+
+          # Create the release; `target_commitish` pins the auto-created tag
+          # to the sha this run checked out (the tag is minted here rather
+          # than pushed when the run was not a tag push).
           create_body="{\"tag_name\":\"$TAG\",\"name\":\"cachette $TAG\",\"target_commitish\":\"$SHA\",\"draft\":false,\"prerelease\":false}"
           curl -sS -X POST "$api/releases" \
             -H "$auth" -H 'Content-Type: application/json' \
