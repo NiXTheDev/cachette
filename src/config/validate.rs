@@ -41,6 +41,12 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
             value: cdc.avg_chunk_bytes,
         });
     }
+    // `[storage.cdc] backfill_delay_ms` of zero would hot-spin the walker -
+    // checked regardless of `enabled` and `backfill`, same hide-nothing
+    // policy as the avg window above.
+    if cdc.backfill_delay_ms == 0 {
+        return Err(ConfigError::ZeroCdcBackfillDelay);
+    }
     if let Some(cert_path) = config.cluster.cert_path.as_ref()
         && *cert_path == config.storage.fs.path
     {
@@ -321,6 +327,35 @@ mod tests {
         config.storage.cdc.avg_chunk_bytes = 1024 * 1024;
         assert!(validate(&config).is_ok());
         config.storage.cdc.enabled = true;
+        assert!(validate(&config).is_ok());
+    }
+
+    /// `backfill_delay_ms = 0` is rejected regardless of `enabled` and
+    /// `backfill` (docs/cdc.md Config surface): the walker must never be
+    /// configurable into a hot spin.
+    #[test]
+    fn cdc_backfill_delay_must_not_be_zero() {
+        let mut config = Config::default();
+        config.storage.cdc.backfill_delay_ms = 0;
+        assert!(
+            matches!(validate(&config), Err(ConfigError::ZeroCdcBackfillDelay)),
+            "zero delay is rejected while disabled"
+        );
+        config.storage.cdc.enabled = true;
+        assert!(
+            matches!(validate(&config), Err(ConfigError::ZeroCdcBackfillDelay)),
+            "the enabled flag must not dodge the zero check"
+        );
+        config.storage.cdc.backfill = false;
+        assert!(
+            matches!(validate(&config), Err(ConfigError::ZeroCdcBackfillDelay)),
+            "the backfill flag must not dodge the zero check"
+        );
+
+        config.storage.cdc.backfill_delay_ms = 1;
+        assert!(validate(&config).is_ok());
+        config.storage.cdc.enabled = false;
+        config.storage.cdc.backfill = true;
         assert!(validate(&config).is_ok());
     }
 

@@ -167,10 +167,84 @@ in-process with the same cadence/idempotence guarantees as today.
 
 ### Mixed layout and coexistence
 
-Pre-CDC `whole` entries stay `whole` until naturally evicted; no bulk
-re-chunk. `verify_all` learns the `layout` column. Cluster relay and
-peer_relay are untouched (chunking is node-local at-rest state; the relay
-forwards receipts as today).
+Pre-CDC `whole` entries converge onto the chunked layout through the
+background backfill walker (Migration) - never a boot-blocking bulk
+re-chunk (a large index must not delay readiness by minutes). Until an
+entry's turn it stays `whole`, so the index is legitimately mixed at rest
+and every path branches on the row's `layout`; `verify_all` learns the
+`layout` column. Cluster relay and peer_relay are untouched (chunking is
+node-local at-rest state; the relay forwards receipts as today).
+
+## Migration
+
+v1.0 → v1.1 upgrades two independent halves, both crash-safe:
+
+### Schema half (the index)
+
+The index carries its schema version in a `meta` key-value table
+(`schema_version`), stamped only after every pending migration step has
+been applied AND verified - decoupled from the crate semver (a patch
+release must never look like a schema event; the ledger lives beside
+`SCHEMA_VERSION` in `fs.rs`). On every boot:
+
+1. stored > the binary's schema version: refuse to open. An older binary
+   never touches a newer index; the error names both versions and the
+   index is left untouched (the downgrade tripwire - see the data half for
+   why there is no in-place reverse path).
+2. stored < the binary's: apply the pending steps (version-ordered ledger;
+   bodies stay introspection-guarded so a re-run is a no-op on an
+   already-current schema), verify the result, and stamp the new version -
+   all in ONE transaction. SQLite DDL is transactional and these steps are
+   constant-default `ALTER`s (O(1) metadata work regardless of index
+   size), so a crash anywhere before the commit rolls back to exactly the
+   old schema and the next boot re-runs cleanly.
+3. verification (required tables + required column sets via
+   `pragma_table_info`) runs unconditionally on every boot, not only after
+   migrations: the stamp can lie (hand-mangled index, partial restore), so
+   a gap refuses to open and names the missing piece.
+
+An index that predates the meta table reads as version 0 and adopts
+smoothly: every step is a guarded no-op on its already-present columns,
+verify passes, the stamp lands.
+
+### Data half (the at-rest payloads)
+
+Schema-converted rows say `whole`; their payloads still are. A background
+backfill walker converges them onto the chunked layout when
+`[storage.cdc] enabled = true` and `backfill` is on (the default: turning
+`enabled` on means "converge", not just "new writes chunk"):
+
+- one entry per step, smallest first (`ORDER BY size ASC, id ASC`), paced
+  by `backfill_delay_ms` - large entries last, so convergence proceeds in
+  cheap increments and live traffic keeps most of the disk.
+- the pick excludes rows with the legacy empty digest (`digest = ''`):
+  their integrity cannot be checked, so they are never converted and stay
+  whole.
+- the connection mutex is NOT held during the chunking pass (the same
+  bounded-memory cutter finalize uses), so live traffic interleaves; the
+  commit is one transaction under the writer gate whose guarded
+  `UPDATE ... WHERE id = ? AND layout = 'whole' AND complete = 1
+  AND size = ? AND digest = ?` re-checks the row it picked - a delete or a
+  re-put with different content between the pick and the commit matches no
+  row, the pass is discarded, and its chunk files stay rowless for the
+  sweeper (the same convergence as a finalize crash mid-pass).
+- accounting moves in the same transaction: `used -= blob_bytes;
+  used += added`, where `added` is the manifest's freshly-referenced
+  bytes - size-neutral without dedup, smaller when the conversion hits
+  content that is already chunked and referenced.
+- the blob file is unlinked only after the commit (best-effort, like
+  finalize); a missed unlink is safe because the sweeper counts a
+  `chunked` row's blob as rowless after the grace (GC).
+- a blob that is missing, or digests differently than its row claims, is
+  corruption rather than a conversion failure: the walker warns, parks the
+  id in an in-process skip set, and keeps converting. Nothing is deleted;
+  the row stays whole; `cachette verify` still reports the entry.
+
+A whole→chunked conversion is one-way; no reverse (chunked→whole)
+re-materialization is implemented for v1.1. Downgrading a v1.1 index to a
+v1.0 binary is refused at open (schema half above) - migrate by draining
+and re-fetching from origins, or by re-replicating to a fresh node, not in
+place.
 
 ## Config surface
 
@@ -178,13 +252,16 @@ forwards receipts as today).
 [storage.cdc]          # off by default, all fields defaulted
 enabled = false
 avg_chunk_bytes = 131072
+backfill = true             # converge whole entries once enabled = true
+backfill_delay_ms = 100     # pause between single-entry conversions (>= 1)
 ```
 
 `enabled = false` behaves byte-identically to v1.0 layout (writes `whole`
-entries; reads over any preexisting `chunked` rows still? plan: read-path
-supports both layouts regardless of the current flag, so flipping the flag
-off never orphans readable data). `config::validate` caps `avg_chunk_bytes`
-to `[32768, 1048576]`.
+entries; the read path supports both layouts regardless of the current
+flag, so flipping the flag off never orphans readable data).
+`config::validate` caps `avg_chunk_bytes` to `[32768, 1048576]` and rejects
+`backfill_delay_ms = 0` - both regardless of `enabled`/`backfill`, so a
+bad value cannot hide until the flag flips on.
 
 ## Test plan
 
@@ -206,9 +283,19 @@ to `[32768, 1048576]`.
    missing-file health reported for both classes.
 7. **Layout-flag independence:** with `enabled = false`, pre-existing
    chunked entries read correctly; new writes take the `whole` path.
+8. **Migration:** fresh boot stamps the schema version and a reboot is a
+   no-op; a newer index refuses to open untouched; a lying stamp (version
+   row vs. actual columns) is caught on every boot; a corrupt version value
+   refuses instead of guessing. Backfill: one-step conversion keeps size
+   and digest, unlinks the blob, and stays size-neutral in accounting; the
+   drain converts smallest-first and ends `Exhausted` idempotently; corrupt
+   rows (missing blob, digest mismatch) are parked and skipped, never
+   deleted; a raced row discards the pass; `digest = ''` rows are never
+   picked; live writes interleave with a conversion.
 
 ## Rollout
 
 First release carrying the code **defaults to off**; flipping
-`[storage.cdc] enabled` on a live node requires a restart and then applies to
-new finalizations only. No protocol, client, image, or wire changes.
+`[storage.cdc] enabled` on a live node requires a restart and then applies
+to new finalizations and starts the background backfill walker (Migration)
+- no boot-blocking re-chunk. No protocol, client, image, or wire changes.

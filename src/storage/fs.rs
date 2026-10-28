@@ -50,7 +50,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::RwLock;
@@ -191,6 +191,36 @@ pub struct ChunkSweep {
     /// Belt-and-braces `chunks` rows with `refs = 0` purged (the normal
     /// release paths delete those in-tx, so these should never exist).
     pub rows: u64,
+}
+
+/// One completed whole->chunked conversion (docs/cdc.md, Migration): the
+/// entry flipped layout in a verified transaction and its blob file was
+/// unlinked post-commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeConversion {
+    /// The converted entry's id.
+    pub id: String,
+    /// Bytes the whole blob occupied (the entry's payload size).
+    pub blob_bytes: u64,
+    /// Bytes the entry's chunk manifest sums to (== `blob_bytes` when the
+    /// chunks were all fresh; less when dedup hit shared content).
+    pub chunk_bytes: u64,
+}
+
+/// What one backfill step decided (docs/cdc.md, Migration).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackfillStep {
+    /// An entry converted; its blob was unlinked after the commit.
+    Converted(WholeConversion),
+    /// The picked row changed under us (deleted, re-put with different
+    /// content, or flipped by another writer) between the pick and the
+    /// commit - the guarded `UPDATE` matched no row. Nothing was committed;
+    /// any chunk files written for the abandoned pass are rowless and the
+    /// sweeper converges on them. The next step re-picks.
+    Raced,
+    /// No convertible entry remains (every `whole` row either carries a
+    /// legacy empty digest or sits in the caller's skip set).
+    Exhausted,
 }
 
 impl std::fmt::Debug for FsStorage {
@@ -564,6 +594,135 @@ impl FsStorage {
                 "rowless chunks swept"
             );
             Ok(swept)
+        })
+        .await
+    }
+
+    /// docs/cdc.md, Migration: convert ONE complete `whole` entry to the
+    /// `chunked` layout, smallest first, skipping ids in `skip` (the
+    /// caller-owned corruption park). Steps:
+    ///
+    /// 1. pick under the conn mutex only - the chunking pass below runs
+    ///    lock-free, so live traffic interleaves with a conversion;
+    /// 2. stream the blob through the chunker (bounded memory, same code
+    ///    path as finalize). A blob that is gone, or whose content digests
+    ///    differently than its row claims, is corruption rather than a
+    ///    conversion failure: warn, park the id in `skip`, try the
+    ///    next-smallest. A digest mismatch is only detected after the chunk
+    ///    files are written; they stay rowless and the sweeper converges on
+    ///    them, exactly like a finalize crash mid-pass;
+    /// 3. commit under the single-writer gate (like finalize): one
+    ///    transaction whose guarded UPDATE re-checks the picked row's
+    ///    layout/completeness/size/digest, so a delete or a re-put with
+    ///    different content in between matches no row and the pass is
+    ///    discarded ([`BackfillStep::Raced`]); then register the manifest
+    ///    (`acquire_chunk_manifest`), move accounting
+    ///    (`used -= blob; used += added`, size-neutral without dedup), and
+    ///    unlink the blob post-commit (best-effort: a missed unlink is the
+    ///    sweeper's crash window, docs/cdc.md GC).
+    ///
+    /// Legacy rows with an empty digest are never picked (their integrity
+    /// cannot be checked; they stay whole). Returns what happened; the next
+    /// call re-picks, so a walker converges by looping until
+    /// [`BackfillStep::Exhausted`].
+    pub async fn backfill_step(
+        &self,
+        params: CdcParams,
+        skip: &mut HashSet<String>,
+    ) -> io::Result<BackfillStep> {
+        loop {
+            let picked = {
+                let conn = lock(&self.conn)?;
+                pick_whole_entry(&conn, skip)?
+            };
+            let Some((id, blob_bytes, digest)) = picked else {
+                return Ok(BackfillStep::Exhausted);
+            };
+            let blob_path = self.root.join("blobs").join(format!("{id}.blob"));
+            let mut blob = match File::open(&blob_path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    tracing::warn!(entry = %id, "backfill: whole entry has no blob; skipping");
+                    skip.insert(id);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let chunks_dir = self.root.join("chunks");
+            let payload = chunk_payload(&chunks_dir, params, &mut blob)?;
+            if payload.digest != digest {
+                tracing::warn!(
+                    entry = %id,
+                    "backfill: blob digest does not match its row; skipping"
+                );
+                skip.insert(id);
+                continue;
+            }
+            let blob_size = i64::try_from(blob_bytes).unwrap_or(i64::MAX);
+            let _gate = self.gate.write().await;
+            let conn = Arc::clone(&self.conn);
+            let row_id = id.clone();
+            let committed = blocking(move || {
+                let mut conn = lock(&conn)?;
+                let tx = conn.transaction().map_err(sql)?;
+                let changed = tx
+                    .execute(
+                        "UPDATE entries SET layout = 'chunked' \
+                         WHERE id = ?1 AND layout = 'whole' AND complete = 1 \
+                           AND size = ?2 AND digest = ?3",
+                        params![row_id, blob_size, digest],
+                    )
+                    .map_err(sql)?;
+                if changed == 0 {
+                    tx.rollback().map_err(sql)?;
+                    return Ok(None);
+                }
+                let mut unlink = Vec::new();
+                let added = acquire_chunk_manifest(&tx, &row_id, &payload, &mut unlink)?;
+                tx.execute(
+                    "UPDATE accounting SET used_bytes = used_bytes - ?1 + ?2",
+                    params![blob_size, added],
+                )
+                .map_err(sql)?;
+                tx.commit().map_err(sql)?;
+                Ok(Some(added))
+            })
+            .await?;
+            let Some(added) = committed else {
+                return Ok(BackfillStep::Raced);
+            };
+            if let Err(err) = std::fs::remove_file(&blob_path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    entry = %id,
+                    error = %err,
+                    "backfill: blob unlink failed; the sweeper will reclaim it"
+                );
+            }
+            return Ok(BackfillStep::Converted(WholeConversion {
+                id,
+                blob_bytes,
+                chunk_bytes: u64::try_from(added).unwrap_or(0),
+            }));
+        }
+    }
+
+    /// How many entries still await backfill conversion: complete `whole`
+    /// rows carrying a content digest (docs/cdc.md, Migration).
+    pub async fn pending_whole_entries(&self) -> io::Result<u64> {
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = lock(&conn)?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries \
+                     WHERE complete = 1 AND layout = 'whole' AND digest != ''",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            Ok(u64::try_from(count.max(0)).unwrap_or(0))
         })
         .await
     }
@@ -2076,6 +2235,39 @@ fn acquire_chunk_manifest(
         .map_err(sql)?;
     }
     Ok(added)
+}
+
+/// The next backfill candidate (docs/cdc.md, Migration): the smallest
+/// complete `whole` entry that carries a content digest and sits outside
+/// the caller's skip set. Legacy rows with `digest = ''` are never picked
+/// (their integrity cannot be checked, so they stay whole); the skip set is
+/// a caller-owned corruption park passed in as a dynamic `NOT IN`.
+fn pick_whole_entry(
+    conn: &Connection,
+    skip: &HashSet<String>,
+) -> io::Result<Option<(String, u64, String)>> {
+    let mut query = String::from(
+        "SELECT id, size, digest FROM entries \
+         WHERE complete = 1 AND layout = 'whole' AND digest != ''",
+    );
+    let mut values: Vec<String> = Vec::new();
+    if !skip.is_empty() {
+        let placeholders = skip.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        values.extend(skip.iter().cloned());
+        let _ = write!(query, " AND id NOT IN ({placeholders})");
+    }
+    let _ = write!(query, " ORDER BY size ASC, id ASC LIMIT 1");
+    let row = conn
+        .query_row(&query, params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(sql)?;
+    Ok(row.map(|(id, size, digest)| (id, u64::try_from(size.max(0)).unwrap_or(0), digest)))
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -5011,6 +5203,427 @@ mod storage_fs {
         assert!(
             err.to_string().contains("corrupt schema_version"),
             "refusal names the corruption: {err}"
+        );
+    }
+
+    // ==== whole->chunked backfill (docs/cdc.md, Migration) ====
+
+    /// Seed a published `whole` entry the v1.0 way: one complete row with a
+    /// real content digest and its blob file on disk. `digest::hash_bytes`
+    /// is the same hex16(blake3) the finalize path stamps, so honest data
+    /// passes the walker's digest check.
+    fn seed_whole_entry(dir: &TestDir, storage: &FsStorage, key: &str, payload: &[u8]) -> String {
+        let id = entry_id(key);
+        let digest = digest::hash_bytes(payload);
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, owner_node, artifact_key, reservation_expires_at, \
+                     digest, layout) \
+                     VALUES (?1, ?2, '', ?3, 0, 0, 1, '', '', NULL, ?4, 'whole')",
+                params![id, key, payload.len() as i64, digest],
+            )
+            .expect("seed whole row");
+            // A real whole entry at rest contributes its size to the
+            // accounting row - the seeded state must satisfy the invariant.
+            conn.execute(
+                "UPDATE accounting SET used_bytes = used_bytes + ?1",
+                [payload.len() as i64],
+            )
+            .expect("seed accounting");
+        }
+        std::fs::write(dir.path().join("blobs").join(format!("{id}.blob")), payload)
+            .expect("seed whole blob");
+        id
+    }
+
+    /// One step converts the smallest seeded whole entry: layout flips,
+    /// size and digest survive unchanged, the blob is unlinked post-commit,
+    /// accounting is size-neutral (fresh chunks, no dedup), and the entry
+    /// reads back byte-exact through the chunked path. A follow-up step is
+    /// `Exhausted`.
+    #[tokio::test]
+    async fn backfill_converts_one_whole_entry_and_reads_back() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 11);
+        let id = seed_whole_entry(&dir, &storage, "legacy", &payload);
+        let before = used_of(&storage).await;
+
+        let step = storage
+            .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+            .await
+            .expect("backfill step");
+        let BackfillStep::Converted(conversion) = &step else {
+            panic!("expected a conversion, got {step:?}");
+        };
+        assert_eq!(conversion.id, id);
+        assert_eq!(conversion.blob_bytes, 48 * 1024);
+        assert_eq!(
+            conversion.chunk_bytes,
+            48 * 1024,
+            "fresh chunks: the manifest sums to the payload"
+        );
+        assert_eq!(layout_of(&storage, "legacy").as_deref(), Some("chunked"));
+        assert!(
+            !dir.path().join("blobs").join(format!("{id}.blob")).exists(),
+            "blob unlinked post-commit"
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            before,
+            "size-neutral without dedup"
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting rests on the invariant"
+        );
+        let read = read_all(
+            storage
+                .get_range("legacy", 0..(48 * 1024))
+                .await
+                .expect("read"),
+        )
+        .await;
+        assert_eq!(read, payload, "round trip through the chunked layout");
+        assert_eq!(
+            storage
+                .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+                .await
+                .expect("drained step"),
+            BackfillStep::Exhausted
+        );
+    }
+
+    /// A drain converts every convertible entry smallest-first
+    /// (`pending_whole_entries` counts down to 0) and ends `Exhausted`
+    /// idempotently; a legacy row with the empty digest is never counted
+    /// nor converted.
+    #[tokio::test]
+    async fn backfill_drains_smallest_first_and_exhausts_idempotently() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let small = pattern(4 * 1024, 1);
+        let large = pattern(64 * 1024, 2);
+        let small_id = seed_whole_entry(&dir, &storage, "small", &small);
+        let large_id = seed_whole_entry(&dir, &storage, "large", &large);
+        // A legacy row with the empty digest: integrity unverifiable, so
+        // never convertible.
+        let legacy_id = entry_id("legacy-empty-digest");
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, owner_node, artifact_key, reservation_expires_at, \
+                     digest, layout) \
+                     VALUES (?1, 'legacy-empty-digest', '', 11, 0, 0, 1, '', '', NULL, '', 'whole')",
+                [&legacy_id],
+            )
+            .expect("seed legacy row");
+        }
+        std::fs::write(
+            dir.path().join("blobs").join(format!("{legacy_id}.blob")),
+            b"empty-digest",
+        )
+        .expect("seed legacy blob");
+
+        assert_eq!(
+            storage.pending_whole_entries().await.expect("pending"),
+            2,
+            "the empty-digest row is not pending"
+        );
+
+        let first = storage
+            .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+            .await
+            .expect("step 1");
+        assert_eq!(
+            first,
+            BackfillStep::Converted(WholeConversion {
+                id: small_id,
+                blob_bytes: 4 * 1024,
+                chunk_bytes: 4 * 1024,
+            }),
+            "smallest first"
+        );
+        assert_eq!(storage.pending_whole_entries().await.expect("pending"), 1);
+
+        let second = storage
+            .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+            .await
+            .expect("step 2");
+        assert_eq!(
+            second,
+            BackfillStep::Converted(WholeConversion {
+                id: large_id,
+                blob_bytes: 64 * 1024,
+                chunk_bytes: 64 * 1024,
+            })
+        );
+        assert_eq!(storage.pending_whole_entries().await.expect("pending"), 0);
+
+        for _ in 0..2 {
+            assert_eq!(
+                storage
+                    .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+                    .await
+                    .expect("drained"),
+                BackfillStep::Exhausted,
+                "exhaustion is idempotent"
+            );
+        }
+        assert_eq!(
+            layout_of(&storage, "legacy-empty-digest").as_deref(),
+            Some("whole"),
+            "empty-digest rows are never converted"
+        );
+        assert!(
+            dir.path()
+                .join("blobs")
+                .join(format!("{legacy_id}.blob"))
+                .exists(),
+            "the legacy blob stays"
+        );
+        let read = read_all(
+            storage
+                .get_range("large", 0..(64 * 1024))
+                .await
+                .expect("read"),
+        )
+        .await;
+        assert_eq!(read, large, "the converted entry reads back byte-exact");
+    }
+
+    /// Corruption is parked, not fatal and never destructive: a whole entry
+    /// whose blob is missing, and one whose blob digests differently than
+    /// its row claims, are both skipped (row and blob untouched, ids in the
+    /// caller's skip set) while the healthy sibling converts; the parked
+    /// pass's rowless chunk files are sweeper fodder like any crash left.
+    #[tokio::test]
+    async fn backfill_parks_corrupt_entries_and_converts_the_rest() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let healthy = pattern(16 * 1024, 3);
+        let healthy_id = seed_whole_entry(&dir, &storage, "healthy", &healthy);
+        // No blob at all.
+        let missing_id = entry_id("missing-blob");
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, owner_node, artifact_key, reservation_expires_at, \
+                     digest, layout) \
+                     VALUES (?1, 'missing-blob', '', 5, 0, 0, 1, '', '', NULL, ?2, 'whole')",
+                params![missing_id, digest::hash_bytes(b"gone")],
+            )
+            .expect("seed a row without its blob");
+            conn.execute("UPDATE accounting SET used_bytes = used_bytes + 5", [])
+                .expect("seed accounting for the blob-less row");
+        }
+        // A blob whose bytes do not match the row's digest.
+        let mutated = pattern(16 * 1024, 4);
+        let mutated_id = seed_whole_entry(&dir, &storage, "mutated", &mutated);
+        std::fs::write(
+            dir.path().join("blobs").join(format!("{mutated_id}.blob")),
+            pattern(16 * 1024, 5),
+        )
+        .expect("swap the blob for other bytes");
+
+        let mut skip: HashSet<String> = HashSet::new();
+        let mut converted: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            match storage
+                .backfill_step(CdcParams::new(4096), &mut skip)
+                .await
+                .expect("step")
+            {
+                BackfillStep::Converted(conversion) => converted.push(conversion.id),
+                BackfillStep::Exhausted => break,
+                BackfillStep::Raced => panic!("no concurrent writers in this test"),
+            }
+        }
+        assert_eq!(
+            converted.as_slice(),
+            std::slice::from_ref(&healthy_id),
+            "only the healthy entry converts"
+        );
+        assert_eq!(skip.len(), 2, "both corrupt ids parked");
+        assert!(skip.contains(&missing_id) && skip.contains(&mutated_id));
+        assert_eq!(layout_of(&storage, "healthy").as_deref(), Some("chunked"));
+        assert_eq!(
+            layout_of(&storage, "missing-blob").as_deref(),
+            Some("whole")
+        );
+        assert_eq!(layout_of(&storage, "mutated").as_deref(), Some("whole"));
+        assert!(
+            dir.path()
+                .join("blobs")
+                .join(format!("{mutated_id}.blob"))
+                .exists(),
+            "a corrupt blob is never deleted"
+        );
+        assert_eq!(used_of(&storage).await, at_rest_invariant(&storage));
+
+        // The parked (mutated) pass left rowless chunk files; age them and
+        // watch the sweeper converge, while the converted manifest's files
+        // are protected by their rows.
+        let rowed: HashSet<String> = chunk_rows(&storage)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        let chunks = dir.path().join("chunks");
+        for name in chunk_files(&dir) {
+            if let Some(stem) = name.strip_suffix(".chunk")
+                && !rowed.contains(stem)
+            {
+                backdate(&chunks.join(&name), 2 * 3600);
+            }
+        }
+        let now = super::super::unix_now();
+        let swept = storage
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("sweep");
+        assert!(swept.files >= 1, "the abandoned pass's leftovers swept");
+        assert_eq!(chunk_rows(&storage).len(), rowed.len(), "no row touched");
+    }
+
+    /// The guarded commit: a row that changes between the pick and the
+    /// commit - here a simulated concurrent re-put landing while the step
+    /// is parked at the writer gate (the pick and the chunking run
+    /// lock-free, the commit cannot) - makes the guarded UPDATE match no
+    /// row: the pass is discarded (`Raced`), no manifest is committed, no
+    /// accounting moves, the row and its blob stay, and the abandoned pass's
+    /// chunk files are rowless for the sweeper.
+    #[tokio::test]
+    async fn backfill_discards_a_pass_whose_row_changed_under_it() {
+        let dir = TestDir::new();
+        let storage = Arc::new(open_cdc(&dir));
+        let payload = pattern(48 * 1024, 6);
+        let id = seed_whole_entry(&dir, storage.as_ref(), "racy", &payload);
+        let before = used_of(&storage).await;
+
+        // Hold the writer gate so the step parks between its chunking pass
+        // and its commit; the parked step is observable via the chunk files
+        // its pass writes (it cannot complete: the gate is held).
+        let _gate = storage.gate.write().await;
+        let task = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                storage
+                    .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+                    .await
+                    .expect("step")
+            })
+        };
+        let chunks = dir.path().join("chunks");
+        let mut parked = false;
+        for _ in 0..200 {
+            if !chunk_files(&dir).is_empty() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(parked, "the pass reached its commit gate");
+
+        // The re-put lands while the step waits: the row id is key-derived
+        // (a delete + re-put of the same key reuses it), with different
+        // size and digest.
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "UPDATE entries SET size = size + 1, digest = ?2 WHERE id = ?1",
+                params![id, digest::hash_bytes(b"different")],
+            )
+            .expect("re-put the row with different content");
+        }
+        drop(_gate);
+
+        let step = task.await.expect("join");
+        assert_eq!(step, BackfillStep::Raced);
+        assert_eq!(layout_of(&storage, "racy").as_deref(), Some("whole"));
+        assert!(
+            dir.path().join("blobs").join(format!("{id}.blob")).exists(),
+            "the blob stays (a re-put's blob must survive a raced pass)"
+        );
+        assert_eq!(chunk_rows(&storage), Vec::new(), "no manifest committed");
+        assert_eq!(
+            used_of(&storage).await,
+            before,
+            "a raced pass moves no accounting"
+        );
+
+        // The abandoned pass's chunk files are rowless; the sweeper takes
+        // them once aged.
+        for name in chunk_files(&dir) {
+            backdate(&chunks.join(&name), 2 * 3600);
+        }
+        let now = super::super::unix_now();
+        let swept = storage
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("sweep");
+        assert!(swept.files >= 1, "abandoned chunk files swept");
+        assert!(
+            chunk_files(&dir).is_empty(),
+            "the chunks dir converges to empty"
+        );
+    }
+
+    /// The chunking pass holds no connection mutex: a concurrent
+    /// put/finalize on another key completes while a conversion is in
+    /// flight, and both entries read back byte-exact with accounting
+    /// resting on the invariant.
+    #[tokio::test]
+    async fn backfill_interleaves_with_live_traffic() {
+        let dir = TestDir::new();
+        let storage = Arc::new(open_cdc(&dir));
+        let payload = pattern(256 * 1024, 8);
+        seed_whole_entry(&dir, &storage, "bulk", &payload);
+        let live = pattern(8 * 1024, 9);
+
+        let writer = {
+            let storage = Arc::clone(&storage);
+            let live = live.clone();
+            tokio::spawn(async move {
+                storage.put_stream("live", bytes(&live)).await.expect("put");
+                storage.finalize("live").await.expect("finalize");
+            })
+        };
+        let step = storage
+            .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+            .await
+            .expect("step");
+        writer.await.expect("writer joins");
+        assert!(
+            matches!(step, BackfillStep::Converted(_)),
+            "the conversion commits despite the interleaved write"
+        );
+        let read_bulk = read_all(
+            storage
+                .get_range("bulk", 0..(256 * 1024))
+                .await
+                .expect("read"),
+        )
+        .await;
+        assert_eq!(read_bulk, payload);
+        let read_live = read_all(
+            storage
+                .get_range("live", 0..(8 * 1024))
+                .await
+                .expect("read"),
+        )
+        .await;
+        assert_eq!(read_live, live);
+        assert_eq!(layout_of(&storage, "bulk").as_deref(), Some("chunked"));
+        assert_eq!(layout_of(&storage, "live").as_deref(), Some("chunked"));
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting rests on the invariant after both writes"
         );
     }
 }

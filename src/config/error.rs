@@ -70,6 +70,13 @@ pub enum ConfigError {
     #[error("storage.cdc.avg_chunk_bytes must be within 32768..=1048576 (got {value})")]
     CdcAvgRange { value: u64 },
 
+    /// `[storage.cdc] backfill_delay_ms` is zero - the backfill walker would
+    /// hot-spin between conversions; validated regardless of `enabled` so a
+    /// bad value cannot hide until the flag flips on (same policy as
+    /// `avg_chunk_bytes`).
+    #[error("storage.cdc.backfill_delay_ms must be at least 1 (got 0)")]
+    ZeroCdcBackfillDelay,
+
     /// `[auth] secret` missing at serve time (not checked by `--print-config`).
     #[error(
         "auth.secret is required to serve: set [auth] secret in the config file or the \

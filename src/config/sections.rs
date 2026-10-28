@@ -102,6 +102,15 @@ pub struct CdcConfig {
     /// [`MIN_AVG_CHUNK_BYTES`](crate::storage::cdc::MIN_AVG_CHUNK_BYTES)
     /// ..[`MAX_AVG_CHUNK_BYTES`](crate::storage::cdc::MAX_AVG_CHUNK_BYTES).
     pub avg_chunk_bytes: u64,
+    /// Converge pre-CDC `whole` entries onto the chunked layout in the
+    /// background when `enabled` is on (docs/cdc.md, Migration). Default on:
+    /// turning `[storage.cdc] enabled` on means "converge", not just "new
+    /// writes chunk".
+    pub backfill: bool,
+    /// Pause between single-entry backfill conversions; bounds the walker's
+    /// interference with live traffic. Validated `>= 1` regardless of
+    /// `enabled` (a zero delay would hot-spin once enabled flips on).
+    pub backfill_delay_ms: u64,
 }
 
 impl Default for CdcConfig {
@@ -109,6 +118,8 @@ impl Default for CdcConfig {
         Self {
             enabled: false,
             avg_chunk_bytes: crate::storage::cdc::DEFAULT_AVG_CHUNK_BYTES,
+            backfill: true,
+            backfill_delay_ms: 100,
         }
     }
 }
