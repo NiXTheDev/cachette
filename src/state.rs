@@ -311,7 +311,10 @@ fn default_node_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Plan task 3 acceptance: unit-test the version parse.
+    /// Plan task 3 acceptance: unit-test the version parse - the crate's
+    /// own version is semver: exactly three numeric components. (The
+    /// literal [1, 0, 0] this once pinned died with the 1.1.0 cut: a
+    /// version snapshot is not the contract, the parse is.)
     #[test]
     fn version_parses_as_semver_matching_the_package() {
         let raw = env!("CARGO_PKG_VERSION");
@@ -319,6 +322,6 @@ mod tests {
             .split('.')
             .map(|part| part.parse::<u64>().expect("version component is numeric"))
             .collect();
-        assert_eq!(components, vec![1, 0, 0], "unexpected version: {raw}");
+        assert_eq!(components.len(), 3, "unexpected version: {raw}");
     }
 }
