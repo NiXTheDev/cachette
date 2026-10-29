@@ -54,8 +54,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cachette::auth::{AuthPolicy, jwt, urls};
@@ -790,6 +790,15 @@ fn build_go_fixture(go: &Path, gac_dir: &Path, out: &Path) -> Result<(), String>
 
 /// Ensure `@actions/cache` is installed under `tests/fixtures` (never committed).
 fn ensure_node_deps(fixtures: &Path) -> Result<(), String> {
+    // Both real-client tests run concurrently in one process; serialize the
+    // one-time `npm ci` or two npm processes race on the same node_modules
+    // (ENOTEMPTY rmdir under node_modules/@actions on a fresh checkout).
+    // Post-lock marker re-check: the first test's install may already be
+    // done by the time the second acquires the lock.
+    static NPM_CI: Mutex<()> = Mutex::new(());
+    let _npm_ci = NPM_CI
+        .lock()
+        .map_err(|_| String::from("npm ci mutex poisoned"))?;
     let marker = fixtures
         .join("node_modules")
         .join("@actions")
@@ -906,15 +915,19 @@ fn which(program: &str) -> Option<PathBuf> {
         vec![String::new()]
     };
     for dir in std::env::split_paths(&path) {
-        let direct = dir.join(program);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        for ext in &extensions {
-            if ext.is_empty() {
-                continue;
-            }
-            let candidate = dir.join(format!("{program}{ext}"));
+        // PATHEXT candidates before the literal name: fnm-style node dirs
+        // ship both `npm` (a POSIX sh script) and `npm.cmd`, and the script
+        // loses to CreateProcess with os error 193 ("%1 is not a valid
+        // Win32 application") - only .exe/.cmd/.bat can ever run on
+        // Windows, and Rust routes those through cmd.exe. The literal name
+        // stays last; on Unix this loop is the plain literal check.
+        let mut candidates: Vec<PathBuf> = extensions
+            .iter()
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| dir.join(format!("{program}{ext}")))
+            .collect();
+        candidates.push(dir.join(program));
+        for candidate in candidates {
             if candidate.is_file() {
                 return Some(candidate);
             }
