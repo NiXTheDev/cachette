@@ -359,22 +359,44 @@ jobs:
 
       - name: Smoke - cross windows artifact PE machine
         if: matrix.smoke == 'cross-windows'
-        shell: pwsh
+        shell: bash
         run: |
-          $path = "target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          $bytes = [System.IO.File]::ReadAllBytes($path)
-          $peOff  = [BitConverter]::ToInt32($bytes, 0x3C)     # e_lfanew
-          $peSig  = [BitConverter]::ToUInt32($bytes, $peOff)  # "PE\0\0"
-          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
-          Write-Host ("PE header @ 0x{0:X}; signature 0x{1:X8}; machine 0x{2:X4}" -f $peOff, $peSig, $machine)
-          if ($peSig -ne 0x00004550) { throw "not a PE file" }
-          if ("${{ matrix.target }}" -match "aarch64") {
-            if ($machine -ne 0xAA64) { throw ("expected ARM64 machine 0xAA64, got 0x{0:X4}" -f $machine) }
-            Write-Host "OK: PE machine 0xAA64 = ARM64"
-          } else {
-            if ($machine -ne 0x8664) { throw ("expected x86_64 machine 0x8664, got 0x{0:X4}" -f $machine) }
-            Write-Host "OK: PE machine 0x8664 = x86_64"
-          }
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if [ ! -s "$bin" ]; then
+            echo "::error::artifact missing or empty: $bin"
+            exit 1
+          fi
+          # PE COFF machine field, read straight from the file with coreutils
+          # od (on every Linux runner - pwsh is absent from the act-runner
+          # image and 127ed the v1.0.0 dispatch's task 64): e_lfanew (u32 LE)
+          # at 0x3C points at the PE header, "PE\0\0" signature there, and
+          # the machine field (u16 LE) directly behind it. Decimal compare:
+          # 0x4550 = 17744, 0xAA64 = 43620, 0x8664 = 34404.
+          pe_off="$(od -An -tu4 -j 60 -N 4 --endian=little "$bin" | tr -d ' \n')"
+          pe_sig="$(od -An -tu4 -j "$pe_off" -N 4 --endian=little "$bin" | tr -d ' \n')"
+          machine="$(od -An -tu2 -j $((pe_off + 4)) -N 2 --endian=little "$bin" | tr -d ' \n')"
+          printf 'PE header @ 0x%X; signature 0x%08X; machine 0x%04X\n' "$pe_off" "$pe_sig" "$machine"
+          if [ "$pe_sig" -ne 17744 ]; then
+            echo "::error::not a PE file (signature 0x$(printf '%08X' "$pe_sig"))"
+            exit 1
+          fi
+          case "${{ matrix.target }}" in
+            *aarch64*)
+              if [ "$machine" -ne 43620 ]; then
+                echo "::error::expected ARM64 machine 0xAA64, got 0x$(printf '%04X' "$machine")"
+                exit 1
+              fi
+              echo "OK: PE machine 0xAA64 = ARM64"
+              ;;
+            *)
+              if [ "$machine" -ne 34404 ]; then
+                echo "::error::expected x86_64 machine 0x8664, got 0x$(printf '%04X' "$machine")"
+                exit 1
+              fi
+              echo "OK: PE machine 0x8664 = x86_64"
+              ;;
+          esac
 
       # ---- Stage + upload one uniquely-named binary per target ----
       # The file name is the ARTIFACT name (target-qualified) so the later
