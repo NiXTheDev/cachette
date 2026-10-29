@@ -22,9 +22,10 @@
 #     manifest-derived version, `tag_name` overrides the derived
 #     `v<version>` (both empty = plain Cargo.toml cut at the checkout the
 #     dispatch resolves to). A dispatch is the explicit lever to cut or
-#     re-cut a release; the publish step deletes an existing tag/release for
-#     the same name first (regexY re-run semantics), so overrides cannot
-#     collide.
+#     re-cut a release; the publish step runs actions/forgejo-release with
+#     override: true (regexY re-run semantics): the stale release of the
+#     same tag is deleted and a sha-mismatched tag is re-minted at this
+#     run's commit, so overrides cannot collide.
 #   * the regexY flow also carries a `pr_number` input used by its PR-comment
 #     step: NOT copied - cachette ships no changelog/PR-comment step.
 #
@@ -590,84 +591,25 @@ jobs:
           merge-multiple: true
 
       - name: Publish release and attach assets
-        shell: bash
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SERVER: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ needs.version.outputs.tag }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          api="$SERVER/api/v1/repos/$REPO"
-          auth="Authorization: token $TOKEN"
-
-          echo "Publishing $TAG ($SHA) to $api"
-          ls -l dist
-
-          # regexY re-run semantics: an existing release/tag of the same name
-          # is deleted first, so a re-cut (or an override dispatch) cannot
-          # collide. Failure to delete is tolerated - creation below vetoes
-          # collisions anyway.
-          existing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
-          existing_id="$(printf '%s' "$existing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
-          if [ -n "$existing_id" ]; then
-            echo "deleting stale release $existing_id for $TAG"
-            curl -sS -X DELETE "$api/releases/$existing_id" -H "$auth" || true
-          fi
-          curl -sS -X DELETE "$api/tags/$TAG" -H "$auth" || true
-
-          # Create the release; a re-run returns "already exists", which we
-          # tolerate by resolving the id from the tag anyway. `target_commitish`
-          # pins the auto-created tag to the pushed commit (matters on the
-          # `release` branch, where the tag is minted here rather than pushed).
-          create_body="{\"tag_name\":\"$TAG\",\"name\":\"cachette $TAG\",\"target_commitish\":\"$SHA\",\"draft\":false,\"prerelease\":false}"
-          curl -sS -X POST "$api/releases" \
-            -H "$auth" -H 'Content-Type: application/json' \
-            -d "$create_body" || true
-
-          release_id=""
-          for attempt in 1 2 3 4 5; do
-            listing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
-            release_id="$(printf '%s' "$listing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
-            [ -n "$release_id" ] && break
-            echo "release not resolvable yet (attempt $attempt); retrying"
-            sleep 3
-          done
-          if [ -z "$release_id" ]; then
-            echo "::error::could not resolve a release id for tag $TAG"
-            exit 1
-          fi
-          echo "release id = $release_id"
-
-          # Upload each asset (binaries + SHA256SUMS), retrying transient
-          # failures. A re-run hits "already exists" (HTTP 400/409) for an asset
-          # that is already attached; that is treated as success so a re-run of
-          # the tag is idempotent.
-          for f in dist/*; do
-            name="$(basename "$f")"
-            uploaded=false
-            for attempt in 1 2 3 4; do
-              code="$(curl -sS -o /tmp/upload.out -w '%{http_code}' \
-                -X POST "$api/releases/$release_id/assets?name=$name" \
-                -H "$auth" -F "attachment=@$f" || true)"
-              if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-                echo "uploaded $name (HTTP $code)"
-                uploaded=true
-                break
-              fi
-              if [ "$code" = "400" ] || [ "$code" = "409" ]; then
-                echo "asset $name already attached (HTTP $code); idempotent re-run"
-                uploaded=true
-                break
-              fi
-              echo "upload $name attempt $attempt -> HTTP $code; retrying"
-              cat /tmp/upload.out || true
-              sleep $((attempt * 3))
-            done
-            if [ "$uploaded" != "true" ]; then
-              echo "::error::failed to upload $name after retries"
-              exit 1
-            fi
-          done
-          echo "OK: release $TAG published with all assets"
+        # actions/forgejo-release (official), pinned to v2.13.4 on the
+        # instance's own mirror - the same egress-immune pattern as the
+        # actions/checkout@v4 references. Every input is passed explicitly so
+        # the action's forge.* context defaults never have to evaluate.
+        # override: true is the regexY re-run contract, and the action keeps
+        # it step for step: the stale release of the same tag is deleted, a
+        # sha-mismatched tag is deleted and re-minted at this run's commit,
+        # and the release is created as a draft that only un-drafts after
+        # every asset is attached - a failed upload cannot leave a
+        # half-populated public release.
+        uses: https://hangar.nixthedev.ru/actions/forgejo-release@v2.13.4
+        with:
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          tag: ${{ needs.version.outputs.tag }}
+          sha: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "cachette ${{ needs.version.outputs.tag }}"
+          release-dir: dist
+          override: true
+          verbose: true
