@@ -5,11 +5,13 @@
 #
 # The docker job here pushes the PR head image: a local --load build first
 # (native-runner-arch, with the binary `--version` assert), then a real publish
-# multi-arch on the flyweight `pr-<PR number>` tag. Both legs exercise the
-# cachette buildkit layer cache
-# (docker buildx `type=gha` -> acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static
-# bearer, minted per docs/clients.md; a missing/malformed/expired token is
-# RED at exporter configure time, not a mere cache miss).
+# multi-arch on the flyweight `pr-<PR number>` tag. Both legs READ the buildkit
+# layer cache from the cachette-served gha cache (`type=gha` ->
+# acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static bearer, minted per
+# docs/clients.md; reads proven) and WRITE it to the shared registry buildcache
+# tag behind the HGPR_TOKEN login: cachette's cache server speaks the v2 Twirp
+# API only, while buildx's exporter drives the legacy v1 endpoint and 401s
+# (task 125), so the old ignore-error=true gha export never saved anything.
 #
 # See push-checks.yml for the per-job notes (cargo cache, real-client toolchain
 # requirements, the static docker-compose install, tag scheme).
@@ -263,9 +265,6 @@ jobs:
     runs-on: linux-amd64
     env:
       CARGO_TERM_COLOR: always
-      CACHE_ARGS: >-
-        --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
-        --cache-to type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
@@ -300,71 +299,22 @@ jobs:
       - name: Set up QEMU
         uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3
 
-      # The buildx CLI plugin: Cache the pinned binary and skip the per-job
-      # GitHub gamble. The setup-buildx-action re-downloaded the buildx
-      # binary from github.com on EVERY job and died three times in a row
-      # on a flaky proxy window (empty ::error:: after 21s in the download
-      # group). The pin means the download is a cold, cache-evicted-miss
-      # corner case instead of a per-job dice roll.
-      - name: Cache the pinned buildx CLI
-        uses: actions/cache@v6
+      # THE build driver, back on docker/setup-buildx-action - this time from
+      # the instance's mirror (https://hangar.nixthedev.ru/docker/...), the
+      # same egress-immune pattern as the other action references. Replaces
+      # the shell-scripted buildx pin + `docker buildx create` + `rm` trio:
+      # it provisions the same pinned buildx CLI (version: v0.38.1), creates
+      # the docker-container builder, uses it in context, and removes it
+      # after the job (cleanup: true default); the per-run builder name keeps
+      # concurrent legs on one host from colliding on the daemon. The removed
+      # pin's cache is not lost: cache-binary (default true) stores the
+      # downloaded buildx binary in the Actions cache backend - the same
+      # dogfooded acc.nixthedev.ru the docker CLI cache uses - so the
+      # github.com download is a cold corner case, not a per-job dice roll.
+      - name: Set up Docker Buildx
+        uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3
         with:
-          path: /usr/local/lib/docker/cli-plugins/docker-buildx
-          key: buildx-0.38.1-${{ runner.arch }}
-
-      - name: Pin the buildx CLI
-        run: |
-          set -euo pipefail
-          # Cache hit: the pinned binary was restored - assert the docker
-          # CLI sees the plugin - skip the download.
-          if /usr/local/lib/docker/cli-plugins/docker-buildx version 2>/dev/null | grep -q 'v0.38.1'; then
-            echo "buildx present from cache: $(/usr/local/lib/docker/cli-plugins/docker-buildx version)"
-            docker buildx version
-            exit 0
-          fi
-          # The daemon may bundle its own buildx (Docker Desktop does) -
-          # version-matched against the pin, so the cache key stays honest.
-          if docker buildx version 2>/dev/null | grep -q 'v0.38.1'; then
-            echo "buildx bundled by the daemon matches the pin: $(docker buildx version)"
-            exit 0
-          fi
-          case "$(uname -m)" in
-            x86_64)  asset="buildx-v0.38.1.linux-amd64" ;;
-            aarch64) asset="buildx-v0.38.1.linux-arm64" ;;
-            *) echo "::error::unsupported arch for buildx: $(uname -m)"; exit 1 ;;
-          esac
-          url="https://github.com/docker/buildx/releases/download/v0.38.1/${asset}"
-          mkdir -p /usr/local/lib/docker/cli-plugins
-          for attempt in 1 2 3; do
-            echo "== buildx download attempt $attempt =="
-            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/lib/docker/cli-plugins/docker-buildx && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx; then
-              /usr/local/lib/docker/cli-plugins/docker-buildx version
-              exit 0
-            fi
-            rm -f /usr/local/lib/docker/cli-plugins/docker-buildx
-            echo "attempt $attempt failed; retrying"
-            sleep $((attempt * 5))
-          done
-          echo "::error::could not install the buildx CLI after 3 attempts"
-          exit 1
-
-      # Same builder contract the setup-buildx-action kept: a docker-container
-      # driver, used in context, released after the job (its `cleanup: true`).
-      # The builder name is random per attempt so concurrent legs on one host
-      # (push + PR round, re-runs) never collide on the daemon.
-      - name: Create the buildx builder
-        id: builder
-        run: |
-          set -euo pipefail
-          builder="cachette-ci-${RANDOM}${RANDOM}"
-          echo "name=${builder}" >> "$GITHUB_OUTPUT"
-          docker buildx create --name "${builder}" --driver docker-container --use
-          docker buildx inspect --bootstrap "${builder}" | sed -n '1,16p'
-        shell: bash
-
-      - name: Release the buildx builder
-        if: always()
-        run: docker buildx rm "${{ steps.builder.outputs.name }}" >/dev/null 2>&1 || true
+          version: v0.38.1
 
       # Account-wide registry token (the same credentials regexYbot's pipelines
       # use): the default GITHUB_TOKEN has no registry write on Forgejo.
@@ -376,8 +326,10 @@ jobs:
           password: ${{ secrets.HGPR_TOKEN }}
 
       # PR flyweight tag: `pr-<number>` parsed from refs/pull/<number>/merge.
-      # TAGFLAGS is what the push step publishes; LOCALFLAGS is the throwaway
-      # local tag for the --load validation + --version assert.
+      # `tags` (newline-separated, build-push-action's format) is what the
+      # push step publishes; `local_tag` is the throwaway tag for the
+      # load-validation + --version assert; `version` feeds the assert so a
+      # Cargo.toml bump can never leave it stale again.
       - name: Compute image ref + docker tags
         id: tags
         shell: bash
@@ -385,6 +337,7 @@ jobs:
           set -euo pipefail
           owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           image="hangar.nixthedev.ru/${owner}/cachette"
+          v="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/[^"]*"([^"]*)".*/\1/')"
           pr="${GITHUB_REF#refs/pull/}"
           pr="${pr%%/*}"
           case "${pr}" in
@@ -395,46 +348,66 @@ jobs:
           esac
           echo "pr=${pr}" >> "$GITHUB_OUTPUT"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${image}:pr-${pr}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "local_tag=cachette:ci-dryrun" >> "$GITHUB_OUTPUT"
           echo "verify_ref=${image}:pr-${pr}" >> "$GITHUB_OUTPUT"
-          echo "TAGFLAGS=--tag ${image}:pr-${pr}" >> "$GITHUB_ENV"
-          echo "LOCALFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
-          echo "TAGFLAGS=--tag ${image}:pr-${pr}"
+          echo "PR flyweight tag: ${image}:pr-${pr} (cachette ${v})"
 
+      # Cache policy: READ from both the cachette-served gha cache (dogfood -
+      # proven working) and the shared registry buildcache ref; WRITE to the
+      # registry only (buildx's gha exporter 401s against cachette's v2-only
+      # cache server - task 125). ignore-error=true is preserved so a cache
+      # outage still cannot fail a green build.
+
+      # Validation build: the runner's NATIVE arch (no platforms pin: buildx
+      # builds the host arch, so the validation stays native on every fleet
+      # runner, arm64 included), load: true (nothing leaves the runner),
+      # local throwaway tag; the built binary must RUN and print the exact
+      # Cargo.toml version. The multi-arch push below re-spins from the same
+      # buildkit layer cache, so this first pass makes it cheap.
       - name: Validation build
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: cachette:ci-dryrun
+          cache-from: |
+            type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
+            type=registry,ref=${{ steps.tags.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.tags.outputs.image }}:buildcache,mode=max,ignore-error=true
+
+      - name: Assert the built binary's version
         shell: bash
         run: |
           set -euo pipefail
-          # No --platform pin: buildx builds the runner's NATIVE arch, so the
-          # validation stays native on every fleet runner (arm64 included).
-          docker buildx build --load ${LOCALFLAGS} ${CACHE_ARGS} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
-          [ "$got" = "cachette 1.0.0" ]
+          # Derived from Cargo.toml in the same tags step above - a version
+          # bump can never leave this assert stale again (the hardcoded
+          # 1.0.0 went red on PR #2's 1.1.0 head, task 125, after a fully
+          # successful build).
+          [ "$got" = "cachette ${{ steps.tags.outputs.version }}" ]
 
-      # PR flyweight image: multi-arch (linux/amd64 + linux/arm64), same recipe
-      # and retries as push-checks.yml. The validation build above seeded the
-      # layer cache, so this second pass is nearly free.
+      # PR flyweight image: multi-arch (linux/amd64 + linux/arm64), the same
+      # recipe as push-checks.yml. The validation build above seeded the
+      # layer cache, so this pass is nearly free. Registry blips surface as
+      # a red job to re-run (build-push-action carries no retry ladder).
       - name: Build + push PR image
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${{ steps.tags.outputs.image }}"
-          for attempt in 1 2 3 4; do
-            echo "== buildx push attempt $attempt =="
-            if docker buildx build \
-                 --platform linux/amd64,linux/arm64 \
-                 ${TAGFLAGS} \
-                 ${CACHE_ARGS} \
-                 --push \
-                 .; then
-              echo "OK: pushed ${image}:pr-${{ steps.tags.outputs.pr }}"
-              exit 0
-            fi
-            echo "push attempt $attempt failed; retrying"
-            sleep $((attempt * 5))
-          done
-          echo "::error::multi-arch PR image push failed after 4 attempts"
-          exit 1
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: |
+            type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
+            type=registry,ref=${{ steps.tags.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.tags.outputs.image }}:buildcache,mode=max,ignore-error=true
 
       # Acceptance: the pushed pr-N tag must be a manifest list covering BOTH
       # architectures.
