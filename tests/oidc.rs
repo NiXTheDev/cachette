@@ -266,7 +266,7 @@ async fn spawn_jwks_server() -> JwksServer {
     let cert = rcgen::generate_simple_self_signed(vec![String::from("127.0.0.1")])
         .expect("test leaf cert");
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
 
     // The CA bundle flows through a real FILE (install reads from disk).
     static COUNTER: AtomicU64 = AtomicU64::new(0);

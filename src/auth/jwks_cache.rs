@@ -696,7 +696,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec![String::from("127.0.0.1")])
             .expect("test leaf cert");
         let cert_pem = cert.cert.pem();
-        let key_pem = cert.key_pair.serialize_pem();
+        let key_pem = cert.signing_key.serialize_pem();
 
         // The CA bundle passes through a real FILE on disk, so `try_new`'s
         // read path is exercised too.

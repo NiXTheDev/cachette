@@ -436,9 +436,10 @@ impl FsStorage {
                     )
                     .map_err(sql)?;
                 let rows = stmt
-                    .query_map(params![now_unix], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
+                    .query_map(
+                        [i64::try_from(now_unix).expect("unix stamp fits i64")],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
                     .map_err(sql)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
             };
@@ -947,7 +948,7 @@ impl StorageBackend for FsStorage {
                     .query_row(
                         "SELECT size, layout FROM entries WHERE id = ?1 AND complete = 1",
                         [&id],
-                        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+                        |row| Ok((sql_u64(row.get(0)?), row.get::<_, String>(1)?)),
                     )
                     .optional()
                     .map_err(sql)?;
@@ -973,7 +974,7 @@ impl StorageBackend for FsStorage {
                             .map_err(sql)?;
                         let rows = stmt
                             .query_map([id], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                                Ok((row.get::<_, String>(0)?, sql_u64(row.get(1)?)))
                             })
                             .map_err(sql)?;
                         rows.collect::<Result<Vec<_>, _>>().map_err(sql)?
@@ -1107,9 +1108,9 @@ impl StorageBackend for FsStorage {
                         |row| {
                             Ok(EntryStat {
                                 key: row.get(0)?,
-                                size: row.get(1)?,
-                                created_at: row.get(2)?,
-                                accessed_at: row.get(3)?,
+                                size: sql_u64(row.get(1)?),
+                                created_at: sql_u64(row.get(2)?),
+                                accessed_at: sql_u64(row.get(3)?),
                             })
                         },
                     )
@@ -1137,9 +1138,9 @@ impl StorageBackend for FsStorage {
                     .query_map([], |row| {
                         Ok(EntryStat {
                             key: row.get(0)?,
-                            size: row.get(1)?,
-                            created_at: row.get(2)?,
-                            accessed_at: row.get(3)?,
+                            size: sql_u64(row.get(1)?),
+                            created_at: sql_u64(row.get(2)?),
+                            accessed_at: sql_u64(row.get(3)?),
                         })
                     })
                     .map_err(sql)?;
@@ -2203,13 +2204,14 @@ fn acquire_chunk_manifest(
                 None => {
                     // Fresh at-rest content (or a same-tx release that hit
                     // 0 and dropped its row): registered at one ref.
+                    let size = i64::try_from(*chunk_size).unwrap_or(i64::MAX);
                     conn.execute(
                         "INSERT INTO chunks (id, size, refs, created_at) \
                          VALUES (?1, ?2, 1, ?3)",
-                        params![chunk_id, chunk_size, created_at],
+                        params![chunk_id, size, created_at],
                     )
                     .map_err(sql)?;
-                    added = added.saturating_add(i64::try_from(*chunk_size).unwrap_or(i64::MAX));
+                    added = added.saturating_add(size);
                     requeued(unlink);
                 }
                 Some(refs) => {
@@ -2638,6 +2640,14 @@ where
 
 fn sql(err: rusqlite::Error) -> io::Error {
     io::Error::other(err)
+}
+
+/// SQLite INTEGER column → `u64`: sizes and unix stamps are written as
+/// non-negative integers, so a negative read means a corrupt database and
+/// collapses to 0 here rather than panicking a worker thread. (rusqlite
+/// 0.41 dropped the lossy `u64: FromSql` impl; INTEGER is a signed i64.)
+fn sql_u64(int: i64) -> u64 {
+    u64::try_from(int).unwrap_or(0)
 }
 
 /// Test suite for the FS backend. The module name keeps the plan's
@@ -4047,8 +4057,8 @@ mod storage_fs {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
+                    sql_u64(row.get(1)?),
+                    sql_u64(row.get(2)?),
                 ))
             })
             .expect("query");
