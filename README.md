@@ -272,16 +272,18 @@ credential is `401 {"error":"authentication required"}`.
 | `auth.mode` | v1 `/_apis/artifactcache/*` | v2 Twirp `CacheService` | Capability URLs (`/v2/upload`, `/v2/artifacts`) |
 |---|---|---|---|
 | `hmac` | `Forgejo-Cache-*` HMAC headers only | static/dynamic bearer tokens; self-minted JWT rejected | signed `?id&exp&mac` |
-| `bearer` | `Authorization: Bearer <token>` | static/dynamic bearer token, or a self-minted HS256 JWT | signed `?id&exp&mac` |
-| `merge` | HMAC headers **or** bearer token | static/dynamic bearer token, or a self-minted HS256 JWT | signed `?id&exp&mac` |
+| `bearer` | `Authorization: Bearer <token>` — static, dynamic, or a self-minted JWT verified by signature | static/dynamic bearer token, or a self-minted HS256 JWT | signed `?id&exp&mac` |
+| `merge` | HMAC headers **or** bearer token — static, dynamic, or a self-minted JWT verified by signature | static/dynamic bearer token, or a self-minted HS256 JWT | signed `?id&exp&mac` |
 
 Notes:
 
 - A **static** token is any string in `[auth] tokens`; a **dynamic** token is
   registered at runtime through `POST /_internal/register?token=<token>` and
-  revoked with `POST /_internal/revoke?token=<token>`. Those admin routes accept
-  `Authorization: Bearer <auth.secret>`, or are loopback-only while cluster mode
-  is disabled.
+  revoked with `POST /_internal/revoke?token=<token>`. A **self-minted** JWT is
+  what `cachette token mint buildx-jwt` prints (HS256 keyed to `auth.secret`):
+  the bearer gate verifies the signature, so it needs no listing. Those admin
+  routes accept `Authorization: Bearer <auth.secret>`, or are loopback-only
+  while cluster mode is disabled.
 - The v2 capability URLs (`/v2/upload/{id}`, `/v2/artifacts/{id}`) are
   authorized **only** by their signed URL, never by a bearer token.
 - Artifact **downloads** on v1 are likewise authorized by the signed
@@ -301,7 +303,8 @@ bound into the MAC, so any change to the path, id, or expiry fails with
   runs to completion.
 - To revoke outstanding URLs and JWTs, rotate `auth.secret` (and `v2.jwt_secret`
   if you set one separately). Static bearer tokens in `[auth] tokens` are
-  unaffected unless you also change the list.
+  unaffected unless you also change the list; a token only signed by the old
+  secret stops verifying with the rotation.
 
 Keep the TTL short and rotate the secret if a URL leaks.
 

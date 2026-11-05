@@ -93,8 +93,8 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
     }
     let policy = state.auth();
     // The OIDC verifier (v1.1) is a server-level capability installed at
-    // boot; a token that fails static/store checks is attempted as an
-    // RS256 JWT when one is installed (docs/oidc.md).
+    // boot; a token that fails the static/store/signature checks is
+    // attempted as an RS256 JWT when one is installed (docs/oidc.md).
     let oidc = state.oidc();
     let authorized = match policy.mode {
         AuthMode::Hmac => hmac::verify(&policy, request.headers()),

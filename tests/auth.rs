@@ -8,7 +8,8 @@
 //! (d) a correct static bearer token is accepted,
 //! (e) a wrong token with no MAC is rejected with 401,
 //! (f) `/_internal/register` mints a live token and `/_internal/revoke`
-//!     makes it 401 again.
+//!     makes it 401 again,
+//! (g) a self-minted JWT verifies by signature — no `[auth] tokens` entry.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -135,6 +136,12 @@ fn hmac_headers(ts: i64) -> (String, String) {
     )
 }
 
+/// `Authorization: Bearer <token>` pair as owned strings, for the minted-JWT
+/// tests (`call` borrows `(name, value)` pairs of `&str`).
+fn bearer_header(token: String) -> String {
+    format!("Bearer {token}")
+}
+
 #[tokio::test]
 async fn valid_hmac_is_accepted() {
     let root = TestDir::new();
@@ -198,6 +205,53 @@ async fn wrong_token_without_mac_is_rejected() {
     let (status, body) = call(app, "GET", "/_apis/artifactcache/cache", &headers).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
     assert!(body.contains("authentication required"), "body: {body}");
+}
+
+#[tokio::test]
+async fn self_minted_jwt_is_accepted_without_static_registration() {
+    // The mint CLI signs `buildx-jwt` with `[auth].secret` and the server
+    // holds that key, so the signature alone authorizes the v1 gate: no
+    // listing in `[auth] tokens`, no TokenStore registration.
+    let root = TestDir::new();
+    let app = protected_router(state_with(root.path()));
+    let bearer = bearer_header(cachette::auth::jwt::mint(SECRET, "[]", 300, now_secs()));
+    let headers = [("authorization", bearer.as_str())];
+    let (status, body) = call(app, "GET", "/_apis/artifactcache/cache", &headers).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[tokio::test]
+async fn expired_self_minted_jwt_is_rejected() {
+    let root = TestDir::new();
+    let app = protected_router(state_with(root.path()));
+    // Claims minted 400s ago with a 300s TTL put `exp` 100s in the past;
+    // the gate's own `validate` catches the expiry.
+    let bearer = bearer_header(cachette::auth::jwt::mint(
+        SECRET,
+        "[]",
+        300,
+        now_secs() - 400,
+    ));
+    let headers = [("authorization", bearer.as_str())];
+    let (status, body) = call(app, "GET", "/_apis/artifactcache/cache", &headers).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+}
+
+#[tokio::test]
+async fn jwt_signed_by_a_foreign_secret_is_rejected() {
+    // Same shape, same claims, different key: this is the token class that
+    // still needs an explicit `[auth] tokens` listing to work.
+    let root = TestDir::new();
+    let app = protected_router(state_with(root.path()));
+    let bearer = bearer_header(cachette::auth::jwt::mint(
+        "not-the-server-secret-0123456",
+        "[]",
+        300,
+        now_secs(),
+    ));
+    let headers = [("authorization", bearer.as_str())];
+    let (status, body) = call(app, "GET", "/_apis/artifactcache/cache", &headers).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
 }
 
 #[tokio::test]

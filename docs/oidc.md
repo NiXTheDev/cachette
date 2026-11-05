@@ -28,18 +28,22 @@ bears the request through:
 
 - `auth::hmac::verify` - Forgejo `Forgejo-Cache-*` headers, staleness window
   from `[auth] hmac_max_age_seconds`;
-- `auth::bearer::verify` - static `[auth] tokens` (constant-time compare) or
-  the sqlite `TokenStore` (`/_internal/register` / `revoke`).
+- `auth::bearer::verify` - static `[auth] tokens` (constant-time compare), the
+  sqlite `TokenStore` (`/_internal/register` / `revoke`), or a self-minted
+  HS256 JWT verified by signature against `[auth].secret` (the
+  `cachette token mint buildx-jwt` shape; the server holds the key it was
+  signed with, so no `[auth] tokens` listing is required).
 
 `auth::jwt.rs` mints/validates our **self-issued HS256** shape. That primitive
-is unrelated to OIDC and stays as is: it serves the v2 Twirp gate and
-`ops::mint` for `ACTIONS_RUNTIME_TOKEN`, both of which must keep speaking the
-go-actions-cache shape.
+is unrelated to OIDC and stays as is: it serves the v1 bearer gate (verified
+by signature, no static listing), the v2 Twirp gate, and `ops::mint` for
+`ACTIONS_RUNTIME_TOKEN`, all of which must keep speaking the go-actions-cache
+shape.
 
 ## Design
 
 An `oidc` arm inside `bearer::verify`. A bearer token that fails the
-static/TokenStore checks is then attempted **as a JOSE JWT**:
+static/TokenStore/self-minted-JWT checks is then attempted **as a JOSE JWT**:
 
 1. Split and decode header + claims (base64url, no padding - same routine the
    HS256 module already has).

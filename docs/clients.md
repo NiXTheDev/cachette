@@ -133,25 +133,26 @@ docker buildx build \
 
 ## Tokens
 
-cachette accepts a bearer token two ways:
+cachette accepts a bearer token three ways:
 
 - a **static** token: any string listed in `[auth] tokens`; or
 - a **dynamic** token: registered at runtime with
   `POST /_internal/register?token=<token>` and removed with
-  `POST /_internal/revoke?token=<token>`.
+  `POST /_internal/revoke?token=<token>`; or
+- a **verified** token: a JWT whose HS256 signature verifies against
+  `[auth].secret`. The server holds the very key the token was signed
+  with, so the signature alone authorizes both the v1 routes and the
+  Twirp API (`bearer`/`merge` modes; `hmac` mode never looks at bearer
+  tokens). `[auth] tokens` listing is only needed for a token signed
+  with some other secret.
 
-Why a long-lived static bearer instead of on-demand/OIDC minting:
-
-- Forgejo Actions does not hand jobs OIDC `id_token`s (GitHub-only), and
-  `go-actions-cache` insists on its local JWT shape with the `ac` claim -
-  a generic id-token would be refused by the exporter client itself.
-- The step-cache path is already "on demand": the runner's cache proxy
-  mints per-request Forgejo HMAC headers, so no bearer is stored for it.
-- A per-run mint through `POST /_internal/register` still needs an admin
-  credential inside the job, which only relocates the same secret.
-
-So one static JWT is listed twice (forge secret + `[auth] tokens`); its
-TTL is set years out because the client enforces `exp` locally.
+Why the minted JWT still has a years-long `exp` instead of a per-run
+mint: the *client* (buildx / go-actions-cache) enforces `exp` locally
+and refuses anything but this exact claim shape, Forgejo Actions does
+not hand jobs OIDC `id_token`s, and a per-run mint through
+`/_internal/register` would need an admin credential inside the job —
+only relocating the secret. One minted JWT, exported once, is the
+deliberate shape; docs/oidc.md weighs the OIDC alternative.
 
 One important client detail: `go-actions-cache` (and therefore buildx) parses
 `ACTIONS_RUNTIME_TOKEN` locally as a JWT **before** sending any request, and
@@ -162,8 +163,8 @@ whole build at exporter configure time (`token contains an invalid number of
 segments`, `cache token expired at ...`); `ignore-error` only covers export
 failures during the build, never this parse. The simplest recipe is the
 repo's own mint, which reads `[auth].secret` from the config file for the
-HS256 key (so the printed string is ALSO a valid cachette Twirp JWT in
-`bearer`/`merge` mode):
+HS256 key (so the printed string is signed with the same key the server
+holds — the signature check authorizes it):
 
 ```bash
 cachette token mint buildx-jwt             # exp defaults to 10y
@@ -171,8 +172,8 @@ cachette token mint buildx-jwt --exp 90s   # suffixes s/m/h/d/w/y
 cachette token mint buildx-jwt --exp 3600  # bare integers count as seconds (1h)
 ```
 
-List the printed string verbatim in `[auth] tokens` and export it as the
-forge secret/export `ACTIONS_RUNTIME_TOKEN`.
+Export the printed string as the forge secret / `ACTIONS_RUNTIME_TOKEN`.
+No `[auth] tokens` entry is required: the signature check covers it.
 
 Without a cachette binary at hand, the same token minted by hand (`ac` is a
 string holding a JSON array of scopes; "[]" means no restriction; `exp` is
@@ -189,15 +190,16 @@ signature=$(printf '%s' "$header.$payload" | openssl dgst -sha256 -hmac "$secret
 printf '%s\n' "$header.$payload.$signature"
 ```
 
-Signing by hand with `auth.secret` additionally makes it a valid cachette JWT
-(accepted by the Twirp API in `bearer`/`merge` mode); listing it as a static
-token is what makes it work for the **v1** routes too.
+Signing by hand with the server's `auth.secret` makes it a verified
+cachette JWT: accepted by both the **v1** routes and the Twirp API in
+`bearer`/`merge` mode, again with no `[auth] tokens` entry. Only a token
+signed with some other secret must be listed as a static token.
 
 ```toml
 [auth]
 mode = "merge"
 secret = "change-me-to-16-plus-chars"
-tokens = ["<the JWT printed above>"]
+# tokens = []  # only list bearer strings signed with a *different* secret
 ```
 
 ## Capability URLs
