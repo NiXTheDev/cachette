@@ -267,7 +267,7 @@ jobs:
 
   # Build/checksums/release are skipped unless this run actually publishes.
   build:
-    name: build ${{ matrix.target }}
+    name: build
     runs-on: ${{ matrix.runner }}
     needs: [version]
     if: needs.version.outputs.publish == 'true'
@@ -335,9 +335,9 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Install stable Rust ${{ matrix.target }}
+      - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -345,7 +345,7 @@ jobs:
       # runners); matrix.target keeps the different std libraries apart, and
       # dtolnay's `cachekey` output pins the exact stable version.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
@@ -357,7 +357,7 @@ jobs:
         # dtolnay's rust `cachekey` (the toolchain/stdlib behind the build)
         # and the Cargo.lock hash, with a restore-keys fallback for lockfile
         # drift; cargo re-fingerprints whatever else drifted.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -371,7 +371,7 @@ jobs:
       # here (e.g. `with: { version: 0.14.1 }`) and note it in the header.
       - name: Install zig
         if: matrix.driver == 'zig'
-        uses: https://github.com/mlugg/setup-zig@v2
+        uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild
         if: matrix.driver == 'zig'
@@ -417,7 +417,7 @@ jobs:
       # in this file.
       - name: Cache xwin CRT/SDK
         if: matrix.driver == 'xwin'
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.xwin
           key: xwin-v1-${{ runner.arch }}
@@ -486,8 +486,14 @@ jobs:
           echo "OK: aarch64 glibc-linked ELF (gnu triple proven)"
 
       # ---- Smoke: cross Windows artifact ----
-      # file(1) may be absent from the runner's Git Bash - run it when present,
-      # then ALWAYS assert the PE COFF machine field below (stronger/equal proof).
+      # file(1) may be absent from the runner's Git Bash - print its output
+      # when present. NO grep on `file`'s wording here: the version string
+      # for the AMD64 build says `x86-64`, not a keyword any arm64 grep
+      # would match, and relying on it therefore failed the x86_64 leg
+      # silently-turned-red (task 162). The assertion lives verbatim in the
+      # PE machine step below, which runs unconditionally and reads the
+      # COFF machine field per target - strictly stronger than any `file`
+      # wording.
       - name: Smoke - cross windows artifact file
         if: matrix.smoke == 'cross-windows'
         shell: bash
@@ -496,7 +502,6 @@ jobs:
           if command -v file >/dev/null 2>&1; then
             echo "file(1) output:"
             file "$bin"
-            file "$bin" | grep -qiE "arm64|aarch64"
           else
             echo "file(1) not on this runner - PE machine asserted in the next step"
           fi
@@ -556,8 +561,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}${suffix}"
           ls -l dist
 
-      - name: Upload ${{ matrix.artifact }}
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      - name: Upload binary artifact
+        uses: https://hangar.nixthedev.ru/forgejo/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
@@ -570,7 +575,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all built binaries
-        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -593,7 +598,7 @@ jobs:
           fi
 
       - name: Upload SHA256SUMS
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/upload-artifact@v4
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
@@ -607,7 +612,7 @@ jobs:
     # Release publish needs `contents: write` - granted via Authorized Integrations.
     steps:
       - name: Download every built binary + SHA256SUMS
-        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true

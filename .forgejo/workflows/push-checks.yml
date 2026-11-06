@@ -84,17 +84,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install rustfmt toolchain
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -109,15 +109,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -127,7 +127,7 @@ jobs:
         # keep separate targets like rust-cache's default isolation), pinned
         # on dtolnay's rust `cachekey` + the Cargo.lock hash, with a
         # restore-keys fallback for lockfile drift.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -143,24 +143,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install clippy toolchain
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           components: clippy
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -177,15 +177,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -193,7 +193,7 @@ jobs:
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: https://hangar.nixthedev.ru/actions/setup-node@v4
         with:
           node-version: "20"
           # Built-in restore-at-start/store-at-end of the npm tarballs via the
@@ -201,7 +201,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: tests/fixtures/package-lock.json
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
           go-version: "1.25"
       # Both setup steps above cache through the toolkit natively
@@ -211,7 +211,7 @@ jobs:
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -239,22 +239,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -280,7 +280,7 @@ jobs:
       # push-checks minutes later. The mirror is the hazard - drop it, don't
       # retry it.
       - name: Cache the pinned docker-compose binary
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
           key: docker-compose-5.6.0-${{ runner.arch }}
@@ -332,7 +332,7 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
       - name: Cache the pinned docker CLI
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/bin/docker
           key: docker-cli-28.0.4-${{ runner.arch }}
