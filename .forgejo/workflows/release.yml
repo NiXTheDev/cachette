@@ -98,14 +98,18 @@
 #     legs) is involved. A cross-built PE cannot execute on the Linux
 #     runner, so the artifacts are verified structurally: the PE COFF
 #     machine field must be 0x8664 (x86_64) or 0xAA64 (ARM64) - the exact
-#     fact `file(1)` would report; a `file`-based check runs too whenever
-#     `file` exists on the runner.
+#     fact `file(1)` reports. `file`'s output is printed for context when
+#     the tool exists; the assertion itself is always the PE machine step
+#     (grepping `file`'s wording reds the x86_64 leg - it classifies AMD64
+#     as `x86-64`, which no arm64 keyword grep matches, task 162).
 #
 # Smoke tests: the native linux-x86_64-musl artifact RUNs and asserts
-# `cachette 1.0.0` on `--version`; the cross artifacts (aarch64-musl, both
-# windows legs) cannot execute on the runner, so they are verified
-# structurally instead - `file`(1)/`uname` on linux, the PE machine field
-# asserted unconditionally on windows (`file` too whenever present).
+# `cachette <Cargo.toml version>` on `--version`; the cross artifacts
+# (aarch64-musl, both windows legs) cannot execute on the runner, so they
+# are verified structurally instead - `file`(1)/`uname` on linux, the PE
+# machine field asserted unconditionally on windows (`file` too whenever
+# present) - derived from Cargo.toml, so the version bump never needs a
+# workflow edit.
 #
 # =============================================================================
 # PUBLISHING (plan task 53): the forge release + its binaries. Binaries +
@@ -228,7 +232,7 @@ jobs:
 
   # Build/checksums/release are skipped unless this run actually publishes.
   build:
-    name: build ${{ matrix.target }}
+    name: build
     runs-on: ${{ matrix.os }}
     needs: [version]
     if: needs.version.outputs.publish == 'true'
@@ -264,9 +268,9 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Install stable Rust ${{ matrix.target }}
+      - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -274,7 +278,7 @@ jobs:
       # runners); matrix.target keeps the different std libraries apart, and
       # dtolnay's `cachekey` output pins the exact stable version.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}
@@ -286,7 +290,7 @@ jobs:
         # dtolnay's rust `cachekey` (the toolchain/stdlib behind the build)
         # and the Cargo.lock hash, with a restore-keys fallback for lockfile
         # drift; cargo re-fingerprints whatever else drifted.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -300,7 +304,7 @@ jobs:
       # here (e.g. `with: { version: 0.14.1 }`) and note it in the header.
       - name: Install zig
         if: matrix.zigbuild == true
-        uses: https://github.com/mlugg/setup-zig@v2
+        uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild
         if: matrix.zigbuild == true
@@ -315,13 +319,16 @@ jobs:
         if: matrix.smoke == 'run'
         shell: bash
         run: |
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           chmod +x "$bin" || true
           command -v file >/dev/null 2>&1 && file "$bin"
           got="$("$bin" --version | tr -d '\r')"
           echo "cachette --version => [$got]"
-          if [ "$got" != "cachette 1.0.0" ]; then
-            echo "::error::expected exactly 'cachette 1.0.0', got '$got'"
+          want="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/[^"]*"([^"]*)".*/\1/')"
+          echo "Cargo.toml version => [$want]"
+          if [ "$got" != "cachette $want" ]; then
+            echo "::error::expected 'cachette $want' (Cargo.toml), got '$got'"
             exit 1
           fi
 
@@ -342,8 +349,14 @@ jobs:
           echo "OK: aarch64 musl STATIC artifact, host is x86_64 (cross build proven)"
 
       # ---- Smoke: cross Windows artifact ----
-      # file(1) may be absent from the runner's Git Bash - run it when present,
-      # then ALWAYS assert the PE COFF machine field below (stronger/equal proof).
+      # file(1) may be absent from the runner's Git Bash - print its output
+      # when present. NO grep on `file`'s wording here: the version string
+      # for the AMD64 build says `x86-64`, not a keyword any arm64 grep
+      # would match, and relying on it therefore failed the x86_64 leg
+      # silently-turned-red (task 162). The assertion lives verbatim in the
+      # PE machine step below, which runs unconditionally and reads the
+      # COFF machine field per target - strictly stronger than any `file`
+      # wording.
       - name: Smoke - cross windows artifact file
         if: matrix.smoke == 'cross-windows'
         shell: bash
@@ -352,7 +365,6 @@ jobs:
           if command -v file >/dev/null 2>&1; then
             echo "file(1) output:"
             file "$bin"
-            file "$bin" | grep -qiE "arm64|aarch64"
           else
             echo "file(1) not on this runner - PE machine asserted in the next step"
           fi
@@ -412,8 +424,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}${suffix}"
           ls -l dist
 
-      - name: Upload ${{ matrix.artifact }}
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      - name: Upload binary artifact
+        uses: https://hangar.nixthedev.ru/forgejo/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
@@ -426,7 +438,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all built binaries
-        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -449,7 +461,7 @@ jobs:
           fi
 
       - name: Upload SHA256SUMS
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/upload-artifact@v4
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
@@ -463,7 +475,7 @@ jobs:
     # Release publish needs `contents: write` - granted via Authorized Integrations.
     steps:
       - name: Download every built binary + SHA256SUMS
-        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        uses: https://hangar.nixthedev.ru/forgejo/download-artifact@v4
         with:
           path: dist
           merge-multiple: true

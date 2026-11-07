@@ -42,7 +42,15 @@
 # (same gcc 15.2.0, alpine 3.24.3 userland vs 3.24.2) ICE'd in gcc during the
 # CI compile of libsqlite3-sys' bundled sqlite3.c with no standalone repro.
 # Retry the bump on a fresh Alpine/gcc point release.
-FROM rust:1.98-alpine AS builder
+#
+# Digest-pinned on top of the tag: the docker jobs' last external-host
+# dependency is docker.io's blob CDN (production.cloudfront.docker.com),
+# which EOF'd the 1.0.0-class docker legs mid-build. The pin lets the
+# workflows' pre-pull ladder warm the host store for the EXACT manifest
+# buildkit needs, so a republished `1.98-alpine` upstream cannot revolve
+# under us mid-fleet. To bump: `docker manifest inspect rust:1.98-alpine`,
+# then replace the digest here AND in both workflows' pre-pull steps.
+FROM rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
 
 # gcc/musl-dev: C toolchain for rusqlite/bundled (SQLite C) + ring.
 # file(1): build-time static-link assertion.

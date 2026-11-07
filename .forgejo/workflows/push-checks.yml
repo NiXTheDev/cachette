@@ -80,17 +80,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install rustfmt toolchain
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -105,15 +105,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -123,7 +123,7 @@ jobs:
         # keep separate targets like rust-cache's default isolation), pinned
         # on dtolnay's rust `cachekey` + the Cargo.lock hash, with a
         # restore-keys fallback for lockfile drift.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -139,24 +139,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install clippy toolchain
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
           components: clippy
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -173,15 +173,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
@@ -189,7 +189,7 @@ jobs:
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing).
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: https://hangar.nixthedev.ru/actions/setup-node@v4
         with:
           node-version: "20"
           # Built-in restore-at-start/store-at-end of the npm tarballs via the
@@ -197,7 +197,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: tests/fixtures/package-lock.json
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
           go-version: "1.25"
       # Both setup steps above cache through the toolkit natively
@@ -207,7 +207,7 @@ jobs:
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -235,22 +235,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: https://hangar.nixthedev.ru/actions/checkout@v4
       - name: Install stable Rust
         id: toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+        uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact stable version,
       # so the next stable bump retargets the cache by itself.
       - name: Cache rustup toolchains
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -276,7 +276,7 @@ jobs:
       # push-checks minutes later. The mirror is the hazard - drop it, don't
       # retry it.
       - name: Cache the pinned docker-compose binary
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/bin/docker-compose
           key: docker-compose-5.6.0-${{ runner.arch }}
@@ -331,6 +331,14 @@ jobs:
       # cache outages DURING the build; a missing/malformed/expired token
       # instead fails exporter CONFIGURATION and the job goes red (seen
       # live: "invalid number of segments" on a random-bytes token).
+      #
+      # CACHE_FROM (reads only) feeds the socket-native builds: the default
+      # docker driver may IMPORT gha/registry caches. CACHE_ARGS additionally
+      # exports (from+to) for the multi-arch step's container fallback - the
+      # docker driver cannot EXPORT without the containerd image store, and
+      # cache-export config failures are NOT covered by ignore-error=true.
+      CACHE_FROM: >-
+        --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
       CACHE_ARGS: >-
         --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
         --cache-to type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
@@ -339,7 +347,7 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
       - name: Cache the pinned docker CLI
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/bin/docker
           key: docker-cli-28.0.4-${{ runner.arch }}
@@ -372,6 +380,36 @@ jobs:
       - name: Set up QEMU
         uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3
 
+      # The builder base is the one thing the docker jobs still haul through
+      # EXTERNAL hosts: docker.io's blob CDN (production.cloudfront.docker.com)
+      # EOF'd per-layer repeatedly while the registry API itself resolves.
+      # The socket's native builder consults the host image store FIRST, so a
+      # completed pull here short-circuits buildkit's blob transport for the
+      # validation build and both native per-arch pushes. Docker Hub pre-signs
+      # fresh blob URLs each attempt and docker pull carries its own internal
+      # retries - a plain attempt ladder with backoff absorbs the CDN class.
+      # The digest is the Dockerfile's pinned index (bump both together).
+      - name: Pre-pull the builder base (CDN-retry ladder)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="rust:1.98-alpine"
+          digest="sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f"
+          ok=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            echo "== base pull attempt $attempt =="
+            if docker pull "docker.io/library/${base}@${digest}"; then
+              ok=1
+              break
+            fi
+            sleep $((attempt * 3))
+          done
+          if [ "$ok" -ne 1 ] && docker image inspect "library/${base}@${digest}" >/dev/null 2>&1; then
+            echo "::warning::base pull failed on all attempts - proceeding with the locally held pinned copy"
+            ok=1
+          fi
+          [ "$ok" -eq 1 ] || { echo "::error::builder base unavailable after the full pull ladder"; exit 1; }
+
       # The buildx CLI plugin: Cache the pinned binary and skip the per-job
       # GitHub gamble. The setup-buildx-action re-downloaded the buildx
       # binary from github.com on EVERY job and died three times in a row
@@ -379,7 +417,7 @@ jobs:
       # group). The pin means the download is a cold, cache-evicted-miss
       # corner case instead of a per-job dice roll.
       - name: Cache the pinned buildx CLI
-        uses: actions/cache@v6
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/lib/docker/cli-plugins/docker-buildx
           key: buildx-0.38.1-${{ runner.arch }}
@@ -420,23 +458,13 @@ jobs:
           echo "::error::could not install the buildx CLI after 3 attempts"
           exit 1
 
-      # Same builder contract the setup-buildx-action kept: a docker-container
-      # driver, used in context, released after the job (its `cleanup: true`).
-      # The builder name is random per attempt so concurrent legs on one host
-      # (push + PR round, re-runs) never collide on the daemon.
-      - name: Create the buildx builder
-        id: builder
-        run: |
-          set -euo pipefail
-          builder="cachette-ci-${RANDOM}${RANDOM}"
-          echo "name=${builder}" >> "$GITHUB_OUTPUT"
-          docker buildx create --name "${builder}" --driver docker-container --use
-          docker buildx inspect --bootstrap "${builder}" | sed -n '1,16p'
-        shell: bash
-
-      - name: Release the buildx builder
-        if: always()
-        run: docker buildx rm "${{ steps.builder.outputs.name }}" >/dev/null 2>&1 || true
+      # Builder model, socket-native edition: the DEFAULT (docker) builder -
+      # the buildkit engine inside the persistent host dockerd - serves the
+      # validation build and both per-arch pushes; its build cache survives
+      # jobs on the same host, so warm runners skip base transports and
+      # recompiles entirely. The docker-container builder from the old
+      # setup-buildx contract is created on demand ONLY inside the
+      # multi-arch step's container fallback (built, used, released there).
 
       # Account-wide registry token (the same credentials regexYbot's pipelines
       # use): the default GITHUB_TOKEN has no registry write on Forgejo.
@@ -491,6 +519,13 @@ jobs:
           echo "TAGFLAGS=${flags# }" >> "$GITHUB_ENV"
           echo "TAGFLAGS=${flags# }" >> "$GITHUB_OUTPUT"
           echo "LOCALFLAGS=--tag cachette:ci-dryrun" >> "$GITHUB_ENV"
+          # Newline list for the native path's client-side manifest merge
+          # (docker manifest create takes one tag per published ref).
+          {
+            echo "tag_list<<EOF"
+            for s in ${suffixes}; do echo "${image}:${s}"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "verify_ref=${verify}" >> "$GITHUB_OUTPUT"
 
       # Validation build BEFORE anything is pushed: the runner's NATIVE arch
@@ -504,36 +539,100 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build --load ${LOCALFLAGS} ${CACHE_ARGS} .
+          # No --platform pin: buildx builds the runner's NATIVE arch, so the
+          # validation stays native on every fleet runner (arm64 included).
+          # Builder: the socket's default (docker driver) - the buildkit that
+          # lives inside the PERSISTENT host dockerd. Its build cache survives
+          # jobs on the same host, so warm runners skip base transports
+          # (cloufront EOF class) and recompiles entirely. Reads-only on
+          # cache: the docker driver imports gha caches but cannot EXPORT
+          # without the containerd image store - the container fallback
+          # keeps cache-export duty (see the multi-arch step).
+          docker buildx build --builder default --load ${LOCALFLAGS} ${CACHE_FROM} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
-          [ "$got" = "cachette 1.0.0" ]
+          # Derived from Cargo.toml in the tags step - a version bump can
+          # never leave this assert stale (the hardcoded 1.0.0 went red on
+          # the 1.1 head, task 125).
+          [ "$got" = "cachette ${{ steps.tags.outputs.version }}" ]
 
-      # THE multi-arch push (linux/amd64 + linux/arm64) - every branch push
-      # publishes with its ref's tag scheme. Retried so a transient
-      # registry/network blip does NOT fail an otherwise-green build; the
-      # validation build above seeded the shared layer cache.
+      # THE multi-arch publish (linux/amd64 + linux/arm64) - every branch push
+      # publishes with its ref's tag scheme. Tried on the socket's native
+      # builder FIRST (proven locally: Desktop/native driver built the full
+      # dual-arch manifest list, binfmt handled arm64, cargo cache-mounts
+      # kept the compile in the ~30s class): rung 1 is a single multi-platform
+      # --push invocation (works outright where the containerd image store is
+      # on), rung 2 is the classic-store-safe route - per-arch builds on the
+      # native driver + client-side `docker manifest` merge - and rung 3 is
+      # the old per-run buildkit container with its retry ladder and
+      # cache-export rights. `docker` native runs READ caches only (gha).
       - name: Build + push multi-arch manifest
         shell: bash
         run: |
           set -euo pipefail
           image="${{ steps.tags.outputs.image }}"
+          amd="${image}:ci-amd64"
+          arm="${image}:ci-arm64"
+
+          # Rung 1: one multi-platform build ending in a pushed manifest list.
+          if (
+            set -euo pipefail
+            docker buildx build --builder default \
+              --platform linux/amd64,linux/arm64 \
+              ${TAGFLAGS} ${CACHE_FROM} --push .
+          ); then
+            echo "OK: pushed ${image} via the native multi-platform build (Cargo.toml v${{ steps.tags.outputs.version }})"
+            exit 0
+          fi
+          echo "::warning::native multi-platform try rejected/died - stepping to rung 2: per-arch + manifest merge"
+
+          # Rung 2: classic-store-safe. Each arch builds on the native driver
+          # (warm local cache), gets pushed under a scratch ci-<arch> tag, and
+          # the manifest list itself is assembled client-side.
+          if (
+            set -euo pipefail
+            docker buildx build --builder default --platform linux/amd64 -t "$amd" ${CACHE_FROM} .
+            docker buildx build --builder default --platform linux/arm64 -t "$arm" ${CACHE_FROM} .
+            docker push "$amd"
+            docker push "$arm"
+            export DOCKER_CLI_EXPERIMENTAL=enabled
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              docker manifest create "$tag" "$amd" "$arm"
+              docker manifest push "$tag"
+              echo "OK: $tag -> manifest list (linux/amd64 + linux/arm64)"
+            done <<< "${{ steps.tags.outputs.tag_list }}"
+          ); then
+            echo "OK: pushed ${image} via per-arch native builds + manifest merge (Cargo.toml v${{ steps.tags.outputs.version }})"
+            exit 0
+          fi
+          echo "::warning::per-arch native route failed - falling back to the buildkit-container driver"
+
+          # Rung 3: the original setup-buildx contract, unchanged:
+          # docker-container driver, random name, retry ladder, full
+          # cache-export duties (gha mode=max). Released on the way out.
+          builder="cachette-ci-${RANDOM}${RANDOM}"
+          cleanup() { docker buildx rm "${builder}" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker buildx create --name "${builder}" --driver docker-container --use
+          docker buildx inspect --bootstrap "${builder}" | sed -n '1,16p'
+          ok=0
           for attempt in 1 2 3 4; do
-            echo "== buildx push attempt $attempt =="
+            echo "== container push attempt $attempt =="
             if docker buildx build \
-                 --platform linux/amd64,linux/arm64 \
-                 ${TAGFLAGS} \
-                 ${CACHE_ARGS} \
-                 --push \
-                 .; then
-              echo "OK: pushed ${image} (tags for Cargo.toml v${{ steps.tags.outputs.version }})"
-              exit 0
+                --platform linux/amd64,linux/arm64 \
+                ${TAGFLAGS} \
+                ${CACHE_ARGS} \
+                --push \
+                .; then
+              echo "OK: pushed ${image} via the container builder (Cargo.toml v${{ steps.tags.outputs.version }})"
+              ok=1
+              break
             fi
             echo "push attempt $attempt failed; retrying"
             sleep $((attempt * 5))
           done
-          echo "::error::multi-arch push failed after 4 attempts"
-          exit 1
+          [ "$ok" -eq 1 ] || { echo "::error::multi-arch push failed on all three rungs"; exit 1; }
 
       # Acceptance: the pushed head tag must be a manifest list covering BOTH
       # architectures (the version tag on `release`, the moving `dev` tag
