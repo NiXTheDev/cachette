@@ -335,15 +335,17 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Install stable Rust
+      - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99
           targets: ${{ matrix.target }}
 
       # Cache the per-target toolchain + std libs (the slow rustup leg on these
       # runners); matrix.target keeps the different std libraries apart, and
-      # dtolnay's `cachekey` output pins the exact stable version.
+      # dtolnay's `cachekey` output pins the exact toolchain version
+      # (pinned: 1.99, the version the battery + docker base validate).
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:

@@ -5,13 +5,13 @@
 #
 # The docker job here pushes the PR head image: a local --load build first
 # (native-runner-arch, with the binary `--version` assert), then a real publish
-# multi-arch on the flyweight `pr-<PR number>` tag. Both legs READ the buildkit
-# layer cache from the cachette-served gha cache (`type=gha` ->
+# multi-arch on the flyweight `pr-<PR number>` tag. The native builds READ the
+# buildkit layer cache from the cachette-served gha cache (`type=gha` ->
 # acc.nixthedev.ru; `CACHETTE_BUILDX_JWT` static bearer, minted per
-# docs/clients.md; reads proven) and WRITE it to the shared registry buildcache
-# tag behind the HGPR_TOKEN login: cachette's cache server speaks the v2 Twirp
-# API only, while buildx's exporter drives the legacy v1 endpoint and 401s
-# (task 125), so the old ignore-error=true gha export never saved anything.
+# docs/clients.md) plus the durable on-disk snapshot
+# (~/.cache/cachette-buildkit) refreshed after a successful push; only the
+# last-resort buildkit-container fallback exports gha (mode=max,
+# ignore-error=true). There is no registry buildcache.
 #
 # See push-checks.yml for the per-job notes (cargo cache, real-client toolchain
 # requirements, the static docker-compose install, tag scheme).
@@ -41,10 +41,33 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99
           components: rustfmt
+      # The component fetch is its own network leg and rustup carries no
+      # ladder (run 5's fmt died in 14s when the toolchain host EOF'd
+      # mid-`rustup component add`, and 992ba8e's fmt/check/clippy legs
+      # relapsed the same class). `rustup component add` no-ops in ~1s
+      # when the component is already in place, so the common path pays
+      # nothing; a poisoned/rejected fetch gets three retries with backoff
+      # and a loud tool-level error instead of a bare rustup wall.
+      - name: Ensure the components landed (retry ladder)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4; do
+            if rustup component add rustfmt; then
+              cargo fmt --version
+              exit 0
+            fi
+            echo "component add attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::rustfmt was not fetched after 4 attempts"
+          exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
-      # runners); dtolnay's `cachekey` output pins the exact stable version,
-      # so the next stable bump retargets the cache by itself.
+      # runners); dtolnay's `cachekey` output pins the exact toolchain
+      # version (pinned: 1.99, the version the battery + docker base
+      # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -62,12 +85,15 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
-      - name: Install stable Rust
+      - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99
       # Restore the rustup toolchains dir (the ~20-25 min download on these
-      # runners); dtolnay's `cachekey` output pins the exact stable version,
-      # so the next stable bump retargets the cache by itself.
+      # runners); dtolnay's `cachekey` output pins the exact toolchain
+      # version (pinned: 1.99, the version the battery + docker base
+      # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -100,10 +126,27 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99
           components: clippy
+      # Same component-fetch ladder as the fmt job (docs above).
+      - name: Ensure the components landed (retry ladder)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4; do
+            if rustup component add clippy; then
+              cargo clippy --version
+              exit 0
+            fi
+            echo "component add attempt $attempt failed; retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::clippy was not fetched after 4 attempts"
+          exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
-      # runners); dtolnay's `cachekey` output pins the exact stable version,
-      # so the next stable bump retargets the cache by itself.
+      # runners); dtolnay's `cachekey` output pins the exact toolchain
+      # version (pinned: 1.99, the version the battery + docker base
+      # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -130,12 +173,15 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
-      - name: Install stable Rust
+      - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99
       # Restore the rustup toolchains dir (the ~20-25 min download on these
-      # runners); dtolnay's `cachekey` output pins the exact stable version,
-      # so the next stable bump retargets the cache by itself.
+      # runners); dtolnay's `cachekey` output pins the exact toolchain
+      # version (pinned: 1.99, the version the battery + docker base
+      # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -184,12 +230,15 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
-      - name: Install stable Rust
+      - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99
       # Restore the rustup toolchains dir (the ~20-25 min download on these
-      # runners); dtolnay's `cachekey` output pins the exact stable version,
-      # so the next stable bump retargets the cache by itself.
+      # runners); dtolnay's `cachekey` output pins the exact toolchain
+      # version (pinned: 1.99, the version the battery + docker base
+      # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -262,9 +311,23 @@ jobs:
   docker:
     name: docker
     needs: test
-    runs-on: linux-amd64
+    runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # CACHE_FROM feeds the socket-native builds (docker driver can import
+      # gha caches). CACHE_ARGS additionally exports (from+to) for the
+      # multi-arch step's container fallback - the docker driver cannot
+      # EXPORT caches without the containerd image store, plus the
+      # exporter-config failures are not covered by ignore-error=true.
+      # LOCALCACHE is filled in by the seed step below from the durable
+      # on-disk snapshot (written by snapshot_local_cache in the multi-arch
+      # step); it is the only cache that survives gha outages and dockerd
+      # builder prunes.
+      CACHE_FROM: >-
+        --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
+      CACHE_ARGS: >-
+        --cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
+        --cache-to type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
@@ -419,36 +482,31 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "local_tag=cachette:ci-dryrun" >> "$GITHUB_OUTPUT"
           echo "verify_ref=${image}:pr-${pr}" >> "$GITHUB_OUTPUT"
-          # Newline tag list for the native path's client-side manifest merge,
-          # plus the cache flags: native builds IMPORT caches (gha + the
-          # registry buildcache) but cannot EXPORT without the containerd
-          # image store - CACHE_WRITE rides the multi-arch step's container
-          # fallback exclusively.
+          # Newline tag list for the native path's client-side manifest merge.
           {
             echo "tag_list<<EOF"
             echo "${image}:pr-${pr}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "CACHE_FROM<<EOF"
-            echo "--cache-from type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }} --cache-from type=registry,ref=${image}:buildcache"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-          {
-            echo "CACHE_WRITE<<EOF"
-            echo "--cache-to type=registry,ref=${image}:buildcache,mode=max,ignore-error=true"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
           echo "PR flyweight tag: ${image}:pr-${pr} (cachette ${v})"
 
-      # Cache policy: READ from both the cachette-served gha cache (dogfood -
-      # proven working) and the shared registry buildcache ref (CACHE_FROM,
-      # set in the tags step); WRITE to the registry only, from the container
-      # builder fallback alone (CACHE_WRITE): buildx's gha exporter 401s
-      # against cachette's v2-only cache server, and the socket's default
-      # docker driver cannot export non-inline caches without the containerd
-      # image store (task 125). ignore-error=true is preserved so a cache
-      # outage still cannot fail a green build.
+      # Durability net for the native builder: the host dockerd's buildkit
+      # keeps its cache warm across jobs, but a dockerd restart or a builder
+      # prune wipes it. The on-disk snapshot written by snapshot_local_cache
+      # (multi-arch step) survives both and needs no network, so seed the
+      # import flag from it whenever the directory exists.
+      - name: Seed the local buildkit cache flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="${HOME}/.cache/cachette-buildkit"
+          if [ -d "${dir}" ]; then
+            echo "LOCALCACHE=--cache-from type=local,src=${dir}" >> "$GITHUB_ENV"
+            echo "local buildkit cache snapshot found at ${dir}"
+          else
+            echo "LOCALCACHE=" >> "$GITHUB_ENV"
+            echo "no local buildkit cache snapshot yet - building cold (gha cache still applies)"
+          fi
 
       # Validation build: the runner's NATIVE arch (no platforms pin: buildx
       # builds the host arch, so the validation stays native on every fleet
@@ -462,12 +520,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Reads only: the docker driver imports gha/registry caches but
-          # cannot EXPORT without the containerd image store - CACHE_WRITE
-          # rides the multi-arch step's container fallback.
+          # Reads only: gha plus the on-disk LOCALCACHE snapshot; the docker
+          # driver cannot EXPORT without the containerd image store - the
+          # guarded snapshot helper and the container fallback keep export
+          # duty (multi-arch step).
           docker buildx build --builder default --load \
             --tag cachette:ci-dryrun \
-            ${CACHE_FROM} .
+            ${CACHE_FROM} ${LOCALCACHE} .
           got="$(docker run --rm cachette:ci-dryrun --version)"
           echo "cachette --version => [$got]"
           # Derived from Cargo.toml in the tags step - a version bump can
@@ -478,8 +537,8 @@ jobs:
       # PR flyweight image: multi-arch (linux/amd64 + linux/arm64), the same
       # socket-native ladder as push-checks.yml: native-builder try FIRST
       # (single multi-platform rung, then per-arch + client manifest merge),
-      # and the per-run buildkit container with its retry ladder + full
-      # cache-export duties strictly as the last resort.
+      # and the per-run buildkit container with its retry ladder + gha
+      # exports strictly as the last resort.
       - name: Build + push PR image
         shell: bash
         run: |
@@ -493,15 +552,36 @@ jobs:
             tagflags="${tagflags} --tag ${tag}"
           done <<< "${{ steps.tags.outputs.tag_list }}"
 
+          # Durable local cache snapshot: after a successful native publish,
+          # replay the build with a local cache export and swap the result
+          # into place. The docker driver may refuse cache exports without
+          # the containerd image store - that is a warning, never a failure,
+          # and the previous snapshot stays intact on a refused/failed export.
+          local_dir="${HOME}/.cache/cachette-buildkit"
+          snapshot_local_cache() {
+            local tmp="${local_dir}.new"
+            rm -rf "${tmp}"
+            if docker buildx build --builder default \
+                --cache-to "type=local,dest=${tmp}" . && [ -d "${tmp}" ]; then
+              rm -rf "${local_dir}"
+              mv "${tmp}" "${local_dir}"
+              echo "OK: local buildkit cache snapshot refreshed at ${local_dir}"
+            else
+              rm -rf "${tmp}"
+              echo "::warning::local buildkit cache export unavailable on this builder - keeping the previous snapshot (if any)"
+            fi
+          }
+
           # Rung 1: one multi-platform build ending in a pushed manifest list.
           if (
             set -euo pipefail
             docker buildx build --builder default \
               --platform linux/amd64,linux/arm64 \
               ${tagflags} \
-              ${CACHE_FROM} --push .
+              ${CACHE_FROM} ${LOCALCACHE} --push .
           ); then
             echo "OK: pushed ${image}:pr-${{ steps.tags.outputs.pr }} via the native multi-platform build"
+            snapshot_local_cache
             exit 0
           fi
           echo "::warning::native multi-platform try rejected/died - stepping to rung 2: per-arch + manifest merge"
@@ -509,8 +589,8 @@ jobs:
           # Rung 2: classic-store-safe per-arch route + client-side merge.
           if (
             set -euo pipefail
-            docker buildx build --builder default --platform linux/amd64 -t "$amd" ${CACHE_FROM} .
-            docker buildx build --builder default --platform linux/arm64 -t "$arm" ${CACHE_FROM} .
+            docker buildx build --builder default --platform linux/amd64 -t "$amd" ${CACHE_FROM} ${LOCALCACHE} .
+            docker buildx build --builder default --platform linux/arm64 -t "$arm" ${CACHE_FROM} ${LOCALCACHE} .
             docker push "$amd"
             docker push "$arm"
             export DOCKER_CLI_EXPERIMENTAL=enabled
@@ -522,14 +602,15 @@ jobs:
             done <<< "${{ steps.tags.outputs.tag_list }}"
           ); then
             echo "OK: pushed ${image}:pr-${{ steps.tags.outputs.pr }} via per-arch native builds + manifest merge"
+            snapshot_local_cache
             exit 0
           fi
           echo "::warning::per-arch native route failed - falling back to the buildkit-container driver"
 
           # Rung 3: the setup-buildx contract, shell-scripted: docker-container
-          # driver, random name, retry ladder, and the ONLY cache-export duty
-          # (registry buildcache, mode=max; ignore-error=true). Released on
-          # the way out via trap.
+          # driver, random name, retry ladder, and the only cache-export duty
+          # (gha mode=max via CACHE_ARGS; ignore-error=true). Released on the
+          # way out via trap.
           builder="cachette-ci-${RANDOM}${RANDOM}"
           cleanup() { docker buildx rm "${builder}" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -541,7 +622,7 @@ jobs:
             if docker buildx build \
                 --platform linux/amd64,linux/arm64 \
                 ${tagflags} \
-                ${CACHE_FROM} ${CACHE_WRITE} \
+                ${CACHE_ARGS} \
                 --push \
                 .; then
               echo "OK: pushed ${image}:pr-${{ steps.tags.outputs.pr }} via the container builder"
