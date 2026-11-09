@@ -420,10 +420,28 @@ jobs:
           restore-keys: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
 
       # ---- zig driver legs (windows gnu/gnullvm only) ----
-      # If a zig release ever regresses cargo-zigbuild, pin a known-good one
-      # here (e.g. `with: { version: 0.14.1 }`) and note it in the header.
-      - name: Install zig
+      # The zig distro fetch is a bare network leg with no ladder of its
+      # own: the first cut died mid-tarball on the default mirror
+      # (task 409, `::error::terminated` ~73s after the fetch began,
+      # before cargo-zigbuild ever ran), with no build.zig.zon in this
+      # repo to pin the version on top of it. So the install becomes a
+      # two-rung ladder - the same continue-on-error + outcome gate shape
+      # as the docker publish rungs: primary fetch from the machengine
+      # community mirror, then the action's default vault only if the
+      # primary failed. Both steps resolve the version the same way
+      # (empty input -> latest from the mirror's own index). If a zig
+      # release ever regresses cargo-zigbuild, pin a known-good one on
+      # BOTH steps (e.g. `version: 0.14.1`) and note it in the header.
+      - name: Install zig (machengine mirror)
+        id: zig1
         if: matrix.driver == 'zig'
+        continue-on-error: true
+        uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
+        with:
+          mirror: https://pkg.machengine.org/zig
+
+      - name: Install zig (default vault retry)
+        if: matrix.driver == 'zig' && steps.zig1.outcome == 'failure'
         uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild
