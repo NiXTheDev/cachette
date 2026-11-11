@@ -386,6 +386,18 @@ jobs:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
+      # Alpine runners (the musl targets' userland) boot their action
+      # container from node:24-alpine, which ships NEITHER bash NOR git -
+      # so the first bash-requiring composite below (the rust install)
+      # exec-127'd before anything else ran (task 515:
+      # `exec: "bash": executable file not found in $PATH`), and the
+      # checkout fell back to REST tarball mode. One sh-safe apk step
+      # restores the same toolbox every debian leg already assumes.
+      # Deliberately no `shell:` pin: this must run under busybox sh.
+      - name: Alpine runner prerequisites
+        if: matrix.userland == 'alpine'
+        run: apk add --no-cache bash git
+
       - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable

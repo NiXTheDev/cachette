@@ -73,8 +73,29 @@ COPY cachette.example.toml ./cachette.example.toml
 
 # Cache mounts keep the ~190-crate dependency build cached across local
 # iterations; the binary is version- and static-checked before staging.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+#
+# gcc-15.2.0 sqlite3.c ceiling (see the 1.99/1.98 base note above):
+# cc-rs derives its -O from cargo's OPT_LEVEL; at -O3 the CI runners'
+# gcc (Alpine) 15.2.0 segfaulted in cc1 on every cold amd64 attempt -
+# four occurrences across runs 502/558, same file + line (168163,
+# whereAddIndexedExpr). Not reproducible locally from toolchain+input
+# alone (probe record in the PR body), so the trigger is taken as
+# runner-environmental; the profile override caps cc-rs at -O2
+# (structural: no -O3 is ever emitted) as a structured pressure
+# reducer, while RUSTFLAGS re-claims -O3 for rustc itself - cargo
+# appends RUSTFLAGS after the profile flags, so the shipped binary
+# keeps -O3 codegen.
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+ENV RUSTFLAGS="-Copt-level=3"
+#
+# Both mounts carry sharing=locked: buildkit's shared default lets a
+# multi-arch build's two platform workers run cargo CONCURRENTLY into
+# one cache mount - the witness of the rung-3 deaths in 502/558
+# ("failed to unpack ... .cargo-ok: File exists (os error 17)" after an
+# earlier leg's cargo was killed mid-unpack). locked = the second
+# mount claim waits behind the first; slower worst-case, correct always.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked && \
     ./target/release/cachette --version && \
     file target/release/cachette | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked' && \
