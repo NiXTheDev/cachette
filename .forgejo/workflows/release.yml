@@ -391,12 +391,16 @@ jobs:
       # so the first bash-requiring composite below (the rust install)
       # exec-127'd before anything else ran (task 515:
       # `exec: "bash": executable file not found in $PATH`), and the
-      # checkout fell back to REST tarball mode. One sh-safe apk step
-      # restores the same toolbox every debian leg already assumes.
+      # checkout fell back to REST tarball mode. It also ships NO curl:
+      # the rust-toolchain composite itself fetches rustup through curl
+      # (tasks 626/628: `curl: command not found` at the composite's
+      # line 3, exit 127, dead 35s in - both musl legs, every roll).
+      # One sh-safe apk step restores the same toolbox every debian leg
+      # already assumes.
       # Deliberately no `shell:` pin: this must run under busybox sh.
       - name: Alpine runner prerequisites
         if: matrix.userland == 'alpine'
-        run: apk add --no-cache bash git
+        run: apk add --no-cache bash git curl
 
       - name: Install pinned Rust (1.99)
         id: toolchain
@@ -432,61 +436,43 @@ jobs:
           restore-keys: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
 
       # ---- zig driver legs (windows gnu/gnullvm only) ----
-      # zig cc (behind cargo-zigbuild) is the only zig usage in these legs,
-      # so the install is hand-rolled and RESUMABLE by design: the action
-      # fetch (mlugg/setup-zig@v2) died mid-tarball on BOTH of its routes
-      # (task 409 default vault; task 461 the machengine-mirror primary
-      # AND the vault retry) with undici's ::error::terminated at ~72s -
-      # a ~50MB response body never survives a pass through these
-      # runners' egress whole. curl --retry-all-errors + -C - turns every
-      # cut into a Range resume instead of a failure, and the outer round
-      # ladder caps the fight. The completed tarball is sha256-verified
-      # against the pinned values (read off ziglang.org's
-      # download/index.json), extracted into the tool cache and published
-      # on PATH (the same mechanism setup-zig used); a matching install on
-      # a warm runner short-circuits the fetch. setup-zig's global zig
-      # package-cache blob belongs to `zig build`, which these legs never
-      # run - nothing else is lost. Version PINNED: a bump means changing
-      # the version + BOTH shasums together (and re-watching the
-      # cargo-zigbuild contract; see the TOOLCHAIN JUSTIFICATION header
-      # notes).
-      - name: Install zig (resumable pinned fetch)
+      # zig cc (behind cargo-zigbuild) is the only zig usage in these legs.
+      # History: the hand-rolled resumable curl ladder that stood here
+      # (PR #7) lost to the runners' egress wall - connections die
+      # mid-transfer at varying offsets, resume re-enters the wall, and
+      # which source is fast varies by host and hour (verified live:
+      # linus.dev 8.9 MB/s from one host but <4 KB/s from two others,
+      # alexrp the reverse, and an 8-second clean ziglang.org fetch on a
+      # runner landed between two walled attempts). So the install returns
+      # to STOCK mlugg/setup-zig - mirrored to hangar (all tags
+      # byte-identical to upstream shas) and deliberately UNPATCHED so its
+      # 8-hourly upstream sync stays safe. What it buys: ziglang.org's
+      # live community-mirror list (embedded fallback if ziglang.org is
+      # itself unreachable), shuffled, every mirror tried before
+      # ziglang.org as the last resort, and a minisign signature verified
+      # against Zig's upstream key on every tarball - the signature's
+      # trusted comment also binds the tarball filename, which exceeds
+      # the old sha256 pins. Accepted trade: its Node fetcher has no
+      # speed-based abort, so a trickling mirror still burns and rotation
+      # only rescues after connection death; exposure is bounded by the
+      # persistent tool cache (use-tool-cache defaults on for self-hosted
+      # runners) - at most ONE cold fetch per runner per version, then a
+      # warm short-circuit. use-cache stays false: the global zig package
+      # cache blob belongs to `zig build`, which these legs never run
+      # (same judgment the hand-rolled step recorded - nothing else is
+      # lost). cargo-zigbuild locates zig via PATH (CARGO_ZIGBUILD_ZIG_PATH,
+      # default `zig`) - it never self-installs, so something upstream of
+      # it must always put zig in place. Version PINNED via the `version:`
+      # input: an explicit version skips ziglang.org's index.json
+      # entirely; a bump means changing this one line (and re-watching
+      # the cargo-zigbuild contract; see the TOOLCHAIN JUSTIFICATION
+      # header notes).
+      - name: Install zig
         if: matrix.driver == 'zig'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="0.14.1"
-          case "$(uname -m)" in
-            x86_64)  pkg="x86_64-linux";  sha="24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c";;
-            aarch64) pkg="aarch64-linux"; sha="f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b";;
-            *) echo "::error::unsupported zig host arch: $(uname -m)"; exit 1 ;;
-          esac
-          cache_root="${RUNNER_TOOL_CACHE:-${HOME}/.cache/cachette-toolcache}"
-          dir="${cache_root}/zig-${version}"
-          tmp="${RUNNER_TEMP:-/tmp}/zig-${pkg}-${version}.tar.xz"
-          if [ -x "${dir}/zig" ]; then
-            echo "OK: reusing the cached zig tree at ${dir}"
-          else
-            url="https://ziglang.org/download/${version}/zig-${pkg}-${version}.tar.xz"
-            rm -f "${tmp}"
-            round=1
-            while ! curl -fSL --connect-timeout 20 --retry 8 --retry-all-errors --retry-delay 2 -C - -o "${tmp}" "${url}"; do
-              round=$((round + 1))
-              if [ "${round}" -gt 4 ]; then
-                echo "::error::the zig tarball never completed (4 outer rounds of 8 resumable retries each)"
-                exit 1
-              fi
-              echo "zig tarball round ${round}: resuming the fetch"
-              sleep 3
-            done
-            echo "${sha}  ${tmp}" | sha256sum -c -
-            rm -rf "${dir}"
-            mkdir -p "${dir}"
-            tar -xJf "${tmp}" -C "${dir}" --strip-components=1
-            echo "OK: extracted the sha256-verified zig tree to ${dir}"
-          fi
-          "${dir}/zig" version
-          echo "${dir}" >> "$GITHUB_PATH"
+        uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
+        with:
+          version: "0.14.1"
+          use-cache: false
 
       - name: Install cargo-zigbuild
         if: matrix.driver == 'zig'
