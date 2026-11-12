@@ -2163,7 +2163,16 @@ mod storage_fs {
             }
         });
 
-        for _ in 0..1_000 {
+        // The scratch file appears only after the spawned task clears the
+        // chunk lock, the gate read, and two blocking-pool round trips
+        // (reservation query + parts listing) before it even opens the
+        // file. The old 1 s window (1000 x 1 ms) was tuned for an idle
+        // workstation and starved on loaded CI: release run 91 fired this
+        // assert while the whole lib suite ran ~36x slower than locally.
+        // 30 s stays bounded but leaves real headroom. The wait is
+        // load-bearing: the abort below must land mid-copy, not pre-open,
+        // or the cleanup assertions would pass vacuously.
+        for _ in 0..30_000 {
             if scratch.exists() {
                 break;
             }

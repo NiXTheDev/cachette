@@ -130,10 +130,35 @@
 #       * windows gnu  - zigbuild as before (zig cc drives mingw-w64; the
 #                        arm64 leg is gnullvm per the paragraph above; no
 #                        windows machines exist to cross FROM)
-#       * windows msvc - cargo-xwin per the recipe above (~1 GiB CRT/SDK
-#                        cached at ~/.xwin per runner arch); clang/lld/cmake/
-#                        nasm installed per leg
+#       * windows msvc - cargo-xwin per the recipe above (clang-cl backend
+#                        for x86_64: ~1 GiB CRT/SDK; clang backend for
+#                        aarch64: prebuilt windows-msvc-sysroot - both
+#                        cached per runner arch under ~/.cache/cargo-xwin);
+#                        clang/lld/cmake/nasm installed per leg
 #     The scratch/musl OCI image decision stands unchanged.
+#
+#     UPDATE (v1.2, 2026-11-12): the aarch64-pc-windows-msvc leg cannot use
+#     the default clang-cl driver - ring 0.17.14's build.rs (configure_cc)
+#     force-replaces the cc-resolved compiler with plain GNU `clang` for
+#     windows+aarch64 whenever it is not clang-LIKE, and cc-rs 1.9.0's
+#     is_like_clang() matches only GNU-style ToolFamily::Clang (clang-cl is
+#     is_like_clang_cl(), a separate predicate). cargo-xwin's cl-style
+#     CFLAGS (/imsvc <dir>) therefore reach a compiler that treats /imsvc
+#     as an input file and every ring object fails: "clang: error: no such
+#     file or directory: '/imsvc'" x5 per file, exit 101 (release run 89,
+#     task 673; target-inherent, reproduces on every host). Fix: that leg
+#     alone builds with XWIN_CROSS_COMPILER=clang (matrix xwin_backend) -
+#     the backend designed for this case: GNU-style flags against the
+#     PREBUILT windows-msvc-sysroot from trcrsired/windows-msvc-sysroot
+#     GitHub releases (asset URL resolved via api.github.com
+#     releases/latest; fallback pinned to the 2026-01-16 release; ~233-287
+#     MiB; 3 download retries; DONE-marker cache;
+#     XWIN_MSVC_SYSROOT_DOWNLOAD_URL overrides for pinning). x86_64-msvc
+#     stays clang-cl (no ring force there; its .asm goes through nasm).
+#     Also fixed in passing: the xwin cache path was ~/.xwin - cargo-xwin
+#     never used it (its root is ~/.cache/cargo-xwin), so that cache
+#     silently no-op'ed every run; path corrected, key bumped
+#     xwin-v1 -> xwin-v2.
 #
 # Local-dev limitation (recorded by task 36): the dev workstation has NO
 # zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
@@ -373,12 +398,18 @@ jobs:
           - runner: linux-amd64
             target: x86_64-pc-windows-msvc
             driver: xwin
+            xwin_backend: clang-cl
             artifact: cachette-x86_64-pc-windows-msvc
             bin: cachette.exe
             smoke: cross-windows
           - runner: linux-arm64
             target: aarch64-pc-windows-msvc
             driver: xwin
+            # ring 0.17.14 force-replaces the compiler with GNU clang on
+            # windows+aarch64, so the default clang-cl driver can NEVER
+            # work on this leg - see the Build step below and the
+            # TOOLCHAIN JUSTIFICATION header (UPDATE v1.2).
+            xwin_backend: clang
             artifact: cachette-aarch64-pc-windows-msvc
             bin: cachette.exe
             smoke: cross-windows
@@ -506,6 +537,9 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ---- xwin driver legs (windows msvc): cargo-xwin, header's recipe ----
+      # clang ships both driver binaries; lld provides lld-link (the linker
+      # cargo-xwin points rustc at), llvm the llvm-lib shim source, nasm is
+      # ring's x86_64 .asm assembler, cmake covers cmake-rs crates.
       - name: Install msvc cross prerequisites
         if: matrix.driver == 'xwin'
         run: |
@@ -513,22 +547,48 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends clang llvm lld cmake nasm
 
-      # ~1 GiB CRT/SDK; cache per runner arch + recipe version so content
-      # bumps (xwin updates changing the SDK layout) are done as v1 -> v2
-      # in this file.
-      - name: Cache xwin CRT/SDK
+      # cargo-xwin's real cache root is ~/.cache/cargo-xwin
+      # (dirs::cache_dir() + "cargo-xwin"): ~/.cache/cargo-xwin/xwin holds
+      # the clang-cl backend's ~1 GiB CRT/SDK, and
+      # ~/.cache/cargo-xwin/windows-msvc-sysroot the clang backend's ~233
+      # MiB prebuilt sysroot. The old key cached ~/.xwin - a path
+      # cargo-xwin never used, so this cache was a silent no-op and every
+      # run re-downloaded (run 89: 5m51s CRT fetch on the arm64 runner).
+      # Key bumps on recipe/content changes: v1 -> v2 here.
+      - name: Cache xwin CRT/SDK + msvc sysroot
         if: matrix.driver == 'xwin'
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
-          path: ~/.xwin
-          key: xwin-v1-${{ runner.arch }}
+          path: ~/.cache/cargo-xwin
+          key: xwin-v2-${{ runner.arch }}
 
       - name: Install cargo-xwin
         if: matrix.driver == 'xwin'
         run: cargo install cargo-xwin --locked
 
+      # Backend split (xwin_backend in the matrix): x86_64 keeps the
+      # default clang-cl driver. aarch64 MUST take the clang driver:
+      # ring 0.17.14's build.rs (configure_cc) unconditionally replaces the
+      # cc-resolved compiler with plain GNU `clang` whenever
+      # target.os == windows && target.arch == aarch64 and the compiler is
+      # not clang-LIKE - and cc-rs' is_like_clang() matches ONLY GNU-style
+      # ToolFamily::Clang (clang-cl answers is_like_clang_cl(), a separate
+      # predicate), so the force fires even though cargo-xwin set
+      # CC=clang-cl. clang-cl's cl-style CFLAGS (/imsvc <dir>) then reach a
+      # compiler that treats /imsvc as an input file and every ring object
+      # fails: "clang: error: no such file or directory: '/imsvc'" x5 per
+      # file, exit 101 (release run 89, task 673) - target-inherent, not
+      # runner roulette. The clang driver was built for exactly this:
+      # CC=clang with GNU-style flags (--target=<triple> -fuse-ld=lld-link
+      # -I<sysroot>/include ...) and rustflags -C linker-flavor=lld-link +
+      # -defaultlib:oldnames + -Lnative=<sysroot>/lib/aarch64-unknown-
+      # windows-msvc, fed by the prebuilt windows-msvc-sysroot (see the
+      # cache step). The `||` guard keeps clap's env parsing happy if a
+      # future leg omits the field.
       - name: Build
         if: matrix.driver == 'xwin'
+        env:
+          XWIN_CROSS_COMPILER: ${{ matrix.xwin_backend || 'clang-cl' }}
         run: cargo xwin build --release --locked --target ${{ matrix.target }}
 
       # ---- Smoke: native artifacts actually RUN --version ----
