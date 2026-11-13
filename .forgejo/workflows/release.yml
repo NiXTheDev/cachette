@@ -61,7 +61,8 @@
 # Goal: fully STATIC `*-unknown-linux-musl` binaries that run on any Linux
 # distro without glibc-version coupling. A musl build needs (a) musl libc,
 # (b) a linker + C toolchain for the C code pulled in by dependencies
-# (`rusqlite/bundled` compiles SQLite C; `ring` has C/asm; cc-rs in general):
+# (`rusqlite/bundled` compiles SQLite C; aws-lc-sys has C/asm; cc-rs in
+# general):
 #
 #   * `x86_64-unknown-linux-musl` is a SELF-CONTAINED rustc target (rustup
 #     ships its own libc.a) - it only needs a linker, so it would build with
@@ -159,6 +160,39 @@
 #     never used it (its root is ~/.cache/cargo-xwin), so that cache
 #     silently no-op'ed every run; path corrected, key bumped
 #     xwin-v1 -> xwin-v2.
+#
+#     UPDATE (v1.3, 2026-11-13): the v1.2 backend split is retired - ring
+#     left the dependency graph entirely. ring 0.17.14 was activated ONLY
+#     through rcgen's default feature set (`cargo tree -i ring -e normal
+#     --target all` printed exactly one path: ring <- rcgen <- cachette);
+#     rcgen now builds default-features=false with crypto/pem/aws_lc_rs -
+#     the backend rustls' default provider already uses - so aws-lc-rs is
+#     the single crypto backend of the whole tree (lock diff: one rcgen
+#     dep edge, "ring" -> "aws-lc-rs"; ring absent on EVERY target;
+#     cachette's rcgen usage - KeyPair/PKCS_ED25519/CertificateParams -
+#     is backend-agnostic, no source change). Consequences:
+#       * aarch64-pc-windows-msvc returns to the DEFAULT clang-cl driver
+#         (xwin_backend: clang-cl, same as x86_64). The v1.2 ring
+#         force-replace is moot without ring, and the clang driver's
+#         prebuilt windows-msvc-sysroot is what actually failed run 96 on
+#         this leg: aws-lc's hrss.c needs GNU vector semantics (`a + b` on
+#         uint16x8_t) that the MSVC-style arm64_neon.h unions deny, the
+#         sysroot ships zero uppercase-cased Windows headers
+#         (`Windows.h: file not found`), and its -L-laden CFLAGS trip
+#         aws-lc's -Werror capability probes. clang-cl + the REAL
+#         Microsoft arm64 CRT/SDK that the xwin crate fetches bypasses
+#         all three: aws-lc-sys itself requires clang-cl for
+#         aarch64-pc-windows-msvc (builder/cc_builder.rs), and upstream
+#         aws-lc-rs CI proves the exact cargo-xwin + clang-cl +
+#         aarch64-pc-windows-msvc combination (aws/aws-lc-rs
+#         .github/workflows/cross.yml, ubuntu-latest host). Both msvc
+#         legs now run ONE identical recipe (packages, driver, cache
+#         shape); only the CRT/SDK flavor differs per runner arch.
+#       * The prebuilt windows-msvc-sysroot download path (clang driver)
+#         is no longer exercised by any leg; ~/.cache/cargo-xwin/xwin is
+#         the only cache content the xwin driver fetches (arm64 flavor
+#         fetched once on the arm64 runner, then cached under
+#         xwin-v2-arm64).
 #
 # Local-dev limitation (recorded by task 36): the dev workstation has NO
 # zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
@@ -405,11 +439,11 @@ jobs:
           - runner: linux-arm64
             target: aarch64-pc-windows-msvc
             driver: xwin
-            # ring 0.17.14 force-replaces the compiler with GNU clang on
-            # windows+aarch64, so the default clang-cl driver can NEVER
-            # work on this leg - see the Build step below and the
-            # TOOLCHAIN JUSTIFICATION header (UPDATE v1.2).
-            xwin_backend: clang
+            # Default clang-cl driver, same as the x86_64 leg: ring left
+            # the tree (rcgen flipped to its aws_lc_rs crypto backend,
+            # header UPDATE v1.3), so the v1.2 force-replace hazard is
+            # gone and aws-lc gets the driver it requires on ARM64.
+            xwin_backend: clang-cl
             artifact: cachette-aarch64-pc-windows-msvc
             bin: cachette.exe
             smoke: cross-windows
@@ -517,7 +551,7 @@ jobs:
       - name: Install musl build prerequisites
         if: matrix.driver == 'native' && matrix.userland == 'alpine'
         # The Dockerfile builder's exact recipe: gcc + musl-dev for the C
-        # deps (sqlite3.c, ring), file(1) for the smoke assertions.
+        # deps (sqlite3.c, aws-lc), file(1) for the smoke assertions.
         run: apk add --no-cache gcc musl-dev file
 
       - name: Install glibc build prerequisites
@@ -538,8 +572,10 @@ jobs:
 
       # ---- xwin driver legs (windows msvc): cargo-xwin, header's recipe ----
       # clang ships both driver binaries; lld provides lld-link (the linker
-      # cargo-xwin points rustc at), llvm the llvm-lib shim source, nasm is
-      # ring's x86_64 .asm assembler, cmake covers cmake-rs crates.
+      # cargo-xwin points rustc at), llvm the llvm-lib/llvm-ar shims the
+      # build scripts resolve, nasm covers aws-lc-sys's x86_64 asm fallback
+      # (its prebuilt NASM objects normally win; ring's .asm needs went
+      # away with UPDATE v1.3), cmake covers cmake-rs crates.
       - name: Install msvc cross prerequisites
         if: matrix.driver == 'xwin'
         run: |
@@ -549,12 +585,14 @@ jobs:
 
       # cargo-xwin's real cache root is ~/.cache/cargo-xwin
       # (dirs::cache_dir() + "cargo-xwin"): ~/.cache/cargo-xwin/xwin holds
-      # the clang-cl backend's ~1 GiB CRT/SDK, and
-      # ~/.cache/cargo-xwin/windows-msvc-sysroot the clang backend's ~233
-      # MiB prebuilt sysroot. The old key cached ~/.xwin - a path
-      # cargo-xwin never used, so this cache was a silent no-op and every
-      # run re-downloaded (run 89: 5m51s CRT fetch on the arm64 runner).
-      # Key bumps on recipe/content changes: v1 -> v2 here.
+      # the clang-cl backend's ~1 GiB CRT/SDK - since UPDATE v1.3 the ONLY
+      # cache content any leg fetches (arm64 runner: arm64 flavor,
+      # fetched once then cached under xwin-v2-arm64). The
+      # windows-msvc-sysroot path (v1.2 clang driver's prebuilt sysroot,
+      # ~233 MiB) retired with that backend. The old key cached ~/.xwin -
+      # a path cargo-xwin never used, so that cache was a silent no-op
+      # and every run re-downloaded (run 89: 5m51s CRT fetch on the arm64
+      # runner). Key bumps on recipe/content changes: v1 -> v2 here.
       - name: Cache xwin CRT/SDK + msvc sysroot
         if: matrix.driver == 'xwin'
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -566,25 +604,26 @@ jobs:
         if: matrix.driver == 'xwin'
         run: cargo install cargo-xwin --locked
 
-      # Backend split (xwin_backend in the matrix): x86_64 keeps the
-      # default clang-cl driver. aarch64 MUST take the clang driver:
-      # ring 0.17.14's build.rs (configure_cc) unconditionally replaces the
-      # cc-resolved compiler with plain GNU `clang` whenever
-      # target.os == windows && target.arch == aarch64 and the compiler is
-      # not clang-LIKE - and cc-rs' is_like_clang() matches ONLY GNU-style
-      # ToolFamily::Clang (clang-cl answers is_like_clang_cl(), a separate
-      # predicate), so the force fires even though cargo-xwin set
-      # CC=clang-cl. clang-cl's cl-style CFLAGS (/imsvc <dir>) then reach a
-      # compiler that treats /imsvc as an input file and every ring object
-      # fails: "clang: error: no such file or directory: '/imsvc'" x5 per
-      # file, exit 101 (release run 89, task 673) - target-inherent, not
-      # runner roulette. The clang driver was built for exactly this:
-      # CC=clang with GNU-style flags (--target=<triple> -fuse-ld=lld-link
-      # -I<sysroot>/include ...) and rustflags -C linker-flavor=lld-link +
-      # -defaultlib:oldnames + -Lnative=<sysroot>/lib/aarch64-unknown-
-      # windows-msvc, fed by the prebuilt windows-msvc-sysroot (see the
-      # cache step). The `||` guard keeps clap's env parsing happy if a
-      # future leg omits the field.
+      # Backend (xwin_backend in the matrix): BOTH msvc legs run the
+      # default clang-cl driver since UPDATE v1.3. History (why the knob
+      # exists at all): ring 0.17.14's build.rs (configure_cc)
+      # unconditionally replaces the cc-resolved compiler with plain GNU
+      # `clang` whenever target.os == windows && target.arch == aarch64
+      # and the compiler is not clang-LIKE - and cc-rs' is_like_clang()
+      # matches ONLY GNU-style ToolFamily::Clang (clang-cl answers
+      # is_like_clang_cl(), a separate predicate) - so while ring was in
+      # the tree, clang-cl's cl-style CFLAGS (/imsvc <dir>) reached a
+      # compiler that treats /imsvc as an input file and every ring
+      # object failed: "clang: error: no such file or directory:
+      # '/imsvc'" x5 per file, exit 101 (release run 89, task 673) -
+      # target-inherent, not runner roulette. UPDATE v1.3 removed ring
+      # from the graph via rcgen's aws_lc_rs backend, the aarch64 leg
+      # returned to the default driver, and the clang driver +
+      # prebuilt-windows-msvc-sysroot combination that failed run 96 on
+      # aws-lc (hrss.c GNU vector semantics vs MSVC arm64_neon.h unions;
+      # sysroot header casing; -L CFLAGS under aws-lc's -Werror probes)
+      # is no longer exercised by any leg. The `||` guard keeps clap's
+      # env parsing happy if a future leg omits the field.
       - name: Build
         if: matrix.driver == 'xwin'
         env:
