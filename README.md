@@ -8,14 +8,16 @@ the runner-facing endpoints, the other serves the clustering needs (see
 [Clustering](./docs/cluster.md)).
 
 - Blobs live on the local filesystem under a directory you choose; metadata and
-  usage accounting live in a SQLite file beside them.
-- Auth is a shared secret: Forgejo HMAC headers, bearer tokens, or both.
+  usage accounting live in a SQLite file beside them - schema-versioned, with
+  verified migrations and a refuse-newer-than-binary check on upgrade.
+- Auth is a shared secret: Forgejo HMAC headers, bearer tokens, or both - with
+  optional OIDC bearer verification against your own IdP.
 - Optional peer-to-peer clustering discovers nodes, tracks capacity, and places
   a cache write on the least-loaded healthy owner.
 
 > **Dogfooded.** cachette serves cachette: this project's own CI uses a live
-> deployment as the `docker buildx` layer cache for every build (see
-> [CI & releases](#ci--releases)).
+> deployment as the `docker buildx` layer cache and the `actions/cache`
+> backend for every build (see [CI & releases](#ci--releases)).
 
 ## Features
 
@@ -34,6 +36,14 @@ the runner-facing endpoints, the other serves the clustering needs (see
   owner over pinned mTLS (the blob bytes never touch the entry node).
 - **Self-signed node identity.** First boot mints an Ed25519 keypair and
   certificate; the fingerprint is stable across restarts and storage wipes.
+- **Content-defined chunk dedup (opt-in).** `[storage.cdc]` splits uploads with
+  a FastCDC-style Gear splitter (algo pinned `gear-fastcdc-v1`, default 128 KiB
+  average chunk) so overlapping cache entries share chunk storage. Off by
+  default and byte-identical to the v1.0 layout when off; a background backfill
+  walker converges existing whole-blob entries when you flip it on.
+- **OIDC bearer auth.** `[auth.oidc]` verifies RS256 bearer JWTs against your
+  IdP's JWKS: kid routing, periodic prefetch + lazy singleflight on unknown
+  kids, per-issuer HTTPS, structural rejections fail closed.
 
 ## Quickstart
 
@@ -81,7 +91,7 @@ the runner-facing endpoints, the other serves the clustering needs (see
 
    ```bash
    curl http://127.0.0.1:8080/health
-   # {"version":"1.0.0","node_id":"<64-hex fingerprint>"}
+   # {"version":"1.1.0","node_id":"<64-hex fingerprint>"}
    ```
 
    `GET /metrics` on the same listener returns the Prometheus text-format
@@ -137,6 +147,10 @@ reference, valid-value notes, and examples.
 | `storage` | `backend` | `fs` | `fs` |
 | `storage.fs` | `path` | blob root directory | `/var/lib/cachette` |
 | `storage.fs` | `min_free` | fraction (`0.2`), percent (`"20%"`), or bytesize (`"2GiB"`/`"2GB"`, 1024-based) | `0.2` |
+| `storage.cdc` | `enabled` | boolean | `false` |
+| `storage.cdc` | `avg_chunk_bytes` | target average chunk size, capped `[32768, 1048576]` | `131072` |
+| `storage.cdc` | `backfill` | converge existing whole-blob entries when enabled | `true` |
+| `storage.cdc` | `backfill_delay_ms` | pause between conversions, must be `> 0` | `100` |
 | `cache` | `max_size` | bytes, `0` = unlimited | `0` |
 | `cache` | `eviction` | `lru`, `oldest`, `none` | `lru` |
 | `cache` | `key_case` | `lower`, `preserve` | `preserve` |
@@ -145,6 +159,12 @@ reference, valid-value notes, and examples.
 | `auth` | `secret` | 16+ characters, required to serve | unset |
 | `auth` | `tokens` | list of static bearer tokens | `[]` |
 | `auth` | `hmac_max_age_seconds` | seconds, `0` = disabled | `600` |
+| `auth.oidc` | `enabled` | boolean | `false` |
+| `auth.oidc` | `issuers` | list of HTTPS issuer URLs | unset |
+| `auth.oidc` | `audiences` | list of accepted `aud` values (any overlap) | unset |
+| `auth.oidc` | `jwks_urls` | map of issuer to JWKS endpoint | derived per issuer |
+| `auth.oidc` | `require` | map of claim to required value(s) | `{}` |
+| `auth.oidc` | `jwks_refresh_seconds` | periodic JWKS prefetch interval, `> 0` | `1800` |
 | `v1` | `signed_url_ttl_seconds` | seconds (governs v1 and v2 capability URLs) | `900` |
 | `v2` | `jwt_secret` | HS256 secret (falls back to `auth.secret`) | unset |
 | `v2` | `jwt_ttl_seconds` | seconds (governs the Twirp JWT) | `300` |
@@ -197,7 +217,8 @@ connections. Reloadable: `[auth]` (`mode`, `secret`, `tokens`,
 numbers (`max_size`, `min_free`, `reservation_ttl_seconds`, `key_case`,
 `signed_url_ttl_seconds`, `max_chunk_bytes`), and `[log] level`. Boot-only
 (listener, storage backend and data directory, cluster wiring, `[v2]` JWT
-secret) — restart to change. A malformed file is rejected and the previous
+secret, `[auth.oidc]` — reload keeps the boot OIDC verifier) — restart to
+change. A malformed file is rejected and the previous
 config stays in effect. See
 [docs/configuration.md](docs/configuration.md#live-reload).
 
@@ -259,7 +280,7 @@ Options:
 - `verify`, `cache`, and `gc` take an exclusive lock on the data directory and
   refuse with a clear message while a server (or another ops command) holds it.
   `doctor` and `token mint` never touch the data directory and do not lock.
-- `cachette --version` prints `cachette 1.0.0`.
+- `cachette --version` prints `cachette 1.1.0`.
 - A configuration error exits with status `2`.
 
 ## Authentication
@@ -284,6 +305,11 @@ Notes:
   the bearer gate verifies the signature, so it needs no listing. Those admin
   routes accept `Authorization: Bearer <auth.secret>`, or are loopback-only
   while cluster mode is disabled.
+- **OIDC** (when `[auth.oidc]` is set): a bearer JWT from a configured issuer
+  is accepted after RS256 verification against that issuer's JWKS, with
+  audience overlap required; `alg`/`kid`/issuer mismatches fail closed. The
+  v1 gate's chain is static -> dynamic -> self-minted JWT -> OIDC. See
+  [docs/oidc.md](docs/oidc.md).
 - The v2 capability URLs (`/v2/upload/{id}`, `/v2/artifacts/{id}`) are
   authorized **only** by their signed URL, never by a bearer token.
 - Artifact **downloads** on v1 are likewise authorized by the signed
@@ -346,6 +372,12 @@ no usable multicast interface). See [docs/cluster.md](docs/cluster.md).
   WireGuard) and rate limiting at the proxy.
 - [docs/encrypted-storage.md](docs/encrypted-storage.md) - encrypting the
   storage volume with LUKS, ZFS, or BitLocker.
+- [docs/cdc.md](docs/cdc.md) - content-defined chunking: layouts, dedup,
+  backfill migration, GC, and rollout.
+- [docs/oidc.md](docs/oidc.md) - OIDC bearer auth: issuers, audiences, JWKS
+  wiring, and the acceptance chain.
+- [docs/image-stitching.md](docs/image-stitching.md) - assembling multi-arch
+  images with the cache in the loop.
 
 ### CI & releases
 
@@ -356,15 +388,17 @@ tests including the v1 + v2 real-client round-trips (`node`/`npm`/`go` must be
 present or the job fails), the example-config/compose lint, and the multi-node
 cluster suites - followed by the docker job: a registry-published multi-arch
 image (`linux/amd64` + `linux/arm64`) on EVERY branch push - `release` carries
-the bare-semver tags `1.0.0`/`1.0`/`1` + `latest` + `release` read from
+the bare-semver tags `1.1.0`/`1.1`/`1` + `latest` + `release` read from
 `Cargo.toml`, other branches carry the regexY-style dev scheme
 (`dev`/`latest`/`<version>-dev` + truncations, with `latest` tracking dev
 between releases), and PR runs publish a flyweight `pr-<number>` tag. Both
 legs share a buildkit layer cache served by cachette itself (docker buildx
 `type=gha` against the `acc.nixthedev.ru` cache; an unset
-`CACHETTE_BUILDX_JWT` only means cache misses, never failures). `release.yml`
+`CACHETTE_BUILDX_JWT` only means cache misses, never failures). The
+`actions/cache@v6` steps (rustup toolchains, the cargo registry/target cache,
+the xwin SDK) ride a cachette-served cache endpoint as well. `release.yml`
 runs on `v*` tags and on pushes to the `release` branch: it cross-compiles the
-four targets (linux/windows x amd64/arm64), writes `SHA256SUMS`, and attaches
+eight targets (linux gnu+musl, windows gnu/msvc/gnullvm; amd64+arm64), writes `SHA256SUMS`, and attaches
 the binaries + checksums to a release tagged `v<version>` - the pushed tag on a
 tag build, or `Cargo.toml`'s package version on a `release`-branch build.
 Merging a `feat/*` pull request into `release` therefore fires both pipelines
@@ -375,7 +409,6 @@ at once: the image publish and the release cut.
 These are intentionally out of scope for this version; cachette does not
 advertise or require them:
 
-- Chunk-level (content-addressed) deduplication between cache entries.
 - Server-side (on-the-fly) compression of blob contents.
 - Application-level encryption of blobs (transport is TLS, not the Noise
   protocol). Encrypt the storage volume instead (see
