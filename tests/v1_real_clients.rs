@@ -79,6 +79,10 @@ const TOOLKIT_KEY: &str = "cachette-task22-toolkit";
 const GO_KEY: &str = "cachette-task22-go";
 const MISS_KEY: &str = "cachette-task22-never-saved";
 
+/// Retry budget for the toolkit restore's transient-connection tolerance in
+/// `run_scenarios` (the block there carries the full evidence).
+const RESTORE_ATTEMPTS: usize = 3;
+
 /// A scratch directory removed on drop.
 struct Scratch {
     root: PathBuf,
@@ -648,13 +652,35 @@ async fn run_scenarios() -> Result<Outcome, String> {
     ));
 
     // Last: the toolkit restore deletes and must recreate `payload.bin`.
-    let toolkit_restore = run(&mut node_command(
+    // Bounded transient-connection tolerance: node's undici can lose the
+    // HTTP keep-alive close/reuse race against a perfectly healthy server,
+    // and @actions/cache then reports the failed download as a clean miss
+    // ("Failed to restore: Premature close"). Release run 90 hit exactly
+    // that on a loaded CI runner - and the go client restored the SAME key
+    // byte-for-byte seconds later, proving the server and the entry were
+    // fine. Retrying the identical read-only command keeps the strict
+    // byte-identity assertions honest without masking server defects: only
+    // the connection-class miss is retried (`restore_retryable` below) and
+    // a persistent failure still fails the test with the full transcript.
+    let mut toolkit_restore = run(&mut node_command(
         &node,
         &toolkit_js,
         &["restore", TOOLKIT_KEY, "payload.bin"],
         &work,
         &base,
     ));
+    for _ in 1..RESTORE_ATTEMPTS {
+        if !restore_retryable(&toolkit_restore) {
+            break;
+        }
+        toolkit_restore = run(&mut node_command(
+            &node,
+            &toolkit_js,
+            &["restore", TOOLKIT_KEY, "payload.bin"],
+            &work,
+            &base,
+        ));
+    }
 
     // Probe the artifact route with a *correctly signed* URL but no bearer
     // token â€” exactly what both real clients' download path issues. If the
@@ -682,6 +708,30 @@ async fn run_scenarios() -> Result<Outcome, String> {
         go_restore,
         unauth_artifact_probe,
     })
+}
+
+/// True when a toolkit restore observed exactly the transient the retry
+/// block tolerates: a non-`restored` result whose warnings name the undici
+/// premature-close class. Everything else - any other warning, a missing
+/// marker, or a genuine server defect - is returned untouched so the strict
+/// assertions keep reporting it.
+fn restore_retryable(observed: &Observed) -> bool {
+    let marker = match observed.marker() {
+        Some(marker) => marker,
+        None => return false,
+    };
+    if marker.get("result").and_then(Value::as_str) == Some("restored") {
+        return false;
+    }
+    marker
+        .get("warnings")
+        .and_then(Value::as_array)
+        .is_some_and(|warnings| {
+            warnings
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|warning| warning.contains("Premature close"))
+        })
 }
 
 /// Build the fixture `AppState`: real `FsStorage`, `merge` auth, `tok-a` + the

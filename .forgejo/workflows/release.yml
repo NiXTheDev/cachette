@@ -16,15 +16,16 @@
 #     ONLY when the PR carries the `Release` label; the merged state and the
 #     label list come straight from the pull_request[closed] event - no
 #     subject parsing, no API re-verification. A label-less merge triggers
-#     nothing (the version job logs why and every other job is skippd by the
-#     publish flag).
+#     nothing (the version job logs why and every other job is skipped by
+#     the publish flag).
 #   * a manual workflow_dispatch -> ALWAYS publishes: `version` overrides the
 #     manifest-derived version, `tag_name` overrides the derived
 #     `v<version>` (both empty = plain Cargo.toml cut at the checkout the
 #     dispatch resolves to). A dispatch is the explicit lever to cut or
-#     re-cut a release; the publish step deletes an existing tag/release for
-#     the same name first (regexY re-run semantics), so overrides cannot
-#     collide.
+#     re-cut a release; the publish step runs actions/forgejo-release with
+#     override: true (regexY re-run semantics): the stale release of the
+#     same tag is deleted and a sha-mismatched tag is re-minted at this
+#     run's commit, so overrides cannot collide.
 #   * the regexY flow also carries a `pr_number` input used by its PR-comment
 #     step: NOT copied - cachette ships no changelog/PR-comment step.
 #
@@ -60,7 +61,8 @@
 # Goal: fully STATIC `*-unknown-linux-musl` binaries that run on any Linux
 # distro without glibc-version coupling. A musl build needs (a) musl libc,
 # (b) a linker + C toolchain for the C code pulled in by dependencies
-# (`rusqlite/bundled` compiles SQLite C; `ring` has C/asm; cc-rs in general):
+# (`rusqlite/bundled` compiles SQLite C; aws-lc-sys has C/asm; cc-rs in
+# general):
 #
 #   * `x86_64-unknown-linux-musl` is a SELF-CONTAINED rustc target (rustup
 #     ships its own libc.a) - it only needs a linker, so it would build with
@@ -98,18 +100,110 @@
 #     legs) is involved. A cross-built PE cannot execute on the Linux
 #     runner, so the artifacts are verified structurally: the PE COFF
 #     machine field must be 0x8664 (x86_64) or 0xAA64 (ARM64) - the exact
-#     fact `file(1)` reports. `file`'s output is printed for context when
-#     the tool exists; the assertion itself is always the PE machine step
-#     (grepping `file`'s wording reds the x86_64 leg - it classifies AMD64
-#     as `x86-64`, which no arm64 keyword grep matches, task 162).
+#     fact `file(1)` would report; a `file`-based check runs too whenever
+#     `file` exists on the runner.
 #
-# Smoke tests: the native linux-x86_64-musl artifact RUNs and asserts
-# `cachette <Cargo.toml version>` on `--version`; the cross artifacts
-# (aarch64-musl, both windows legs) cannot execute on the runner, so they
-# are verified structurally instead - `file`(1)/`uname` on linux, the PE
-# machine field asserted unconditionally on windows (`file` too whenever
-# present) - derived from Cargo.toml, so the version bump never needs a
-# workflow edit.
+#     MSVC windows binaries were declined for the v1.0.0 cut (recorded
+#     decision): `*-pc-windows-msvc` is unreachable through cargo-zigbuild -
+#     `zig cc` covers only the GNU (mingw) PE ABI - so a real msvc cross
+#     build means a SECOND toolchain: cargo-xwin (or xwin + lld-link),
+#     LLVM clang-cl, and the ~1 GiB MSVC CRT / Windows SDK download from
+#     Microsoft with its own cache step. The gnu binaries run fine on
+#     Windows 10/11, so wiring unproven msvc legs days before the cut was
+#     declined on purpose. If the need ever materializes (users whose
+#     tooling insists on msvc linkage), add two msvc matrix legs driven by
+#     `cargo xwin build --release --target <triple>` with `~/.xwin` cached,
+#     and record the change HERE - this header is the toolchain contract,
+#     not the commit log.
+#
+#     UPDATE (v1.1, 2026-10-25): the need materialized. The matrix now ships
+#     8 targets - linux gnu+musl and windows gnu+msvc, each amd64+arm64 -
+#     with every leg pinned to the runner labels matching its arch and libc
+#     (musl legs: alpine-latest + linux-<arch> = node:24-alpine on the right
+#     host; everything else: linux-<arch> = node:24-trixie on the matching
+#     host) so no leg ISA-crosses. Driver per leg:
+#       * linux legs   - NATIVE for both libc variants: musl legs build with
+#                        node:24-alpine's own gcc after `apk add gcc musl-dev
+#                        file` (the Dockerfile builder's exact recipe); gnu
+#                        legs build with the host gcc/glibc under
+#                        node:24-trixie. Plain `cargo build` everywhere -
+#                        no zig for linux at all.
+#       * windows gnu  - zigbuild as before (zig cc drives mingw-w64; the
+#                        arm64 leg is gnullvm per the paragraph above; no
+#                        windows machines exist to cross FROM)
+#       * windows msvc - cargo-xwin per the recipe above (clang-cl backend
+#                        for x86_64: ~1 GiB CRT/SDK; clang backend for
+#                        aarch64: prebuilt windows-msvc-sysroot - both
+#                        cached per runner arch under ~/.cache/cargo-xwin);
+#                        clang/lld/cmake/nasm installed per leg
+#     The scratch/musl OCI image decision stands unchanged.
+#
+#     UPDATE (v1.2, 2026-11-12): the aarch64-pc-windows-msvc leg cannot use
+#     the default clang-cl driver - ring 0.17.14's build.rs (configure_cc)
+#     force-replaces the cc-resolved compiler with plain GNU `clang` for
+#     windows+aarch64 whenever it is not clang-LIKE, and cc-rs 1.9.0's
+#     is_like_clang() matches only GNU-style ToolFamily::Clang (clang-cl is
+#     is_like_clang_cl(), a separate predicate). cargo-xwin's cl-style
+#     CFLAGS (/imsvc <dir>) therefore reach a compiler that treats /imsvc
+#     as an input file and every ring object fails: "clang: error: no such
+#     file or directory: '/imsvc'" x5 per file, exit 101 (release run 89,
+#     task 673; target-inherent, reproduces on every host). Fix: that leg
+#     alone builds with XWIN_CROSS_COMPILER=clang (matrix xwin_backend) -
+#     the backend designed for this case: GNU-style flags against the
+#     PREBUILT windows-msvc-sysroot from trcrsired/windows-msvc-sysroot
+#     GitHub releases (asset URL resolved via api.github.com
+#     releases/latest; fallback pinned to the 2026-01-16 release; ~233-287
+#     MiB; 3 download retries; DONE-marker cache;
+#     XWIN_MSVC_SYSROOT_DOWNLOAD_URL overrides for pinning). x86_64-msvc
+#     stays clang-cl (no ring force there; its .asm goes through nasm).
+#     Also fixed in passing: the xwin cache path was ~/.xwin - cargo-xwin
+#     never used it (its root is ~/.cache/cargo-xwin), so that cache
+#     silently no-op'ed every run; path corrected, key bumped
+#     xwin-v1 -> xwin-v2.
+#
+#     UPDATE (v1.3, 2026-11-13): the v1.2 backend split is retired - ring
+#     left the dependency graph entirely. ring 0.17.14 was activated ONLY
+#     through rcgen's default feature set (`cargo tree -i ring -e normal
+#     --target all` printed exactly one path: ring <- rcgen <- cachette);
+#     rcgen now builds default-features=false with crypto/pem/aws_lc_rs -
+#     the backend rustls' default provider already uses - so aws-lc-rs is
+#     the single crypto backend of the whole tree (lock diff: one rcgen
+#     dep edge, "ring" -> "aws-lc-rs"; ring absent on EVERY target;
+#     cachette's rcgen usage - KeyPair/PKCS_ED25519/CertificateParams -
+#     is backend-agnostic, no source change). Consequences:
+#       * aarch64-pc-windows-msvc returns to the DEFAULT clang-cl driver
+#         (xwin_backend: clang-cl, same as x86_64). The v1.2 ring
+#         force-replace is moot without ring, and the clang driver's
+#         prebuilt windows-msvc-sysroot is what actually failed run 96 on
+#         this leg: aws-lc's hrss.c needs GNU vector semantics (`a + b` on
+#         uint16x8_t) that the MSVC-style arm64_neon.h unions deny, the
+#         sysroot ships zero uppercase-cased Windows headers
+#         (`Windows.h: file not found`), and its -L-laden CFLAGS trip
+#         aws-lc's -Werror capability probes. clang-cl + the REAL
+#         Microsoft arm64 CRT/SDK that the xwin crate fetches bypasses
+#         all three: aws-lc-sys itself requires clang-cl for
+#         aarch64-pc-windows-msvc (builder/cc_builder.rs), and upstream
+#         aws-lc-rs CI proves the exact cargo-xwin + clang-cl +
+#         aarch64-pc-windows-msvc combination (aws/aws-lc-rs
+#         .github/workflows/cross.yml, ubuntu-latest host). Both msvc
+#         legs now run ONE identical recipe (packages, driver, cache
+#         shape); only the CRT/SDK flavor differs per runner arch.
+#       * The prebuilt windows-msvc-sysroot download path (clang driver)
+#         is no longer exercised by any leg; ~/.cache/cargo-xwin/xwin is
+#         the only cache content the xwin driver fetches (arm64 flavor
+#         fetched once on the arm64 runner, then cached under
+#         xwin-v2-arm64).
+#
+# Local-dev limitation (recorded by task 36): the dev workstation has NO
+# zig/cargo-zigbuild and only the x86_64-pc-windows-msvc rustup target
+# installed, so the cross legs are CI-validated only; the YAML itself is
+# gated locally with `actionlint` (0 errors).
+#
+# Smoke tests: the native linux-x86_64-musl artifact RUNs and asserts the
+# Cargo.toml version on `--version`; the cross artifacts (aarch64-musl, the
+# windows legs) cannot execute on the runner, so they are verified
+# structurally instead - `file`(1)/`uname` on linux, the PE machine field
+# asserted unconditionally on windows (`file` too whenever present).
 #
 # =============================================================================
 # PUBLISHING (plan task 53): the forge release + its binaries. Binaries +
@@ -159,14 +253,23 @@ jobs:
   #   * a manual dispatch                   -> inputs.version/tag_name or the
   #                                            Cargo.toml version; publish=true
   # Every other case builds nothing (skipped downstream jobs) and logs why.
+  #
+  # NOTE (runner bug, proven on the v1.0.0 cut): Forgejo runner v13.2.1 leaves
+  # a `${{ inputs.* }}` expression unexpanded in job-level env when a
+  # workflow_dispatch carries an empty inputs payload - run 44 handed the
+  # publish step the literal tag `v${{ inputs.version }}`. The inputs are
+  # therefore read through github.event.inputs (the payload-backed context)
+  # AND sanitized in the script: a value that still contains `${{`/`}}` is
+  # treated as "no input" so the Cargo.toml fallback wins, and the resolved
+  # version/tag are rejected if a template literal or whitespace survives.
   version:
     name: resolve version
     runs-on: ubuntu-latest
     env:
       EVENT_MERGED: ${{ github.event.pull_request.merged }}
       EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-      INPUT_VERSION: ${{ inputs.version }}
-      INPUT_TAG: ${{ inputs.tag_name }}
+      INPUT_VERSION: ${{ github.event.inputs.version }}
+      INPUT_TAG: ${{ github.event.inputs.tag_name }}
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -180,6 +283,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Runner v13.2.1 can leave an unexpanded template marker in job env
+          # on an input-less workflow_dispatch (run 44: INPUT_VERSION came
+          # through literally as a dollar sign followed by a double brace).
+          # A templated value means "no input" - drop it so the Cargo.toml
+          # fallback below wins. The marker is assembled at runtime so this
+          # script never contains a literal expression opener that the
+          # workflow preprocessor would try to evaluate.
+          template_open='$'"{{"
+          template_close='}}'
+          sanitize_input() {
+            local value="${1:-}"
+            case "$value" in
+              *"$template_open"*|*"$template_close"*)
+                echo "WARNING: ignoring unexpanded dispatch input literal [$value]" >&2
+                printf ''
+                ;;
+              *)
+                printf '%s' "$value"
+                ;;
+            esac
+          }
+          INPUT_VERSION="$(sanitize_input "${INPUT_VERSION:-}")"
+          INPUT_TAG="$(sanitize_input "${INPUT_TAG:-}")"
+
           if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
             # pull_request[closed] on release: the event carries merged state
             # and the label list natively (regexY contract) - nothing to
@@ -223,6 +351,19 @@ jobs:
             echo "::error::could not resolve a version"
             exit 1
           fi
+          # Last line of defense: a version/tag carrying an unexpanded
+          # template literal or whitespace must never be minted as a release
+          # tag (the v1.0.0 run 44 failure mode).
+          if [[ "$version" == *"$template_open"* || "$version" == *"$template_close"* \
+            || "$version" =~ [[:space:]] ]]; then
+            echo "::error::refusing a suspicious version [$version] (unexpanded dispatch input?)"
+            exit 1
+          fi
+          if [[ "$tag" == *"$template_open"* || "$tag" == *"$template_close"* \
+            || "$tag" =~ [[:space:]] ]]; then
+            echo "::error::refusing a suspicious tag [$tag] (unexpanded dispatch input?)"
+            exit 1
+          fi
           {
             echo "version=$version"
             echo "tag=$tag"
@@ -232,51 +373,111 @@ jobs:
 
   # Build/checksums/release are skipped unless this run actually publishes.
   build:
-    name: build
-    runs-on: ${{ matrix.os }}
+    # Matrix legs interpolate their target into the display name (the
+    # dispatcher shows them as "build (x86_64-unknown-linux-musl)", not
+    # the anonymous build-1..build-7 column the v0.0.9-try dispatch ran);
+    # the job id stays `build` for all needs:/outputs wiring.
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     needs: [version]
     if: needs.version.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
+        # runner label semantics: linux-<arch> maps to node:24-trixie on the
+        # matching host arch; alpine-latest maps to node:24-alpine on WHATEVER
+        # host answers (all runners carry it, arch unknown) - so the musl legs
+        # pair alpine-latest WITH their arch label to pin libc AND arch.
         include:
-          - os: ubuntu-latest
+          - runner: [alpine-latest, linux-amd64]
+            userland: alpine
             target: x86_64-unknown-linux-musl
-            zigbuild: true
+            driver: native
             artifact: cachette-x86_64-unknown-linux-musl
             bin: cachette
             smoke: run
-          - os: ubuntu-latest
+          - runner: [alpine-latest, linux-arm64]
+            userland: alpine
             target: aarch64-unknown-linux-musl
-            zigbuild: true
+            driver: native
             artifact: cachette-aarch64-unknown-linux-musl
             bin: cachette
             smoke: cross-linux
-          - os: ubuntu-latest
+          - runner: linux-amd64
+            userland: debian
+            target: x86_64-unknown-linux-gnu
+            driver: native
+            artifact: cachette-x86_64-unknown-linux-gnu
+            bin: cachette
+            smoke: run
+          - runner: linux-arm64
+            userland: debian
+            target: aarch64-unknown-linux-gnu
+            driver: native
+            artifact: cachette-aarch64-unknown-linux-gnu
+            bin: cachette
+            smoke: cross-linux-gnu
+          - runner: linux-amd64
             target: x86_64-pc-windows-gnu
-            zigbuild: true
+            driver: zig
             artifact: cachette-x86_64-pc-windows-gnu
             bin: cachette.exe
             smoke: cross-windows
-          - os: ubuntu-latest
+          - runner: linux-arm64
             target: aarch64-pc-windows-gnullvm
-            zigbuild: true
+            driver: zig
             artifact: cachette-aarch64-pc-windows-gnullvm
+            bin: cachette.exe
+            smoke: cross-windows
+          - runner: linux-amd64
+            target: x86_64-pc-windows-msvc
+            driver: xwin
+            xwin_backend: clang-cl
+            artifact: cachette-x86_64-pc-windows-msvc
+            bin: cachette.exe
+            smoke: cross-windows
+          - runner: linux-arm64
+            target: aarch64-pc-windows-msvc
+            driver: xwin
+            # Default clang-cl driver, same as the x86_64 leg: ring left
+            # the tree (rcgen flipped to its aws_lc_rs crypto backend,
+            # header UPDATE v1.3), so the v1.2 force-replace hazard is
+            # gone and aws-lc gets the driver it requires on ARM64.
+            xwin_backend: clang-cl
+            artifact: cachette-aarch64-pc-windows-msvc
             bin: cachette.exe
             smoke: cross-windows
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
 
-      - name: Install stable Rust
+      # Alpine runners (the musl targets' userland) boot their action
+      # container from node:24-alpine, which ships NEITHER bash NOR git -
+      # so the first bash-requiring composite below (the rust install)
+      # exec-127'd before anything else ran (task 515:
+      # `exec: "bash": executable file not found in $PATH`), and the
+      # checkout fell back to REST tarball mode. It also ships NO curl:
+      # the rust-toolchain composite itself fetches rustup through curl
+      # (tasks 626/628: `curl: command not found` at the composite's
+      # line 3, exit 127, dead 35s in - both musl legs, every roll).
+      # One sh-safe apk step restores the same toolbox every debian leg
+      # already assumes.
+      # Deliberately no `shell:` pin: this must run under busybox sh.
+      - name: Alpine runner prerequisites
+        if: matrix.userland == 'alpine'
+        run: apk add --no-cache bash git curl
+
+      - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99
           targets: ${{ matrix.target }}
 
       # Cache the per-target toolchain + std libs (the slow rustup leg on these
       # runners); matrix.target keeps the different std libraries apart, and
-      # dtolnay's `cachekey` output pins the exact stable version.
+      # dtolnay's `cachekey` output pins the exact toolchain version
+      # (pinned: 1.99, the version the battery + docker base validate).
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
@@ -299,36 +500,151 @@ jobs:
           key: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
 
-      # ---- Linux musl legs: cargo-zigbuild (justification block at top) ----
-      # If a zig release ever regresses cargo-zigbuild, pin a known-good one
-      # here (e.g. `with: { version: 0.14.1 }`) and note it in the header.
+      # ---- zig driver legs (windows gnu/gnullvm only) ----
+      # zig cc (behind cargo-zigbuild) is the only zig usage in these legs.
+      # History: the hand-rolled resumable curl ladder that stood here
+      # (PR #7) lost to the runners' egress wall - connections die
+      # mid-transfer at varying offsets, resume re-enters the wall, and
+      # which source is fast varies by host and hour (verified live:
+      # linus.dev 8.9 MB/s from one host but <4 KB/s from two others,
+      # alexrp the reverse, and an 8-second clean ziglang.org fetch on a
+      # runner landed between two walled attempts). So the install returns
+      # to STOCK mlugg/setup-zig - mirrored to hangar (all tags
+      # byte-identical to upstream shas) and deliberately UNPATCHED so its
+      # 8-hourly upstream sync stays safe. What it buys: ziglang.org's
+      # live community-mirror list (embedded fallback if ziglang.org is
+      # itself unreachable), shuffled, every mirror tried before
+      # ziglang.org as the last resort, and a minisign signature verified
+      # against Zig's upstream key on every tarball - the signature's
+      # trusted comment also binds the tarball filename, which exceeds
+      # the old sha256 pins. Accepted trade: its Node fetcher has no
+      # speed-based abort, so a trickling mirror still burns and rotation
+      # only rescues after connection death; exposure is bounded by the
+      # persistent tool cache (use-tool-cache defaults on for self-hosted
+      # runners) - at most ONE cold fetch per runner per version, then a
+      # warm short-circuit. use-cache stays false: the global zig package
+      # cache blob belongs to `zig build`, which these legs never run
+      # (same judgment the hand-rolled step recorded - nothing else is
+      # lost). cargo-zigbuild locates zig via PATH (CARGO_ZIGBUILD_ZIG_PATH,
+      # default `zig`) - it never self-installs, so something upstream of
+      # it must always put zig in place. Version PINNED via the `version:`
+      # input: an explicit version skips ziglang.org's index.json
+      # entirely; a bump means changing this one line (and re-watching
+      # the cargo-zigbuild contract; see the TOOLCHAIN JUSTIFICATION
+      # header notes).
       - name: Install zig
-        if: matrix.zigbuild == true
+        if: matrix.driver == 'zig'
         uses: https://hangar.nixthedev.ru/mlugg/setup-zig@v2
+        with:
+          version: "0.14.1"
+          use-cache: false
 
       - name: Install cargo-zigbuild
-        if: matrix.zigbuild == true
+        if: matrix.driver == 'zig'
         run: cargo install cargo-zigbuild --locked
 
       - name: Build
-        if: matrix.zigbuild == true
+        if: matrix.driver == 'zig'
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      # ---- native driver legs (linux): plain cargo, host toolchain ----
+      - name: Install musl build prerequisites
+        if: matrix.driver == 'native' && matrix.userland == 'alpine'
+        # The Dockerfile builder's exact recipe: gcc + musl-dev for the C
+        # deps (sqlite3.c, aws-lc), file(1) for the smoke assertions.
+        run: apk add --no-cache gcc musl-dev file
+
+      - name: Install glibc build prerequisites
+        if: matrix.driver == 'native' && matrix.userland == 'debian'
+        run: |
+          set -euo pipefail
+          for tool in gcc file; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y --no-install-recommends "$tool"
+            fi
+          done
+          gcc --version | head -n1
+
+      - name: Build
+        if: matrix.driver == 'native'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ---- xwin driver legs (windows msvc): cargo-xwin, header's recipe ----
+      # clang ships both driver binaries; lld provides lld-link (the linker
+      # cargo-xwin points rustc at), llvm the llvm-lib/llvm-ar shims the
+      # build scripts resolve, nasm covers aws-lc-sys's x86_64 asm fallback
+      # (its prebuilt NASM objects normally win; ring's .asm needs went
+      # away with UPDATE v1.3), cmake covers cmake-rs crates.
+      - name: Install msvc cross prerequisites
+        if: matrix.driver == 'xwin'
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends clang llvm lld cmake nasm
+
+      # cargo-xwin's real cache root is ~/.cache/cargo-xwin
+      # (dirs::cache_dir() + "cargo-xwin"): ~/.cache/cargo-xwin/xwin holds
+      # the clang-cl backend's ~1 GiB CRT/SDK - since UPDATE v1.3 the ONLY
+      # cache content any leg fetches (arm64 runner: arm64 flavor,
+      # fetched once then cached under xwin-v2-arm64). The
+      # windows-msvc-sysroot path (v1.2 clang driver's prebuilt sysroot,
+      # ~233 MiB) retired with that backend. The old key cached ~/.xwin -
+      # a path cargo-xwin never used, so that cache was a silent no-op
+      # and every run re-downloaded (run 89: 5m51s CRT fetch on the arm64
+      # runner). Key bumps on recipe/content changes: v1 -> v2 here.
+      - name: Cache xwin CRT/SDK + msvc sysroot
+        if: matrix.driver == 'xwin'
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-v2-${{ runner.arch }}
+
+      - name: Install cargo-xwin
+        if: matrix.driver == 'xwin'
+        run: cargo install cargo-xwin --locked
+
+      # Backend (xwin_backend in the matrix): BOTH msvc legs run the
+      # default clang-cl driver since UPDATE v1.3. History (why the knob
+      # exists at all): ring 0.17.14's build.rs (configure_cc)
+      # unconditionally replaces the cc-resolved compiler with plain GNU
+      # `clang` whenever target.os == windows && target.arch == aarch64
+      # and the compiler is not clang-LIKE - and cc-rs' is_like_clang()
+      # matches ONLY GNU-style ToolFamily::Clang (clang-cl answers
+      # is_like_clang_cl(), a separate predicate) - so while ring was in
+      # the tree, clang-cl's cl-style CFLAGS (/imsvc <dir>) reached a
+      # compiler that treats /imsvc as an input file and every ring
+      # object failed: "clang: error: no such file or directory:
+      # '/imsvc'" x5 per file, exit 101 (release run 89, task 673) -
+      # target-inherent, not runner roulette. UPDATE v1.3 removed ring
+      # from the graph via rcgen's aws_lc_rs backend, the aarch64 leg
+      # returned to the default driver, and the clang driver +
+      # prebuilt-windows-msvc-sysroot combination that failed run 96 on
+      # aws-lc (hrss.c GNU vector semantics vs MSVC arm64_neon.h unions;
+      # sysroot header casing; -L CFLAGS under aws-lc's -Werror probes)
+      # is no longer exercised by any leg. The `||` guard keeps clap's
+      # env parsing happy if a future leg omits the field.
+      - name: Build
+        if: matrix.driver == 'xwin'
+        env:
+          XWIN_CROSS_COMPILER: ${{ matrix.xwin_backend || 'clang-cl' }}
+        run: cargo xwin build --release --locked --target ${{ matrix.target }}
 
       # ---- Smoke: native artifacts actually RUN --version ----
       - name: Smoke - run native binary --version
         if: matrix.smoke == 'run'
         shell: bash
         run: |
-          set -euo pipefail
           bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           chmod +x "$bin" || true
           command -v file >/dev/null 2>&1 && file "$bin"
           got="$("$bin" --version | tr -d '\r')"
-          echo "cachette --version => [$got]"
-          want="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/[^"]*"([^"]*)".*/\1/')"
-          echo "Cargo.toml version => [$want]"
+          # Version from the manifest, not hardcoded - survives every cut.
+          want="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
+            | sed -E 's/[^"]*"([^"]*)".*/\1/')"
+          echo "cachette --version => [$got] (want [cachette $want])"
           if [ "$got" != "cachette $want" ]; then
-            echo "::error::expected 'cachette $want' (Cargo.toml), got '$got'"
+            echo "::error::expected exactly 'cachette $want', got '$got'"
             exit 1
           fi
 
@@ -341,12 +657,33 @@ jobs:
           bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           chmod +x "$bin"
           echo "uname -m (host arch): $(uname -m)"
-          test "$(uname -m)" = "x86_64"
+          test "$(uname -m)" = "aarch64"
           echo "file(1) output:"
           file "$bin"
           file "$bin" | grep -qi "aarch64"
           file "$bin" | grep -Eq "statically linked|static-pie linked"
-          echo "OK: aarch64 musl STATIC artifact, host is x86_64 (cross build proven)"
+          echo "OK: aarch64 musl STATIC artifact, built natively on the arm64 runner"
+
+      # ---- Smoke: linux gnu aarch64 artifact (file: arch + DYNAMICALLY
+      # linked against glibc - static would prove the wrong triple built) ----
+      - name: Smoke - cross linux gnu artifact
+        if: matrix.smoke == 'cross-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          chmod +x "$bin"
+          echo "uname -m (host arch): $(uname -m)"
+          test "$(uname -m)" = "aarch64"
+          echo "file(1) output:"
+          file "$bin"
+          file "$bin" | grep -qi "aarch64"
+          file "$bin" | grep -Eqi "interpreter|dynamically linked"
+          if file "$bin" | grep -Eqi "statically linked|static-pie linked"; then
+            echo "::error::aarch64 gnu artifact unexpectedly static"
+            exit 1
+          fi
+          echo "OK: aarch64 glibc-linked ELF (gnu triple proven)"
 
       # ---- Smoke: cross Windows artifact ----
       # file(1) may be absent from the runner's Git Bash - print its output
@@ -453,10 +790,10 @@ jobs:
           echo "----- SHA256SUMS -----"
           cat SHA256SUMS
           echo "----------------------"
-          # Exactly the 4 target binaries must be present.
+          # Exactly the 8 target binaries must be present.
           n="$(grep -c . SHA256SUMS)"
-          if [ "$n" -ne 4 ]; then
-            echo "::error::expected 4 binaries in SHA256SUMS, found $n"
+          if [ "$n" -ne 8 ]; then
+            echo "::error::expected 8 binaries in SHA256SUMS, found $n"
             exit 1
           fi
 
@@ -481,83 +818,25 @@ jobs:
           merge-multiple: true
 
       - name: Publish release and attach assets
-        shell: bash
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SERVER: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ needs.version.outputs.tag }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          api="$SERVER/api/v1/repos/$REPO"
-          auth="Authorization: token $TOKEN"
-
-          echo "Publishing $TAG ($SHA) to $api"
-          ls -l dist
-
-          # regexY re-run semantics: an existing release/tag of the same name
-          # is deleted first, so a re-cut (or an override dispatch) cannot
-          # collide. Failure to delete is tolerated - creation below vetoes
-          # collisions anyway.
-          existing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
-          existing_id="$(printf '%s' "$existing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
-          if [ -n "$existing_id" ]; then
-            echo "deleting stale release $existing_id for $TAG"
-            curl -sS -X DELETE "$api/releases/$existing_id" -H "$auth" || true
-          fi
-          curl -sS -X DELETE "$api/tags/$TAG" -H "$auth" || true
-
-          # Create the release; `target_commitish` pins the auto-created tag
-          # to the sha this run checked out (the tag is minted here rather
-          # than pushed when the run was not a tag push).
-          create_body="{\"tag_name\":\"$TAG\",\"name\":\"cachette $TAG\",\"target_commitish\":\"$SHA\",\"draft\":false,\"prerelease\":false}"
-          curl -sS -X POST "$api/releases" \
-            -H "$auth" -H 'Content-Type: application/json' \
-            -d "$create_body" || true
-
-          release_id=""
-          for attempt in 1 2 3 4 5; do
-            listing="$(curl -sS -H "$auth" "$api/releases/tags/$TAG" || true)"
-            release_id="$(printf '%s' "$listing" | grep -o '"id":[0-9]\+' | head -n1 | cut -d: -f2 || true)"
-            [ -n "$release_id" ] && break
-            echo "release not resolvable yet (attempt $attempt); retrying"
-            sleep 3
-          done
-          if [ -z "$release_id" ]; then
-            echo "::error::could not resolve a release id for tag $TAG"
-            exit 1
-          fi
-          echo "release id = $release_id"
-
-          # Upload each asset (binaries + SHA256SUMS), retrying transient
-          # failures. A re-run hits "already exists" (HTTP 400/409) for an asset
-          # that is already attached; that is treated as success so a re-run of
-          # the tag is idempotent.
-          for f in dist/*; do
-            name="$(basename "$f")"
-            uploaded=false
-            for attempt in 1 2 3 4; do
-              code="$(curl -sS -o /tmp/upload.out -w '%{http_code}' \
-                -X POST "$api/releases/$release_id/assets?name=$name" \
-                -H "$auth" -F "attachment=@$f" || true)"
-              if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-                echo "uploaded $name (HTTP $code)"
-                uploaded=true
-                break
-              fi
-              if [ "$code" = "400" ] || [ "$code" = "409" ]; then
-                echo "asset $name already attached (HTTP $code); idempotent re-run"
-                uploaded=true
-                break
-              fi
-              echo "upload $name attempt $attempt -> HTTP $code; retrying"
-              cat /tmp/upload.out || true
-              sleep $((attempt * 3))
-            done
-            if [ "$uploaded" != "true" ]; then
-              echo "::error::failed to upload $name after retries"
-              exit 1
-            fi
-          done
-          echo "OK: release $TAG published with all assets"
+        # actions/forgejo-release (official), pinned to v2.13.4 on the
+        # instance's own mirror - the same egress-immune pattern as the
+        # actions/checkout@v4 references. Every input is passed explicitly so
+        # the action's forge.* context defaults never have to evaluate.
+        # override: true is the regexY re-run contract, and the action keeps
+        # it step for step: the stale release of the same tag is deleted, a
+        # sha-mismatched tag is deleted and re-minted at this run's commit,
+        # and the release is created as a draft that only un-drafts after
+        # every asset is attached - a failed upload cannot leave a
+        # half-populated public release.
+        uses: https://hangar.nixthedev.ru/actions/forgejo-release@v2.13.4
+        with:
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          tag: ${{ needs.version.outputs.tag }}
+          sha: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "cachette ${{ needs.version.outputs.tag }}"
+          release-dir: dist
+          override: true
+          verbose: true

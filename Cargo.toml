@@ -13,7 +13,7 @@ clap = { version = "^4.6.7", features = ["derive"] }
 fs2 = "^0.4.3"
 hmac = "^0.13.0"
 mdns-sd = "^0.21.5"
-rcgen = "^0.14"
+rcgen = { version = "^0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rusqlite = { version = "^0.41", features = ["bundled"] }
 rustls = "^0.23"
 rustls-pemfile = "^2.2.0"
