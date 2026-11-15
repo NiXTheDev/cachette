@@ -1,7 +1,8 @@
 # Design: OIDC bearer authentication (v1.1 workstream A)
 
-Status: **proposed** 2026-10-25 - awaiting approve/veto. Implementation follows
-this document; this doc is the contract.
+Status: **implemented** in v1.1.0 (2026-11-15). Amended 2026-11-15 for
+v1.2 - see "v1.2 amendments" at the end of this document. The v1.2 shape is
+the contract for v1.2; the text above stays as the record of what shipped.
 
 ## Why
 
@@ -169,3 +170,82 @@ jwks_ca_pem = ""      # path to PEM bundle; required when enabled
 
 Default **off**; toggling `enabled` on a live node requires only a restart.
 No wire or client changes of any kind.
+
+## v1.2 amendments (2026-11-15)
+
+### Per-issuer configuration blocks
+
+The v1.1 table made `audiences` and `require` **global**: one deployment
+could trust many issuers, but every issuer shared one audience list and one
+set of claim pins. That does not survive the first second IdP - Forgejo's
+Actions integration audience (`u:1:<uuid>`) has nothing to do with a
+Keycloak client id, and a repository pin has nothing to do with a group
+pin. `jwks_urls` was already per-issuer, so the shape was half-way there.
+
+The v1.2 shape makes the issuer the block:
+
+```toml
+[auth.oidc]
+enabled = true
+jwks_refresh_seconds = 1800
+jwks_max_keys = 32
+jwks_ca_pem = "/etc/ssl/certs/ca-certificates.crt"   # default trust roots
+
+[auth.oidc."https://hangar.nixthedev.ru/api/actions"]
+audiences = ["u:1:7aa18c62-d578-484f-8d6e-2b62a540c95a"]
+jwks_url = "https://hangar.nixthedev.ru/api/actions/.well-known/keys"
+require = { "repository" = "NiXTheDev/cachette" }
+leeway_seconds = 30
+ca_pem = "/etc/ssl/certs/private-root.pem"           # overrides the default roots
+
+[auth.oidc."https://keycloak.example.org/realms/ci"]
+audiences = ["cachette"]
+jwks_url = "https://keycloak.example.org/realms/ci/protocol/openid-connect/certs"
+require = { "groups" = "ci" }
+```
+
+TOML allows the parent table plus any number of quoted sub-tables, so one
+`[auth.oidc]` parent carries the global knobs while each issuer is its own
+block.
+
+- **Per issuer:** `audiences` (required), `jwks_url` (defaults to
+  `{issuer}/.well-known/jwks.json`), `require`, `leeway_seconds`, and
+  `ca_pem` (overrides the global roots for a private-CA issuer).
+- **Global:** `enabled`, `jwks_refresh_seconds`, `jwks_max_keys`,
+  `jwks_ca_pem` (the default trust roots).
+
+Implementation note: serde's `flatten` cannot be combined with
+`deny_unknown_fields`, so the issuer map is a `#[serde(flatten)]
+BTreeMap<String, OidcIssuerConfig>` on a parent struct that drops
+`deny_unknown_fields`; each issuer block keeps `deny_unknown_fields`, so an
+unknown key *inside* a block is still rejected, and the parent's own key set
+is validated explicitly against the known global keys.
+
+Compatibility: the v1.1 flat shape is **rejected** in v1.2 with a precise
+error naming the new form. The feature shipped in v1.1.0 with no deployed
+configuration behind it, and a half-global shape is worse than a clean
+break - a silent "works with one issuer" fallback would hide exactly the
+misconfiguration this change removes.
+
+### `nbf` is optional (RFC 7519 section 4.1.5)
+
+The v1.1 verifier treated a **missing** `nbf` as `Malformed`
+(`src/auth/oidc.rs`: `claim_secs(claims.get("nbf"))?` maps `None` to an
+error). RFC 7519 makes `nbf` optional, and real issuers omit it: Forgejo's
+OAuth2-app `id_token` sets `ExpiresAt`, `IssuedAt` and `Audience` but no
+`NotBefore` (`routers/web/auth/oauth.go`), and Auth0- and Google-style
+tokens likewise. Every such token was rejected as malformed.
+
+The v1.2 rule: an absent `nbf` means no lower bound; a **present** `nbf`
+that is not an integer stays a structural failure. (Forgejo's *Actions* ID
+token does set `nbf` - `routers/api/actions/id_token.go` - so it was never
+affected; the OAuth2-app family was.)
+
+### Per-issuer tenants (workstream F)
+
+The OIDC plane is one of the credential planes of the multi-tenant shared
+cache (`docs/shared-cache.md`): the issuer block is the **forge**, the pinned
+`require` claim yields the **tenant**, and the namespace defaults to
+`"<issuer>|<tenant>"`. That is why the per-issuer shape is load-bearing
+rather than cosmetic - one deployment can trust many forges at once, each
+with its own audiences, pins and roots.

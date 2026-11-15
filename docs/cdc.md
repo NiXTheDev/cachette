@@ -1,7 +1,8 @@
 # Design: server-side content-defined chunking (v1.1 workstream B)
 
-Status: **proposed** 2026-10-25 - awaiting approve/veto. Implementation follows
-this document; this doc is the contract.
+Status: **implemented** in v1.1.0 (2026-11-15). Amended 2026-11-15 for
+v1.2 - see "v1.2 amendments" at the end of this document. The v1.2 shape is
+the contract for v1.2; the text above stays as the record of what shipped.
 
 ## Why
 
@@ -299,3 +300,37 @@ First release carrying the code **defaults to off**; flipping
 `[storage.cdc] enabled` on a live node requires a restart and then applies
 to new finalizations and starts the background backfill walker (Migration)
 - no boot-blocking re-chunk. No protocol, client, image, or wire changes.
+
+## v1.2 amendments (2026-11-15)
+
+### Workstream B, commit 3: layout-aware zero-ref predicate + crash recovery
+
+v1.1 shipped the CDC sweeper with a zero-ref predicate that counts distinct
+referencing entries, and a conversion-crash window covered by
+`sweep_orphan_blobs`. Two things are still open, and they are why workstream
+B did not close in v1.1:
+
+- **Layout-aware zero-ref.** A chunk row is referenced by an `entry_chunks`
+  manifest of a **chunked** entry; a row of a **whole** entry holds a blob,
+  not a manifest. The predicate must consult the `layout` column before
+  deciding a chunk has no referrer, and the two row kinds must never be
+  counted against each other. A whole entry whose blob was unlinked by a
+  conversion is not a "zero-ref chunk"; a chunked entry's manifest row is
+  not a "whole blob". With v1.2's namespaces (workstream F) the same
+  predicate has to be namespace-scoped on top: a chunk referenced only from
+  another namespace's manifest is still a referrer, and the sweeper must
+  never touch another namespace's rows.
+- **Crash recovery in the conversion window.** The conversion (whole entry
+  -> chunked) stages chunks, then publishes the manifest and unlinks the
+  blob. A crash between those steps must leave the entry readable (as its
+  old whole layout or its new chunked one, never as neither), the staged
+  chunks collectable by the sweeper, and the accounting correct. The staged
+  chunks of an **in-flight** conversion must not be swept by a concurrent
+  sweeper - the age grace plus the staged marker is what makes that safe.
+
+Tests: mixed-layout fixtures where a chunk and a whole row coexist with
+referrers in only one of them; crash injection at each conversion bound
+(staged, published, unlinked) followed by a boot + sweep convergence check
+and a `used_bytes` consistency check; a staged chunk surviving a concurrent
+sweep; a zero-ref chunk of a chunked entry still being swept; a chunk
+referenced across namespaces surviving the sweep.
