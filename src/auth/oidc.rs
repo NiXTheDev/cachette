@@ -182,7 +182,10 @@ impl OidcVerifier {
         // structurally broken token. (v1.1 mapped a missing claim to
         // `Malformed`, which rejected every token from an issuer that
         // omits it - Forgejo's OAuth2-app id_token among them.)
-        let nbf = claim_secs(claims.get("nbf"))?;
+        let nbf = match claims.get("nbf") {
+            Some(value) => claim_secs(Some(value))?,
+            None => 0,
+        };
         if now_unix.saturating_add(leeway) < nbf {
             return Err(OidcError::NotYetValid);
         }
@@ -412,6 +415,30 @@ mod tests {
         let (fx, v) = std_setup();
         let token = signed_token(&fx, HEADER, &claims(&fx.issuer));
         assert_eq!(v.verify(&token, NOW), Ok(()));
+    }
+
+    /// RFC 7519 section 4.1.5: `nbf` is OPTIONAL. An absent claim means no
+    /// lower bound (v1.1 mapped it to `Malformed`, which rejected every
+    /// token from an issuer that omits it - Forgejo's OAuth2-app id_token
+    /// among them); a present but non-numeric one is structurally broken.
+    #[test]
+    fn absent_nbf_is_accepted_and_a_broken_one_is_malformed() {
+        let (fx, v) = std_setup();
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"cachette","sub":"ci-1","exp":{}}}"#,
+            fx.issuer,
+            NOW + 300
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Ok(()));
+
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"cachette","exp":{},"nbf":"soon"}}"#,
+            fx.issuer,
+            NOW + 300
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Err(OidcError::Malformed));
     }
 
     /// Each issuer is judged by its OWN audiences and claim pins (v1.2
