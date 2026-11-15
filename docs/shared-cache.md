@@ -179,12 +179,37 @@ silently degraded.
 
 ### 5. Quotas and eviction fairness
 
+Every namespace has a limit. The storage section governs the **default**,
+and an operator overrides it per namespace - exactly, or with a wildcard
+over the tenant part so a whole owner never has to be enumerated:
+
 ```toml
 [storage.quotas]
 default = "20GiB"
-# per-namespace overrides
-"acme-shared" = "200GiB"
+# exact namespace (the default namespace form is "<forge>|<tenant>")
+"https://hangar.nixthedev.ru|NiXTheDev/cachette" = "50GiB"
+# tenant-side wildcard: every repo of that owner, on any forge
+"NiXTheDev/*" = "5GiB"
+# forge-scoped wildcard: every repo of that owner on one forge
+"https://github.com|octo-org/*" = "5GiB"
 ```
+
+Matching, most specific first:
+
+1. the exact namespace string;
+2. the longest matching pattern - `*` matches any run of characters, and a
+   pattern without a `|` matches the **tenant part** of any forge's
+   namespace (so `NiXTheDev/*` covers that owner everywhere);
+3. `default`.
+
+The rules are overrides only: the default governs every namespace no rule
+matches, and a namespace with its own rule is budgeted by that rule alone.
+Sizes use the repo's existing bytesize syntax (the same form
+`[storage] min_free` parses).
+
+A namespace several tenants share is budgeted as ONE (it is one storage
+unit), so a wildcard rule never silently splits a shared budget: shared
+namespaces are named explicitly and budgeted by their own exact rule.
 
 Eviction order, when the global floor (`min_free`) or a namespace quota is
 pressured:
