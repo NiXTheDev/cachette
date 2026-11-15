@@ -130,15 +130,17 @@ pub struct JwksCache {
     /// Weak self-reference for the two background tasks (they upgrade per
     /// iteration, so dropping the cache ends both loops without leaks).
     self_ref: Weak<Self>,
-    /// CA-pinned rustls client: every fetch presents the IdP chain to the
-    /// configured bundle and standard webpki verification (the aws-lc-rs
-    /// provider rustls already resolves in this tree).
-    client: Arc<RustlsClientConfig>,
+    /// CA-pinned rustls client PER ISSUER (v1.2: each
+    /// `[auth.oidc."<issuer>"]` block may name its own trust roots; the
+    /// global `jwks_ca_pem` is the default). Every fetch presents the IdP
+    /// chain to that issuer's bundle and standard webpki verification (the
+    /// aws-lc-rs provider rustls already resolves in this tree).
+    clients: BTreeMap<String, Arc<RustlsClientConfig>>,
     /// Configured issuers — the ONLY issuers ever fetched. A token carrying
     /// any other issuer misses and fails closed with no outbound request.
     issuers: BTreeSet<String>,
-    /// Explicit JWKS URL per issuer (`jwks_urls`); defaults derive from the
-    /// issuer itself.
+    /// JWKS URL per issuer: the block's explicit `jwks_url`, else the
+    /// default derived from the issuer itself.
     urls: BTreeMap<String, String>,
     /// Global key cap (`jwks_max_keys`).
     max_keys: usize,
@@ -164,15 +166,28 @@ impl JwksCache {
     /// Without a running tokio runtime (`Handle::current()`); construction
     /// happens inside `serve()` / async tests only.
     pub fn try_new(oidc: &OidcConfig) -> Result<Arc<Self>, JwksCacheError> {
-        let client = match oidc.jwks_ca_pem.as_deref() {
-            Some(path) => client_config(path)?,
-            None => return Err(JwksCacheError::MissingCaPem),
-        };
+        // Per issuer: its own trust roots (its own `ca_pem`, else the global
+        // bundle) and its own endpoint (its own `jwks_url`, else the
+        // `{issuer}/.well-known/jwks.json` default).
+        let mut clients = BTreeMap::new();
+        let mut urls = BTreeMap::new();
+        for (issuer, block) in &oidc.issuers {
+            let Some(ca_pem) = block.ca_pem.as_deref().or(oidc.jwks_ca_pem.as_deref()) else {
+                return Err(JwksCacheError::MissingCaPem);
+            };
+            clients.insert(issuer.clone(), client_config(ca_pem)?);
+            urls.insert(
+                issuer.clone(),
+                block.jwks_url.clone().unwrap_or_else(|| {
+                    format!("{}/.well-known/jwks.json", issuer.trim_end_matches('/'))
+                }),
+            );
+        }
         let this = Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
-            client,
-            issuers: oidc.issuers.iter().cloned().collect(),
-            urls: oidc.jwks_urls.clone(),
+            clients,
+            issuers: oidc.issuers.keys().cloned().collect(),
+            urls,
             max_keys: oidc.jwks_max_keys.max(1),
             refresh_interval: Duration::from_secs(oidc.jwks_refresh_seconds.max(1)),
             handle: Handle::current(),
@@ -201,9 +216,9 @@ impl JwksCache {
         });
     }
 
-    /// The JWKS URL for an issuer: the explicit override when present, else
-    /// `{issuer}/.well-known/jwks.json` (trailing slashes on the issuer
-    /// dropped so the derived path stays canonical).
+    /// The JWKS URL for an issuer: the block's explicit `jwks_url` when
+    /// present, else `{issuer}/.well-known/jwks.json` (trailing slashes on
+    /// the issuer dropped so the derived path stays canonical).
     fn jwks_url(&self, issuer: &str) -> String {
         if let Some(url) = self.urls.get(issuer) {
             return url.clone();
@@ -225,7 +240,10 @@ impl JwksCache {
     /// cached keys keep verifying, tokens needing a new key fail closed.
     async fn refresh_one(&self, issuer: &str) {
         let url = self.jwks_url(issuer);
-        let fetch = tokio::time::timeout(FETCH_BUDGET, fetch_jwks(&self.client, &url));
+        let Some(client) = self.clients.get(issuer) else {
+            return;
+        };
+        let fetch = tokio::time::timeout(FETCH_BUDGET, fetch_jwks(client, &url));
         let keys = match fetch.await {
             Ok(Ok(keys)) => keys,
             Ok(Err(reason)) => {
@@ -571,6 +589,7 @@ mod tests {
     use tokio_rustls::server::TlsStream;
 
     use super::*;
+    use crate::config::OidcIssuerConfig;
 
     /// The throwaway RSA fixture (see the file's note field): tokens are
     /// signed with its private half; the JWKS JSON values below serve its
@@ -672,12 +691,17 @@ mod tests {
         fn config(&self, fields: impl FnOnce(&mut OidcConfig)) -> OidcConfig {
             let mut oidc = OidcConfig {
                 enabled: true,
-                issuers: vec![ISSUER.to_owned()],
-                audiences: vec![String::from("cachette")],
                 jwks_ca_pem: Some(self.ca_pem_path.clone()),
                 ..OidcConfig::default()
             };
-            oidc.jwks_urls.insert(ISSUER.to_owned(), self.url());
+            oidc.issuers.insert(
+                ISSUER.to_owned(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    jwks_url: Some(self.url()),
+                    ..OidcIssuerConfig::default()
+                },
+            );
             fields(&mut oidc);
             oidc
         }
@@ -1088,10 +1112,20 @@ mod tests {
 
         let empty = dir.join("empty.pem");
         std::fs::write(&empty, "").expect("empty bundle");
-        let boot_config = |ca_pem: Option<PathBuf>| OidcConfig {
-            enabled: true,
-            jwks_ca_pem: ca_pem,
-            ..OidcConfig::default()
+        let boot_config = |ca_pem: Option<PathBuf>| {
+            let mut oidc = OidcConfig {
+                enabled: true,
+                jwks_ca_pem: ca_pem,
+                ..OidcConfig::default()
+            };
+            oidc.issuers.insert(
+                ISSUER.to_owned(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            );
+            oidc
         };
         assert!(matches!(
             JwksCache::try_new(&boot_config(Some(empty.clone()))),

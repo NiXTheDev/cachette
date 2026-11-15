@@ -56,10 +56,13 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `[auth.oidc]` wiring rules (v1.1; docs/oidc.md §Config surface):
-/// `enabled` implies the issuer/audience lists, the CA bundle, a positive
-/// refresh interval and key cap; `jwks_urls` may only name configured
-/// issuers with `https` endpoints. A disabled/absent table is always fine.
+/// `[auth.oidc]` wiring rules (v1.2 shape; docs/oidc.md §Config surface):
+/// the parent table carries the global knobs, every issuer is its own block
+/// (`[auth.oidc."<issuer>"]`) with its own audiences, pins, roots and clock
+/// skew. `enabled` implies at least one issuer block, a positive refresh
+/// interval and key cap, and usable trust roots for every issuer. The v1.1
+/// flat shape is rejected with a precise error. A disabled/absent table is
+/// always fine.
 fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     let Some(oidc) = config.auth.oidc.as_ref() else {
         return Ok(());
@@ -67,19 +70,22 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     if !oidc.enabled {
         return Ok(());
     }
+    // The v1.1 flat shape is a configuration error, not a silent fallback:
+    // name the key that carries it and the shape that replaced it.
+    for (key, present) in [
+        ("issuers", oidc.legacy_issuers.is_some()),
+        ("audiences", oidc.legacy_audiences.is_some()),
+        ("jwks_urls", oidc.legacy_jwks_urls.is_some()),
+        ("require", oidc.legacy_require.is_some()),
+        ("leeway_seconds", oidc.legacy_leeway_seconds.is_some()),
+    ] {
+        if present {
+            return Err(ConfigError::OidcLegacyShape { key });
+        }
+    }
     if oidc.issuers.is_empty() {
         return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.issuers",
-        });
-    }
-    if oidc.audiences.is_empty() {
-        return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.audiences",
-        });
-    }
-    if oidc.jwks_ca_pem.is_none() {
-        return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.jwks_ca_pem",
+            field: "at least one [auth.oidc.\"<issuer>\"] block",
         });
     }
     if oidc.jwks_refresh_seconds == 0 {
@@ -88,30 +94,37 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     if oidc.jwks_max_keys == 0 {
         return Err(ConfigError::OidcZeroMaxKeys);
     }
-    // Every issuer must itself be an https URL: the default JWKS endpoint is
-    // derived as `{issuer}/.well-known/jwks.json`, so a plaintext issuer
-    // would mean a plaintext fetch. Explicit overrides cannot rescue it —
-    // verification binds tokens to the issuer string whatever URL serves
-    // keys, and the fetch layer is https-only as depth defense.
-    for issuer in &oidc.issuers {
-        let scheme = url::Url::parse(issuer).is_ok_and(|url| url.scheme() == "https");
-        if !scheme {
+    for (issuer, block) in &oidc.issuers {
+        // Every issuer must itself be an https URL: the default JWKS endpoint
+        // is derived as `{issuer}/.well-known/jwks.json`, so a plaintext
+        // issuer would mean a plaintext fetch. An explicit override cannot
+        // rescue it - verification binds tokens to the issuer string whatever
+        // URL serves keys, and the fetch layer is https-only as depth
+        // defense.
+        if !url::Url::parse(issuer).is_ok_and(|url| url.scheme() == "https") {
             return Err(ConfigError::OidcIssuerPlaintext {
                 issuer: issuer.clone(),
             });
         }
-    }
-    for (issuer, url) in &oidc.jwks_urls {
-        if !oidc.issuers.contains(issuer) {
-            return Err(ConfigError::OidcJwksIssuerUnknown {
+        if block.audiences.is_empty() {
+            return Err(ConfigError::OidcIssuerMissing {
                 issuer: issuer.clone(),
+                field: "audiences",
             });
         }
-        let scheme = url::Url::parse(url).is_ok_and(|u| u.scheme() == "https");
-        if !scheme {
+        if let Some(url) = &block.jwks_url
+            && !url::Url::parse(url).is_ok_and(|u| u.scheme() == "https")
+        {
             return Err(ConfigError::OidcJwksPlaintext {
                 issuer: issuer.clone(),
                 url: url.clone(),
+            });
+        }
+        // Trust roots: the issuer's own bundle, or the global default.
+        if block.ca_pem.is_none() && oidc.jwks_ca_pem.is_none() {
+            return Err(ConfigError::OidcIssuerMissing {
+                issuer: issuer.clone(),
+                field: "ca_pem (or the global auth.oidc.jwks_ca_pem)",
             });
         }
     }
@@ -150,7 +163,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::OidcConfig;
+    use std::collections::BTreeMap;
+
+    use crate::config::{OidcConfig, OidcIssuerConfig};
 
     /// A `Config` with `[auth.oidc]` built from the default surface.
     fn oidc_config(fields: impl FnOnce(&mut OidcConfig)) -> Config {
@@ -165,9 +180,14 @@ mod tests {
     fn enabled_oidc() -> Config {
         oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-            oidc.audiences = vec![String::from("cachette")];
             oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                String::from("https://idp.example.org/realms/ci"),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            );
         })
     }
 
@@ -175,9 +195,16 @@ mod tests {
     fn enabled_oidc_with_issuers(issuers: Vec<String>) -> Config {
         oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = issuers;
-            oidc.audiences = vec![String::from("cachette")];
             oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            for issuer in issuers {
+                oidc.issuers.insert(
+                    issuer,
+                    OidcIssuerConfig {
+                        audiences: vec![String::from("cachette")],
+                        ..OidcIssuerConfig::default()
+                    },
+                );
+            }
         })
     }
 
@@ -378,52 +405,58 @@ mod tests {
         assert!(
             validate(&oidc_config(|oidc| {
                 oidc.enabled = false;
-                oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
+                oidc.issuers.insert(
+                    String::from("https://idp.example.org/realms/ci"),
+                    OidcIssuerConfig::default(),
+                );
             }))
             .is_ok()
         );
     }
 
     #[test]
-    fn enabled_oidc_requires_issuers_audiences_and_ca_pem() {
-        let err = validate(&oidc_config(|oidc| oidc.enabled = true)).expect_err("no lists, no pem");
+    fn enabled_oidc_requires_an_issuer_block_audiences_and_roots() {
+        let err = validate(&oidc_config(|oidc| oidc.enabled = true)).expect_err("no issuer block");
         assert!(
             matches!(
                 err,
                 ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.issuers"
+                    field: "at least one [auth.oidc.\"<issuer>\"] block"
                 }
             ),
             "unexpected error: {err:?}"
         );
 
+        let issuer = String::from("https://idp.example.org/realms/ci");
         let err = validate(&oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
+            oidc.issuers
+                .insert(issuer.clone(), OidcIssuerConfig::default());
         }))
         .expect_err("no audiences");
         assert!(
             matches!(
-                err,
-                ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.audiences"
-                }
+                &err,
+                ConfigError::OidcIssuerMissing { issuer: got, field: "audiences" } if got == &issuer
             ),
             "unexpected error: {err:?}"
         );
 
         let err = validate(&oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-            oidc.audiences = vec![String::from("cachette")];
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            );
         }))
         .expect_err("no CA bundle");
         assert!(
             matches!(
-                err,
-                ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.jwks_ca_pem"
-                }
+                &err,
+                ConfigError::OidcIssuerMissing { issuer: got, .. } if got == &issuer
             ),
             "unexpected error: {err:?}"
         );
@@ -431,13 +464,66 @@ mod tests {
         assert!(validate(&enabled_oidc()).is_ok());
     }
 
+    /// A per-issuer `ca_pem` covers that issuer on its own; the global
+    /// `jwks_ca_pem` is the fallback for issuers that name none.
+    #[test]
+    fn per_issuer_ca_pem_covers_its_issuer() {
+        let issuer = String::from("https://idp.example.org/realms/ci");
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ca_pem: Some(PathBuf::from("/etc/cachette/other-ca.pem")),
+                    ..OidcIssuerConfig::default()
+                },
+            );
+        });
+        assert!(validate(&config).is_ok());
+    }
+
+    /// The v1.1 flat shape is a configuration error, not a silent fallback:
+    /// the error names the key and the shape that replaced it.
+    #[test]
+    fn the_v11_flat_shape_is_rejected_with_a_precise_error() {
+        for (key, set) in [
+            ("issuers", 0),
+            ("audiences", 1),
+            ("jwks_urls", 2),
+            ("require", 3),
+            ("leeway_seconds", 4),
+        ] {
+            let err = validate(&oidc_config(|oidc| {
+                oidc.enabled = true;
+                match set {
+                    0 => oidc.legacy_issuers = Some(vec![String::from("https://idp.example.org")]),
+                    1 => oidc.legacy_audiences = Some(vec![String::from("cachette")]),
+                    2 => oidc.legacy_jwks_urls = Some(BTreeMap::new()),
+                    3 => oidc.legacy_require = Some(BTreeMap::new()),
+                    _ => oidc.legacy_leeway_seconds = Some(30),
+                }
+            }))
+            .expect_err("v1.1 flat shape");
+            assert!(
+                matches!(&err, ConfigError::OidcLegacyShape { key: got } if *got == key),
+                "unexpected error for {key}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn zero_oidc_refresh_and_key_cap_are_rejected() {
         let surface = crate::config::OidcConfig {
             enabled: true,
-            issuers: vec![String::from("https://idp.example.org/realms/ci")],
-            audiences: vec![String::from("cachette")],
             jwks_ca_pem: Some(PathBuf::from("/etc/cachette/idp-ca.pem")),
+            issuers: BTreeMap::from([(
+                String::from("https://idp.example.org/realms/ci"),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            )]),
             ..crate::config::OidcConfig::default()
         };
         let mut config = Config::default();
@@ -463,36 +549,20 @@ mod tests {
         );
     }
 
+    /// A per-issuer `jwks_url` is an outbound fetch target: https only.
     #[test]
-    fn jwks_urls_must_target_configured_https_issuers() {
-        fn enabled(base: impl FnOnce(&mut OidcConfig)) -> Config {
-            oidc_config(|oidc| {
-                oidc.enabled = true;
-                oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-                oidc.audiences = vec![String::from("cachette")];
-                oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
-                base(oidc);
-            })
-        }
-
-        let mut config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://other.example.org"),
-                String::from("https://other.example.org/jwks.json"),
-            );
-        });
-        let err = validate(&config).expect_err("url for an unlisted issuer");
-        match &err {
-            ConfigError::OidcJwksIssuerUnknown { issuer } => {
-                assert_eq!(issuer, "https://other.example.org");
-            }
-            other => panic!("expected OidcJwksIssuerUnknown, got {other:?}"),
-        }
-
-        config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://idp.example.org/realms/ci"),
-                String::from("http://idp.example.org/jwks.json"),
+    fn jwks_url_must_be_https() {
+        let issuer = String::from("https://idp.example.org/realms/ci");
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    jwks_url: Some(String::from("http://idp.example.org/jwks.json")),
+                    ..OidcIssuerConfig::default()
+                },
             );
         });
         let err = validate(&config).expect_err("plaintext url");
@@ -501,10 +571,16 @@ mod tests {
             "unexpected error: {err:?}"
         );
 
-        config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://idp.example.org/realms/ci"),
-                String::from("https://idp.example.org/jwks.json"),
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    jwks_url: Some(String::from("https://idp.example.org/jwks.json")),
+                    ..OidcIssuerConfig::default()
+                },
             );
         });
         assert!(validate(&config).is_ok());

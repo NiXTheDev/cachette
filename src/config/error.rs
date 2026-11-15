@@ -88,9 +88,22 @@ pub enum ConfigError {
     #[error("auth.secret must be at least 16 characters (got {len})")]
     ShortSecret { len: usize },
 
-    /// `[auth.oidc]` enabled without a required list, pin or CA bundle.
+    /// `[auth.oidc] enabled without a required list, pin or CA bundle.
     #[error("auth.oidc is enabled but {field} must be configured")]
     OidcMissingRequired { field: &'static str },
+
+    /// A per-issuer OIDC block is missing something it needs.
+    #[error("auth.oidc block for issuer {issuer:?} is missing {field}")]
+    OidcIssuerMissing { issuer: String, field: &'static str },
+
+    /// The v1.1 flat `[auth.oidc]` shape, which v1.2 replaced with
+    /// per-issuer blocks.
+    #[error(
+        "auth.oidc.{key} is the v1.1 flat shape; v1.2 configures one block per issuer: \
+         [auth.oidc.\"<issuer>\"] with audiences = [...] (and require / jwks_url / ca_pem / \
+         leeway_seconds inside that block)"
+    )]
+    OidcLegacyShape { key: &'static str },
 
     /// `[auth.oidc] jwks_refresh_seconds` is zero.
     #[error("auth.oidc.jwks_refresh_seconds must be greater than 0")]
@@ -99,10 +112,6 @@ pub enum ConfigError {
     /// `[auth.oidc] jwks_max_keys` is zero.
     #[error("auth.oidc.jwks_max_keys must be greater than 0")]
     OidcZeroMaxKeys,
-
-    /// `auth.oidc.jwks_urls` names an issuer missing from `issuers`.
-    #[error("auth.oidc.jwks_urls key {issuer:?} is not listed in auth.oidc.issuers")]
-    OidcJwksIssuerUnknown { issuer: String },
 
     /// A `jwks_urls` endpoint (or a default derivation target) is not HTTPS.
     #[error("auth.oidc JWKS endpoint for {issuer:?} must be https (got {url})")]

@@ -69,15 +69,27 @@ pub enum OidcError {
 }
 
 /// Stateless verifier for RS256 OIDC bearer tokens. Holds the configured
-/// trust set (issuers, audiences, `require` pins, leeway) and the
+/// trust set **per issuer** (v1.2 shape: each `[auth.oidc."<issuer>"]`
+/// block carries its own audiences, `require` pins and clock skew) and the
 /// `(issuer, kid)` key source; per-request verification is pure computation
 /// over those.
 pub struct OidcVerifier {
-    issuers: Vec<String>,
-    audiences: Vec<String>,
-    require: BTreeMap<String, String>,
-    leeway_seconds: u64,
+    /// Per-issuer trust sets, keyed by the issuer string (the exact `iss`
+    /// claim the token carries).
+    issuers: BTreeMap<String, IssuerTrust>,
     keys: Arc<dyn RsaKeySource>,
+}
+
+/// One issuer's trust set: what its tokens may claim, and how much clock
+/// skew the gate tolerates.
+#[derive(Clone, Debug, Default)]
+pub struct IssuerTrust {
+    /// `aud` values a token may state (any of).
+    pub audiences: Vec<String>,
+    /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
+    pub require: BTreeMap<String, String>,
+    /// Clock skew tolerated on `exp`/`nbf` (seconds).
+    pub leeway_seconds: u64,
 }
 
 impl fmt::Debug for OidcVerifier {
@@ -86,9 +98,6 @@ impl fmt::Debug for OidcVerifier {
         // operator snapshot needs the config half only.
         f.debug_struct("OidcVerifier")
             .field("issuers", &self.issuers)
-            .field("audiences", &self.audiences)
-            .field("require", &self.require)
-            .field("leeway_seconds", &self.leeway_seconds)
             .finish_non_exhaustive()
     }
 }
@@ -97,20 +106,8 @@ impl OidcVerifier {
     /// Assemble a verifier from the resolved `[auth.oidc]` config and a key
     /// source. Built by the auth-policy loader; `config::validate`
     /// guarantees the required surface before one is constructed.
-    pub fn new(
-        issuers: Vec<String>,
-        audiences: Vec<String>,
-        require: BTreeMap<String, String>,
-        leeway_seconds: u64,
-        keys: Arc<dyn RsaKeySource>,
-    ) -> Self {
-        Self {
-            issuers,
-            audiences,
-            require,
-            leeway_seconds,
-            keys,
-        }
+    pub fn new(issuers: BTreeMap<String, IssuerTrust>, keys: Arc<dyn RsaKeySource>) -> Self {
+        Self { issuers, keys }
     }
 
     /// Verify `token` at unix time `now_unix` (docs/oidc.md chain).
@@ -163,13 +160,16 @@ impl OidcVerifier {
 
         // Step 5: claims-side gates, strictly after the signature bound
         // them. Order: iss, aud, exp, nbf, require (docs/oidc.md step 3).
-        if !self.issuers.iter().any(|trusted| trusted == issuer) {
+        // The issuer selects the trust set: audiences, claim pins and clock
+        // skew are per issuer (v1.2 shape), so a token is judged by the
+        // rules of the IdP that issued it.
+        let Some(trust) = self.issuers.get(issuer) else {
             return Err(OidcError::Issuer);
-        }
-        if !self.audience_granted(claims.get("aud")) {
+        };
+        if !trust.audience_granted(claims.get("aud")) {
             return Err(OidcError::Audience);
         }
-        let leeway = self.leeway_seconds as i64;
+        let leeway = trust.leeway_seconds as i64;
         // `exp` gains the leeway as credit (a clock-skew tolerance);
         // `leeway = 0` degenerates to the strict `exp > now` rule. `nbf`
         // is symmetric on the other side.
@@ -177,11 +177,16 @@ impl OidcVerifier {
         if now_unix >= exp.saturating_add(leeway) {
             return Err(OidcError::Expired);
         }
+        // `nbf` is OPTIONAL (RFC 7519 section 4.1.5): an absent claim means
+        // no lower bound, while a PRESENT but non-numeric one is a
+        // structurally broken token. (v1.1 mapped a missing claim to
+        // `Malformed`, which rejected every token from an issuer that
+        // omits it - Forgejo's OAuth2-app id_token among them.)
         let nbf = claim_secs(claims.get("nbf"))?;
         if now_unix.saturating_add(leeway) < nbf {
             return Err(OidcError::NotYetValid);
         }
-        for (claim, expected) in &self.require {
+        for (claim, expected) in &trust.require {
             let granted = match claims.get(claim) {
                 Some(Value::String(actual)) => actual == expected,
                 // Array-valued claims authorize when they *contain* the
@@ -197,9 +202,11 @@ impl OidcVerifier {
         }
         Ok(())
     }
+}
 
+impl IssuerTrust {
     /// `aud` gate: the claim may be one string or an array of strings; any
-    /// overlap with the configured audiences authorizes.
+    /// overlap with this issuer's audiences authorizes.
     fn audience_granted(&self, aud: Option<&Value>) -> bool {
         let Some(aud) = aud else { return false };
         match aud {
@@ -230,17 +237,25 @@ pub fn install(state: &AppState, config: &Config) -> Result<(), JwksCacheError> 
         return Ok(());
     };
     let keys = JwksCache::try_new(oidc)?;
-    state.install_oidc(
-        OidcVerifier::new(
-            oidc.issuers.clone(),
-            oidc.audiences.clone(),
-            oidc.require.clone(),
-            oidc.leeway_seconds,
-            keys,
-        ),
-        oidc,
+    let trust: BTreeMap<String, IssuerTrust> = oidc
+        .issuers
+        .iter()
+        .map(|(issuer, block)| {
+            (
+                issuer.clone(),
+                IssuerTrust {
+                    audiences: block.audiences.clone(),
+                    require: block.require.clone(),
+                    leeway_seconds: block.leeway_seconds,
+                },
+            )
+        })
+        .collect();
+    state.install_oidc(OidcVerifier::new(trust, keys), oidc);
+    tracing::info!(
+        issuers = ?oidc.issuers.keys().collect::<Vec<_>>(),
+        "oidc bearer verification installed"
     );
-    tracing::info!(issuers = ?oidc.issuers, "oidc bearer verification installed");
     Ok(())
 }
 
@@ -342,19 +357,29 @@ mod tests {
         }
     }
 
+    /// Build a verifier with one trust set per issuer (v1.2 shape). Every
+    /// issuer gets the `cachette` audience plus the caller's pins and
+    /// leeway; the per-issuer test below overrides them.
     fn verifier(
         issuers: Vec<String>,
         require: BTreeMap<String, String>,
         leeway_seconds: u64,
         keys: Arc<dyn RsaKeySource>,
     ) -> OidcVerifier {
-        OidcVerifier::new(
-            issuers,
-            vec![String::from("cachette")],
-            require,
-            leeway_seconds,
-            keys,
-        )
+        let trust = issuers
+            .into_iter()
+            .map(|issuer| {
+                (
+                    issuer,
+                    IssuerTrust {
+                        audiences: vec![String::from("cachette")],
+                        require: require.clone(),
+                        leeway_seconds,
+                    },
+                )
+            })
+            .collect();
+        OidcVerifier::new(trust, keys)
     }
 
     fn std_setup() -> (RsaFixture, OidcVerifier) {
@@ -387,6 +412,71 @@ mod tests {
         let (fx, v) = std_setup();
         let token = signed_token(&fx, HEADER, &claims(&fx.issuer));
         assert_eq!(v.verify(&token, NOW), Ok(()));
+    }
+
+    /// Each issuer is judged by its OWN audiences and claim pins (v1.2
+    /// shape): one deployment can trust several IdPs whose audiences and
+    /// pins have nothing to do with each other.
+    #[test]
+    fn each_issuer_is_judged_by_its_own_audiences_and_pins() {
+        let (fx, mut source) = key_source();
+        let other = String::from("https://other.example.org/realms/ci");
+        let key = source
+            .keys
+            .get(&(fx.issuer.clone(), fx.kid.clone()))
+            .cloned()
+            .expect("fixture key");
+        source.keys.insert((other.clone(), fx.kid.clone()), key);
+        let trust = BTreeMap::from([
+            (
+                fx.issuer.clone(),
+                IssuerTrust {
+                    audiences: vec![String::from("cachette")],
+                    require: BTreeMap::new(),
+                    leeway_seconds: 30,
+                },
+            ),
+            (
+                other.clone(),
+                IssuerTrust {
+                    audiences: vec![String::from("other-svc")],
+                    require: BTreeMap::from([(String::from("sub"), String::from("ci-2"))]),
+                    leeway_seconds: 30,
+                },
+            ),
+        ]);
+        let v = OidcVerifier::new(trust, Arc::new(source));
+
+        // The first issuer's token carrying the SECOND issuer's audience is
+        // rejected: audiences are per issuer, not global.
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"other-svc","sub":"ci-1","exp":{},"nbf":{}}}"#,
+            fx.issuer,
+            NOW + 300,
+            NOW - 5
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Err(OidcError::Audience));
+
+        // The second issuer's own token passes its audience and its pin.
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"other-svc","sub":"ci-2","exp":{},"nbf":{}}}"#,
+            other,
+            NOW + 300,
+            NOW - 5
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Ok(()));
+
+        // ... and the same token with another subject fails that pin.
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"other-svc","sub":"ci-1","exp":{},"nbf":{}}}"#,
+            other,
+            NOW + 300,
+            NOW - 5
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Err(OidcError::Require));
     }
 
     #[test]

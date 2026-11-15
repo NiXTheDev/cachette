@@ -139,22 +139,40 @@ fn oidc_config() -> Config {
     let mut config = Config::default();
     config.auth.oidc = Some(OidcConfig {
         enabled: true,
-        issuers: vec![String::from("https://idp.example.org/realms/ci")],
-        audiences: vec![String::from("cachette")],
         jwks_ca_pem: Some(std::path::PathBuf::from("/etc/cachette/idp-ca.pem")),
         ..OidcConfig::default()
     });
     config
+        .auth
+        .oidc
+        .as_mut()
+        .expect("oidc table")
+        .issuers
+        .insert(
+            String::from("https://idp.example.org/realms/ci"),
+            cachette::config::OidcIssuerConfig {
+                audiences: vec![String::from("cachette")],
+                ..cachette::config::OidcIssuerConfig::default()
+            },
+        );
+    config
 }
 
 fn fixture_verifier(issuers: Vec<String>) -> cachette::auth::oidc::OidcVerifier {
-    cachette::auth::oidc::OidcVerifier::new(
-        issuers,
-        vec![String::from("cachette")],
-        BTreeMap::new(),
-        30,
-        Arc::new(ReloadKeys),
-    )
+    let trust = issuers
+        .into_iter()
+        .map(|issuer| {
+            (
+                issuer,
+                cachette::auth::oidc::IssuerTrust {
+                    audiences: vec![String::from("cachette")],
+                    require: BTreeMap::new(),
+                    leeway_seconds: 30,
+                },
+            )
+        })
+        .collect();
+    cachette::auth::oidc::OidcVerifier::new(trust, Arc::new(ReloadKeys))
 }
 
 /// A SIGHUP reload keeps the boot-installed OIDC verifier — with the same
@@ -165,7 +183,10 @@ fn reload_keeps_the_boot_oidc_verifier_installed() {
     let config = oidc_config();
     let oidc_cfg = config.auth.oidc.clone().expect("table present");
     let state = AppState::new();
-    state.install_oidc(fixture_verifier(oidc_cfg.issuers.clone()), &oidc_cfg);
+    state.install_oidc(
+        fixture_verifier(oidc_cfg.issuers.keys().cloned().collect()),
+        &oidc_cfg,
+    );
 
     let boot = state.oidc().expect("boot install");
     assert!(
@@ -183,7 +204,15 @@ fn reload_keeps_the_boot_oidc_verifier_installed() {
     // Retuned-but-enabled reload: the verifier is still the boot one (the
     // production log warns about the signature change; the restart applies).
     let mut retuned = oidc_config();
-    retuned.auth.oidc.as_mut().expect("present").leeway_seconds = 90;
+    retuned
+        .auth
+        .oidc
+        .as_mut()
+        .expect("present")
+        .issuers
+        .get_mut("https://idp.example.org/realms/ci")
+        .expect("issuer block")
+        .leeway_seconds = 90;
     state.apply_reload(&retuned);
     assert!(
         Arc::ptr_eq(&boot, state.oidc().as_ref().expect("kept")),

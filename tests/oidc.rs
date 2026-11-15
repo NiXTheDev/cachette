@@ -35,7 +35,7 @@ use axum::routing::get;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use cachette::auth::{self, AuthPolicy, TokenStore};
-use cachette::config::{AuthMode, Config, OidcConfig};
+use cachette::config::{AuthMode, Config, OidcConfig, OidcIssuerConfig};
 use cachette::state::AppState;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
@@ -385,12 +385,17 @@ fn config(server: &JwksServer, fields: impl FnOnce(&mut OidcConfig)) -> Config {
     config.auth.tokens = vec![STATIC_TOKEN.to_owned()];
     let mut oidc = OidcConfig {
         enabled: true,
-        issuers: vec![server.issuer()],
-        audiences: vec![AUDIENCE.to_owned()],
         jwks_ca_pem: Some(server.ca_pem_path.clone()),
         ..OidcConfig::default()
     };
-    oidc.jwks_urls.insert(server.issuer(), server.url("/_jwks"));
+    oidc.issuers.insert(
+        server.issuer(),
+        OidcIssuerConfig {
+            audiences: vec![AUDIENCE.to_owned()],
+            jwks_url: Some(server.url("/_jwks")),
+            ..OidcIssuerConfig::default()
+        },
+    );
     fields(&mut oidc);
     config.auth.oidc = Some(oidc);
     config
@@ -405,12 +410,17 @@ fn disabled_config(server: &JwksServer, present: bool) -> Config {
     if present {
         let mut oidc = OidcConfig {
             enabled: false,
-            issuers: vec![server.issuer()],
-            audiences: vec![AUDIENCE.to_owned()],
             jwks_ca_pem: Some(server.ca_pem_path.clone()),
             ..OidcConfig::default()
         };
-        oidc.jwks_urls.insert(server.issuer(), server.url("/_jwks"));
+        oidc.issuers.insert(
+            server.issuer(),
+            OidcIssuerConfig {
+                audiences: vec![AUDIENCE.to_owned()],
+                jwks_url: Some(server.url("/_jwks")),
+                ..OidcIssuerConfig::default()
+            },
+        );
         config.auth.oidc = Some(oidc);
     }
     config
@@ -687,7 +697,12 @@ async fn default_jwks_url_derives_from_issuer() {
         let (router, _state) = app(
             // Clear the override the helper pre-inserts: the fetch must
             // derive the default URL from the issuer itself.
-            &config(&server, |oidc| oidc.jwks_urls.clear()),
+            &config(&server, |oidc| {
+                oidc.issuers
+                    .get_mut(&server.issuer())
+                    .expect("issuer block")
+                    .jwks_url = None;
+            }),
             root.path(),
         );
 
@@ -739,43 +754,43 @@ async fn expired_and_wrong_audience_tokens_fail() {
     drop(root);
 }
 
-/// The `[auth.oidc]` TOML surface roundtrips through serde, and unknown
-/// keys are denied (operator-surface guard).
+/// The `[auth.oidc]` TOML surface roundtrips through serde (v1.2 shape:
+/// one block per issuer), and unknown keys are denied (operator-surface
+/// guard).
 #[test]
 fn oidc_toml_surface_roundtrips() {
+    let issuer = String::from("https://idp.example.org/realms/ci");
     let oidc = OidcConfig {
         enabled: true,
-        issuers: vec![String::from("https://idp.example.org/realms/ci")],
-        audiences: vec![String::from("cachette")],
-        jwks_urls: BTreeMap::from([(
-            String::from("https://idp.example.org/realms/ci"),
-            String::from("https://idp.example.org/jwks.json"),
-        )]),
-        require: BTreeMap::from([(String::from("sub"), String::from("ci-"))]),
-        leeway_seconds: 90,
         jwks_refresh_seconds: 300,
         jwks_max_keys: 64,
         jwks_ca_pem: Some(PathBuf::from("/etc/cachette/idp-ca.pem")),
+        issuers: BTreeMap::from([(
+            issuer.clone(),
+            OidcIssuerConfig {
+                audiences: vec![String::from("cachette")],
+                jwks_url: Some(String::from("https://idp.example.org/jwks.json")),
+                require: BTreeMap::from([(String::from("sub"), String::from("ci-"))]),
+                leeway_seconds: 90,
+                ca_pem: None,
+            },
+        )]),
+        ..OidcConfig::default()
     };
 
     let rendered = toml::to_string(&oidc).expect("serializes");
     let roundtrip: OidcConfig = toml::from_str(&rendered).expect("parses back");
 
     assert!(roundtrip.enabled);
-    assert_eq!(roundtrip.issuers, ["https://idp.example.org/realms/ci"]);
-    assert_eq!(roundtrip.audiences, ["cachette"]);
+    assert_eq!(roundtrip.issuers.keys().collect::<Vec<_>>(), [&issuer]);
+    let block = roundtrip.issuers.get(&issuer).expect("issuer block");
+    assert_eq!(block.audiences, ["cachette"]);
     assert_eq!(
-        roundtrip
-            .jwks_urls
-            .get("https://idp.example.org/realms/ci")
-            .map(String::as_str),
+        block.jwks_url.as_deref(),
         Some("https://idp.example.org/jwks.json")
     );
-    assert_eq!(
-        roundtrip.require.get("sub").map(String::as_str),
-        Some("ci-")
-    );
-    assert_eq!(roundtrip.leeway_seconds, 90);
+    assert_eq!(block.require.get("sub").map(String::as_str), Some("ci-"));
+    assert_eq!(block.leeway_seconds, 90);
     assert_eq!(roundtrip.jwks_refresh_seconds, 300);
     assert_eq!(roundtrip.jwks_max_keys, 64);
     assert_eq!(
@@ -783,9 +798,28 @@ fn oidc_toml_surface_roundtrips() {
         Some(Path::new("/etc/cachette/idp-ca.pem"))
     );
 
-    // unknown keys are rejected, not silently ignored
+    // unknown keys inside an issuer block are rejected, not silently ignored
     assert!(
-        toml::from_str::<OidcConfig>("enabled = true\nno_such_knob = true").is_err(),
-        "unknown [auth.oidc] keys must be denied"
+        toml::from_str::<OidcConfig>(
+            "enabled = true\n[auth.oidc.\"https://idp.example.org\"]\nno_such_knob = true"
+        )
+        .is_err(),
+        "unknown per-issuer keys must be denied"
+    );
+}
+
+/// The v1.1 flat shape does not parse into the v1.2 surface silently: it is
+/// kept only so the validation layer can name it.
+#[test]
+fn the_v11_flat_shape_is_rejected() {
+    let flat = r#"
+        enabled = true
+        issuers = ["https://idp.example.org/realms/ci"]
+        audiences = ["cachette"]
+    "#;
+    let parsed: OidcConfig = toml::from_str(flat).expect("the legacy keys still parse");
+    assert!(
+        parsed.legacy_issuers.is_some(),
+        "the legacy issuer list must be visible to validation"
     );
 }

@@ -43,7 +43,9 @@ the runner-facing endpoints, the other serves the clustering needs (see
   walker converges existing whole-blob entries when you flip it on.
 - **OIDC bearer auth.** `[auth.oidc]` verifies RS256 bearer JWTs against your
   IdP's JWKS: kid routing, periodic prefetch + lazy singleflight on unknown
-  kids, per-issuer HTTPS, structural rejections fail closed.
+  kids, per-issuer HTTPS, structural rejections fail closed. Each issuer is
+  its own block (`[auth.oidc."<issuer>"]`) with its own audiences, claim
+  pins, trust roots and clock skew - one deployment can trust many IdPs.
 
 ## Quickstart
 
@@ -160,11 +162,14 @@ reference, valid-value notes, and examples.
 | `auth` | `tokens` | list of static bearer tokens | `[]` |
 | `auth` | `hmac_max_age_seconds` | seconds, `0` = disabled | `600` |
 | `auth.oidc` | `enabled` | boolean | `false` |
-| `auth.oidc` | `issuers` | list of HTTPS issuer URLs | unset |
-| `auth.oidc` | `audiences` | list of accepted `aud` values (any overlap) | unset |
-| `auth.oidc` | `jwks_urls` | map of issuer to JWKS endpoint | derived per issuer |
-| `auth.oidc` | `require` | map of claim to required value(s) | `{}` |
 | `auth.oidc` | `jwks_refresh_seconds` | periodic JWKS prefetch interval, `> 0` | `1800` |
+| `auth.oidc` | `jwks_max_keys` | server-wide cached-key cap | `32` |
+| `auth.oidc` | `jwks_ca_pem` | default JWKS trust roots (PEM path) | unset |
+| `auth.oidc."<issuer>"` | `audiences` | list of accepted `aud` values (any overlap) | required |
+| `auth.oidc."<issuer>"` | `jwks_url` | JWKS endpoint | `{issuer}/.well-known/jwks.json` |
+| `auth.oidc."<issuer>"` | `require` | map of claim to required value(s) | `{}` |
+| `auth.oidc."<issuer>"` | `leeway_seconds` | clock skew tolerated on `exp`/`nbf` | `30` |
+| `auth.oidc."<issuer>"` | `ca_pem` | trust roots for this issuer (overrides the default) | unset |
 | `v1` | `signed_url_ttl_seconds` | seconds (governs v1 and v2 capability URLs) | `900` |
 | `v2` | `jwt_secret` | HS256 secret (falls back to `auth.secret`) | unset |
 | `v2` | `jwt_ttl_seconds` | seconds (governs the Twirp JWT) | `300` |
