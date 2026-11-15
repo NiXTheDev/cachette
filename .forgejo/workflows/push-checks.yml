@@ -92,6 +92,10 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+      # Egress-proof the toolchain fetch - the mirror ladder lives in
+      # .forgejo/actions/rustup-mirror (see its header for the why).
+      - name: Bootstrap rustup through the mirror ladder
+        uses: ./.forgejo/actions/rustup-mirror
       - name: Install rustfmt toolchain
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
@@ -99,10 +103,12 @@ jobs:
           toolchain: 1.99
           components: rustfmt
       # The component fetch is its own network leg and rustup carries no
-      # ladder (run 5's fmt died in 14s when the toolchain host EOF'd
-      # mid-`rustup component add`, and 992ba8e's fmt/check/clippy legs
-      # relapsed the same class). `rustup component add` no-ops in ~1s
-      # when the component is already in place, so the common path pays
+      # ladder of its own (run 5's fmt died in 14s when the toolchain host
+      # EOF'd mid-`rustup component add`, and 992ba8e's fmt/check/clippy legs
+      # relapsed the same class). The bootstrap step above now points
+      # rustup at a mirror ladder for the TOOLCHAIN fetch; the component
+      # fetch rides that same mirror, and `rustup component add` no-ops in
+      # ~1s when the component is already in place, so the common path pays
       # nothing; a poisoned/rejected fetch gets three retries with backoff
       # and a loud tool-level error instead of a bare rustup wall.
       - name: Ensure the components landed (retry ladder)
@@ -140,6 +146,10 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+      # Egress-proof the toolchain fetch - the mirror ladder lives in
+      # .forgejo/actions/rustup-mirror (see its header for the why).
+      - name: Bootstrap rustup through the mirror ladder
+        uses: ./.forgejo/actions/rustup-mirror
       - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
@@ -177,6 +187,10 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+      # Egress-proof the toolchain fetch - the mirror ladder lives in
+      # .forgejo/actions/rustup-mirror (see its header for the why).
+      - name: Bootstrap rustup through the mirror ladder
+        uses: ./.forgejo/actions/rustup-mirror
       - name: Install clippy toolchain
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
@@ -228,6 +242,10 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+      # Egress-proof the toolchain fetch - the mirror ladder lives in
+      # .forgejo/actions/rustup-mirror (see its header for the why).
+      - name: Bootstrap rustup through the mirror ladder
+        uses: ./.forgejo/actions/rustup-mirror
       - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
@@ -293,6 +311,10 @@ jobs:
     steps:
       - name: Checkout
         uses: https://hangar.nixthedev.ru/actions/checkout@v4
+      # Egress-proof the toolchain fetch - the mirror ladder lives in
+      # .forgejo/actions/rustup-mirror (see its header for the why).
+      - name: Bootstrap rustup through the mirror ladder
+        uses: ./.forgejo/actions/rustup-mirror
       - name: Install pinned Rust (1.99)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
