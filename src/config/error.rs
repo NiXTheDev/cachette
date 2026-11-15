@@ -64,6 +64,19 @@ pub enum ConfigError {
     #[error("cluster.cert_path must differ from storage.fs.path")]
     CertPathCollides,
 
+    /// `[storage.cdc] avg_chunk_bytes` outside the chunker's useful window;
+    /// validated regardless of `enabled` so a bad value cannot hide until
+    /// the flag flips on.
+    #[error("storage.cdc.avg_chunk_bytes must be within 32768..=1048576 (got {value})")]
+    CdcAvgRange { value: u64 },
+
+    /// `[storage.cdc] backfill_delay_ms` is zero - the backfill walker would
+    /// hot-spin between conversions; validated regardless of `enabled` so a
+    /// bad value cannot hide until the flag flips on (same policy as
+    /// `avg_chunk_bytes`).
+    #[error("storage.cdc.backfill_delay_ms must be at least 1 (got 0)")]
+    ZeroCdcBackfillDelay,
+
     /// `[auth] secret` missing at serve time (not checked by `--print-config`).
     #[error(
         "auth.secret is required to serve: set [auth] secret in the config file or the \
@@ -74,6 +87,35 @@ pub enum ConfigError {
     /// `[auth] secret` shorter than 16 characters at serve time.
     #[error("auth.secret must be at least 16 characters (got {len})")]
     ShortSecret { len: usize },
+
+    /// `[auth.oidc]` enabled without a required list, pin or CA bundle.
+    #[error("auth.oidc is enabled but {field} must be configured")]
+    OidcMissingRequired { field: &'static str },
+
+    /// `[auth.oidc] jwks_refresh_seconds` is zero.
+    #[error("auth.oidc.jwks_refresh_seconds must be greater than 0")]
+    OidcZeroRefresh,
+
+    /// `[auth.oidc] jwks_max_keys` is zero.
+    #[error("auth.oidc.jwks_max_keys must be greater than 0")]
+    OidcZeroMaxKeys,
+
+    /// `auth.oidc.jwks_urls` names an issuer missing from `issuers`.
+    #[error("auth.oidc.jwks_urls key {issuer:?} is not listed in auth.oidc.issuers")]
+    OidcJwksIssuerUnknown { issuer: String },
+
+    /// A `jwks_urls` endpoint (or a default derivation target) is not HTTPS.
+    #[error("auth.oidc JWKS endpoint for {issuer:?} must be https (got {url})")]
+    OidcJwksPlaintext { issuer: String, url: String },
+
+    /// An issuer URL is not HTTPS: the default JWKS endpoint would be
+    /// derived as `{issuer}/.well-known/jwks.json`, so a plaintext issuer
+    /// would mean a plaintext fetch. Only explicit overrides may deviate,
+    /// and those are already pinned to `https` themselves.
+    #[error(
+        "auth.oidc issuer {issuer:?} must be an https URL (default JWKS endpoints derive from it)"
+    )]
+    OidcIssuerPlaintext { issuer: String },
 
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.

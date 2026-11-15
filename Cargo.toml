@@ -1,30 +1,31 @@
 [package]
 name = "cachette"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "MIT"
 
 [dependencies]
+aws-lc-rs = "^1.18.2"
 axum = "^0.8.9"
-tokio = { version = "^1.53.2", features = ["full"] }
-tower = "^0.5.3"
+base64 = "^0.23"
+blake3 = "^1.8.7"
 clap = { version = "^4.6.7", features = ["derive"] }
-serde = { version = "^1.0.229", features = ["derive"] }
-serde_json = "^1.0.151"
-toml = "^0.9"
-tracing = "^0.1.44"
-tracing-subscriber = { version = "^0.3.23", features = ["env-filter", "json"] }
+fs2 = "^0.4.3"
+hmac = "^0.13.0"
+mdns-sd = "^0.21.5"
+rcgen = { version = "^0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rusqlite = { version = "^0.41", features = ["bundled"] }
 rustls = "^0.23"
 rustls-pemfile = "^2.2.0"
-tokio-rustls = "^0.26"
-rcgen = { version = "^0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
-rusqlite = { version = "^0.32", features = ["bundled"] }
-mdns-sd = "^0.21.5"
-hmac = "^0.13.0"
+serde = { version = "^1.0.229", features = ["derive"] }
+serde_json = "^1.0.151"
 sha2 = "^0.11.0"
-blake3 = "^1.8.7"
-base64 = "^0.22"
-url = "^2.5.8"
 thiserror = "^2"
-tower-http = { version = "^0.6", features = ["trace", "catch-panic"] }
-fs2 = "^0.4.3"
+tokio = { version = "^1.53.2", features = ["full"] }
+tokio-rustls = "^0.26"
+toml = "^1"
+tower = "^0.5.3"
+tower-http = { version = "^0.7", features = ["trace", "catch-panic"] }
+tracing = "^0.1.44"
+tracing-subscriber = { version = "^0.3.23", features = ["env-filter", "json"] }
+url = "^2.5.8"

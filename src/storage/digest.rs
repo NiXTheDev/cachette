@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Stored digest width in bytes.
 pub const DIGEST_BYTES: usize = 16;
@@ -87,6 +87,24 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buf[..read]);
+    }
+    Ok(hex16(hasher.finalize().as_bytes()))
+}
+
+/// Digest of several files concatenated in the given order — the chunked
+/// layout's whole-payload recheck for `cachette verify` (docs/cdc.md).
+pub fn hash_files(paths: &[PathBuf]) -> io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0_u8; HASH_CHUNK];
+    for path in paths {
+        let mut file = File::open(path)?;
+        loop {
+            let read = file.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
     }
     Ok(hex16(hasher.finalize().as_bytes()))
 }

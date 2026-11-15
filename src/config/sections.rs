@@ -49,6 +49,9 @@ impl Default for ServerConfig {
 pub struct StorageConfig {
     pub backend: Backend,
     pub fs: FsConfig,
+    /// Finalize-time content-defined chunking (v1.1); `[storage.cdc]` may
+    /// be absent entirely - everything defaults off.
+    pub cdc: CdcConfig,
 }
 
 impl Default for StorageConfig {
@@ -56,6 +59,7 @@ impl Default for StorageConfig {
         Self {
             backend: Backend::Fs,
             fs: FsConfig::default(),
+            cdc: CdcConfig::default(),
         }
     }
 }
@@ -83,6 +87,41 @@ impl Default for FsConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Fs,
+}
+
+/// `[storage.cdc]` - finalize-time content-defined chunking (v1.1; the
+/// contract lives in `docs/cdc.md`). Off by default: entries are stored
+/// whole exactly as in v1.0, and the read path stays chunk-aware regardless
+/// of the flag, so flipping it off never orphans already-chunked data.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdcConfig {
+    /// Cut finalized payloads into deduplicated content chunks at rest.
+    pub enabled: bool,
+    /// Target mean chunk size in bytes; validation keeps it within
+    /// [`MIN_AVG_CHUNK_BYTES`](crate::storage::cdc::MIN_AVG_CHUNK_BYTES)
+    /// ..[`MAX_AVG_CHUNK_BYTES`](crate::storage::cdc::MAX_AVG_CHUNK_BYTES).
+    pub avg_chunk_bytes: u64,
+    /// Converge pre-CDC `whole` entries onto the chunked layout in the
+    /// background when `enabled` is on (docs/cdc.md, Migration). Default on:
+    /// turning `[storage.cdc] enabled` on means "converge", not just "new
+    /// writes chunk".
+    pub backfill: bool,
+    /// Pause between single-entry backfill conversions; bounds the walker's
+    /// interference with live traffic. Validated `>= 1` regardless of
+    /// `enabled` (a zero delay would hot-spin once enabled flips on).
+    pub backfill_delay_ms: u64,
+}
+
+impl Default for CdcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            avg_chunk_bytes: crate::storage::cdc::DEFAULT_AVG_CHUNK_BYTES,
+            backfill: true,
+            backfill_delay_ms: 100,
+        }
+    }
 }
 
 /// `[cache]` - local size accounting + eviction knobs.
@@ -140,6 +179,8 @@ pub struct AuthConfig {
     pub tokens: Vec<String>,
     /// 0 = disabled (GitHub parity, M14).
     pub hmac_max_age_seconds: u64,
+    /// OIDC RS256 bearer acceptance (v1.1); `None` = table absent = disabled.
+    pub oidc: Option<OidcConfig>,
 }
 
 impl Default for AuthConfig {
@@ -149,6 +190,7 @@ impl Default for AuthConfig {
             secret: None,
             tokens: Vec::new(),
             hmac_max_age_seconds: 600,
+            oidc: None,
         }
     }
 }
@@ -160,6 +202,51 @@ pub enum AuthMode {
     Hmac,
     Bearer,
     Merge,
+}
+
+/// `[auth.oidc]` - OIDC RS256 bearer acceptance (v1.1 workstream A;
+/// docs/oidc.md is the contract). Entirely default-off: omitting the table
+/// (or leaving `enabled = false`) leaves v1.0 behavior byte-identical.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcConfig {
+    pub enabled: bool,
+    /// IdPs whose tokens are accepted; required when `enabled`.
+    pub issuers: Vec<String>,
+    /// `aud` values a token may state (any of); required when `enabled`.
+    pub audiences: Vec<String>,
+    /// `issuer -> explicit JWKS URL` override; the default endpoint is
+    /// `{issuer}/.well-known/jwks.json` (docs/oidc.md §JWKS handling).
+    pub jwks_urls: BTreeMap<String, String>,
+    /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
+    /// Array-valued claims authorize when they contain the value.
+    pub require: BTreeMap<String, String>,
+    /// Clock skew tolerated on `exp`/`nbf` (seconds).
+    pub leeway_seconds: u64,
+    /// Periodic JWKS re-fetch interval (lazy unknown-kid refresh happens
+    /// regardless); 0 is rejected by `config::validate`.
+    pub jwks_refresh_seconds: u64,
+    /// Hard cap on cached keys server-wide (rotation-flooding guard).
+    pub jwks_max_keys: usize,
+    /// PEM bundle serving as the JWKS fetcher's trust roots (self-hosted
+    /// IdPs commonly need it); required when `enabled`.
+    pub jwks_ca_pem: Option<PathBuf>,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuers: Vec::new(),
+            audiences: Vec::new(),
+            jwks_urls: BTreeMap::new(),
+            require: BTreeMap::new(),
+            leeway_seconds: 30,
+            jwks_refresh_seconds: 1800,
+            jwks_max_keys: 32,
+            jwks_ca_pem: None,
+        }
+    }
 }
 
 /// `[v1]` - artifactcache protocol knobs.

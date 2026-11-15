@@ -208,6 +208,9 @@ fn health_label(health: &EntryHealth) -> String {
     match health {
         EntryHealth::Ok => String::from("ok"),
         EntryHealth::MissingBlob => String::from("missing-blob"),
+        EntryHealth::MissingChunk { missing, total } => {
+            format!("missing-chunk ({missing} of {total} chunk files gone)")
+        }
         EntryHealth::MissingDigest => String::from("missing-digest (pre-task-50 row)"),
         EntryHealth::SizeMismatch { expected, actual } => {
             format!("size-mismatch (expected {expected}, actual {actual})")
@@ -501,7 +504,13 @@ fn token(action: &TokenCommand, config: &Config) -> Result<i32, Box<dyn Error>> 
             eprintln!(
                 "# HS256 bearer for buildx type=gha / @actions/cache: ac=\"[]\", exp=now+{ttl}s, nbf=now-5s"
             );
-            eprintln!("# list this exact string in the forge secret AND in [auth] tokens");
+            eprintln!(
+                "# export it as the forge secret / ACTIONS_RUNTIME_TOKEN; the server verifies"
+            );
+            eprintln!("# its signature against [auth].secret, so no [auth] tokens entry is needed");
+            eprintln!(
+                "# (auth.mode = \"bearer\" or \"merge\"; hmac mode never looks at bearer tokens)"
+            );
         }
         Some(MintKind::Hmac { scope, repo, run }) => print_hmac(secret, scope, repo, *run),
         None => print_hmac(secret, scope, repo, *run),
@@ -531,12 +540,13 @@ fn print_hmac(secret: &str, scope: &Scope, repo: &str, run: u64) {
 
 /// Mint the HS256 bearer JWT that buildx `type=gha` (go-actions-cache) and
 /// the @actions/cache toolkit accept: `ac="[]"`, `exp`/`nbf` from now, three
-/// dot-separated base64url segments. The server string-matches the token
-/// against `[auth] tokens`; signing with `[auth].secret` additionally makes
-/// the string a valid cachette Twirp JWT (see docs/clients.md). The client
-/// enforces `exp` locally (`cache token expired at ...`), which is why the
-/// caller controls the TTL instead of hard-coding a short one. Self-checked
-/// against our own validator before printing.
+/// dot-separated base64url segments. The server verifies the HS256 signature
+/// against `[auth].secret` — the key it was minted with — so in `bearer`/
+/// `merge` modes it authorizes v1 and Twirp requests with no `[auth] tokens`
+/// listing (`hmac` mode never looks at bearer tokens). The client enforces
+/// `exp` locally (`cache token expired at ...`), which is why the caller
+/// controls the TTL instead of hard-coding a short one. Self-checked against
+/// our own validator before printing.
 fn mint_buildx_jwt(secret: &str, ttl_seconds: u64, now_unix: i64) -> Result<String, io::Error> {
     let token = crate::auth::jwt::mint(secret, "[]", ttl_seconds, now_unix);
     if let Err(err) = crate::auth::jwt::validate(&token, secret, now_unix) {

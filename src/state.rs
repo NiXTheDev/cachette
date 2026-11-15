@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::auth::oidc::OidcVerifier;
 use crate::auth::{AuthPolicy, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
-use crate::config::{Config, KeyCase, MinFree};
+use crate::config::{Config, KeyCase, MinFree, OidcConfig};
 use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -65,6 +66,22 @@ impl Default for CacheLimits {
     }
 }
 
+/// OIDC runtime state (v1.1 workstream A): the verifier `auth::oidc::install`
+/// hung on the state at BOOT plus the boot config's `[auth.oidc]` signature.
+/// A SIGHUP reload never swaps the verifier (docs/oidc.md rollout: toggling
+/// `enabled` requires only a restart); `apply_reload` warns when the
+/// reloaded table differs from the boot signature.
+#[derive(Debug, Default)]
+pub struct OidcRuntime {
+    /// The boot-installed verifier; `None` when `[auth.oidc]` was absent or
+    /// disabled at boot.
+    pub verifier: Option<Arc<OidcVerifier>>,
+    /// JSON signature of the `[auth.oidc]` section the boot install used,
+    /// for the reload warn-on-change; `None` = installed with OIDC off (or
+    /// never installed).
+    pub boot_signature: Option<String>,
+}
+
 /// State threaded through every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -96,6 +113,10 @@ pub struct AppState {
     /// bump, no heap allocation) so an in-flight request keeps the policy it
     /// started with and never holds the lock across an `.await`.
     pub auth: Arc<RwLock<Arc<AuthPolicy>>>,
+    /// OIDC bearer verification (v1.1 workstream A): the boot-installed
+    /// verifier behind [`OidcRuntime`]. Reload keeps whatever was installed
+    /// and only warns on a changed config (restart required).
+    pub oidc: Arc<RwLock<OidcRuntime>>,
     /// Cache capacity + reservation knobs (plan task 19), shared so a SIGHUP
     /// reload (plan task 49) can refresh them live. Readers take a `Copy`
     /// snapshot through [`AppState::cache_limits`].
@@ -140,6 +161,7 @@ impl AppState {
             peer_table: Arc::new(PeerTable::new()),
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(RwLock::new(Arc::new(AuthPolicy::default()))),
+            oidc: Arc::new(RwLock::new(OidcRuntime::default())),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
             external_url: None,
             relay: None,
@@ -167,6 +189,33 @@ impl AppState {
             .auth
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+    }
+
+    /// Install the boot-built OIDC verifier (v1.1 workstream A): the verifier
+    /// itself plus a JSON signature of the `[auth.oidc]` section that built
+    /// it. Called once at boot by [`crate::auth::oidc::install`]; a SIGHUP
+    /// reload never re-installs (docs/oidc.md rollout: toggling `enabled`
+    /// requires only a restart).
+    pub fn install_oidc(&self, verifier: OidcVerifier, oidc: &OidcConfig) {
+        *self
+            .oidc
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = OidcRuntime {
+            verifier: Some(Arc::new(verifier)),
+            boot_signature: Some(oidc_signature(oidc)),
+        };
+    }
+
+    /// The boot-installed OIDC verifier, if any. `None` when `[auth.oidc]`
+    /// was absent or disabled at boot — rejection behavior is then exactly
+    /// v1.0's. Clones the `Arc` (atomic refcount bump, no lock held after).
+    #[must_use]
+    pub fn oidc(&self) -> Option<Arc<OidcVerifier>> {
+        self.oidc
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verifier
+            .clone()
     }
 
     /// A `Copy` snapshot of the live cache limits (no lock held afterwards).
@@ -210,10 +259,39 @@ impl AppState {
     /// Apply one reloaded config's reloadable subset in place (plan task 49):
     /// the auth policy and the cache limits. Boot-only knobs (listen addresses,
     /// the data directory, the storage backend, cluster wiring) are not touched.
+    ///
+    /// v1.1: the OIDC verifier installed at boot is deliberately NOT swapped
+    /// (docs/oidc.md rollout — toggling/retuning OIDC requires a restart, so
+    /// an in-flight verifier keeps a consistent JWKS/trust state). A reloaded
+    /// `[auth.oidc]` section that differs from the boot signature is warned
+    /// about on every such reload — persistent by design, a standing reminder
+    /// that the running verifier is not the configured one.
     pub fn apply_reload(&self, config: &Config) {
         self.set_auth(AuthPolicy::from_config(config));
         self.set_cache_limits(CacheLimits::from_config(config));
+        let reloaded_signature = config
+            .auth
+            .oidc
+            .as_ref()
+            .filter(|oidc| oidc.enabled)
+            .map(oidc_signature);
+        let runtime = self
+            .oidc
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if runtime.boot_signature != reloaded_signature && reloaded_signature.is_some() {
+            tracing::warn!(
+                "reloaded [auth.oidc] differs from the section the boot verifier was built \
+                 with; the boot verifier stays active until a restart"
+            );
+        }
     }
+}
+
+/// JSON signature of an `[auth.oidc]` section for boot-vs-reload comparison.
+/// Complexity is fine here: called once per install and once per reload.
+fn oidc_signature(oidc: &OidcConfig) -> String {
+    serde_json::to_string(oidc).unwrap_or_else(|_| String::from("<unrepresentable>"))
 }
 
 impl Default for AppState {
@@ -233,7 +311,10 @@ fn default_node_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    /// Plan task 3 acceptance: unit-test the version parse.
+    /// Plan task 3 acceptance: unit-test the version parse - the crate's
+    /// own version is semver: exactly three numeric components. (The
+    /// literal [1, 0, 0] this once pinned died with the 1.1.0 cut: a
+    /// version snapshot is not the contract, the parse is.)
     #[test]
     fn version_parses_as_semver_matching_the_package() {
         let raw = env!("CARGO_PKG_VERSION");
@@ -241,6 +322,6 @@ mod tests {
             .split('.')
             .map(|part| part.parse::<u64>().expect("version component is numeric"))
             .collect();
-        assert_eq!(components, vec![1, 0, 0], "unexpected version: {raw}");
+        assert_eq!(components.len(), 3, "unexpected version: {raw}");
     }
 }

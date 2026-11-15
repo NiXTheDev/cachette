@@ -32,7 +32,10 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519, date_time_ymd};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519, PublicKeyData,
+    date_time_ymd,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -108,7 +111,7 @@ impl Identity {
             dir: dir.to_path_buf(),
             reason: format!("{KEY_FILE} is not a parseable PEM private key"),
         })?;
-        let spki = key_pair.public_key_der();
+        let spki = key_pair.subject_public_key_info();
         let cert_der = first_cert_der(&cert_pem).ok_or_else(|| IdentityError::Invalid {
             dir: dir.to_path_buf(),
             reason: format!("{CERT_FILE} contains no valid PEM certificate"),
@@ -146,7 +149,7 @@ impl Identity {
         let cert = params.self_signed(&key_pair)?;
         let key_pem = key_pair.serialize_pem();
         let cert_pem = cert.pem();
-        let fingerprint = fingerprint_spki(&key_pair.public_key_der());
+        let fingerprint = fingerprint_spki(&key_pair.subject_public_key_info());
         write_private(dir, KEY_FILE, key_pem.as_bytes())?;
         write_private(dir, CERT_FILE, cert_pem.as_bytes())?;
         tracing::info!(dir = %dir.display(), "first-boot Ed25519 identity generated");
@@ -208,7 +211,7 @@ impl Identity {
         params.not_after = date_time_ymd(expiry_year, expiry_month, expiry_day);
         let cert = params.self_signed(&key_pair)?;
         let cert_pem = cert.pem();
-        let fingerprint = fingerprint_spki(&key_pair.public_key_der());
+        let fingerprint = fingerprint_spki(&key_pair.subject_public_key_info());
         // Only the certificate changes; the key file is left byte-for-byte
         // intact (renewal must not perturb the pinned identity).
         write_private(dir, CERT_FILE, cert_pem.as_bytes())?;
@@ -482,7 +485,10 @@ mod tests {
             "not uppercase hex: {fingerprint}"
         );
         let key_pair = KeyPair::from_pem(&key_pem).expect("generated key parses");
-        assert_eq!(fingerprint, fingerprint_spki(&key_pair.public_key_der()));
+        assert_eq!(
+            fingerprint,
+            fingerprint_spki(&key_pair.subject_public_key_info())
+        );
         assert_eq!(identity.key_pem(), key_pem);
         assert_eq!(identity.cert_pem(), cert_pem);
     }

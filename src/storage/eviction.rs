@@ -22,8 +22,9 @@
 //!   (everything leased) warns and returns instead of deadlocking.
 //! - [`Reaper`]: periodic reservation TTL cleanup for the FS backend (plan
 //!   M4): rows with `reservation_expires_at < now` lose their parts and
-//!   row, and rowless blob files older than [`ORPHAN_BLOB_GRACE`] (1h)
-//!   are swept. The periodic interval is `reservation_ttl / 4`.
+//!   row, and files older than [`ORPHAN_BLOB_GRACE`] (1h) are swept —
+//!   rowless blobs, rowless chunk files, aged finalize scratch
+//!   (docs/cdc.md §GC). The periodic interval is `reservation_ttl / 4`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -414,6 +415,13 @@ pub struct ReapReport {
     pub reservations_reaped: u64,
     /// Rowless blob files older than [`ORPHAN_BLOB_GRACE`] deleted.
     pub orphan_blobs_swept: u64,
+    /// Rowless `chunks/{id}.chunk` files older than the grace deleted
+    /// (docs/cdc.md §GC).
+    pub orphan_chunks_swept: u64,
+    /// Aged `chunks/{id}.chunk.tmp` finalize-scratch files deleted.
+    pub chunk_temps_swept: u64,
+    /// Belt-and-braces `chunks` rows with `refs = 0` purged.
+    pub zero_ref_chunk_rows_purged: u64,
     /// Idle per-key chunk locks dropped (T52): unbounded otherwise.
     pub chunk_locks_swept: u64,
 }
@@ -433,17 +441,22 @@ impl Reaper {
     }
 
     /// One pass: reap reservations whose `reservation_expires_at` has
-    /// passed, sweep rowless blobs older than [`ORPHAN_BLOB_GRACE`], and drop
-    /// idle chunk locks so that map cannot grow without bound.
+    /// passed, sweep rowless blobs and chunk-side leftovers older than
+    /// [`ORPHAN_BLOB_GRACE`] (docs/cdc.md §GC), and drop idle chunk locks
+    /// so that map cannot grow without bound.
     pub async fn sweep_once(&self, storage: &FsStorage) -> std::io::Result<ReapReport> {
         let now = super::unix_now();
         let reservations_reaped = storage.reap_expired_reservations(now).await?;
         let cutoff = now.saturating_sub(ORPHAN_BLOB_GRACE.as_secs());
         let orphan_blobs_swept = storage.sweep_orphan_blobs(cutoff).await?;
+        let chunks = storage.sweep_orphan_chunks(cutoff).await?;
         let chunk_locks_swept = storage.sweep_chunk_locks();
         Ok(ReapReport {
             reservations_reaped,
             orphan_blobs_swept,
+            orphan_chunks_swept: chunks.files,
+            chunk_temps_swept: chunks.temps,
+            zero_ref_chunk_rows_purged: chunks.rows,
             chunk_locks_swept,
         })
     }

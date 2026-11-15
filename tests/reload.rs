@@ -4,15 +4,21 @@
 //! against the new secret is accepted — and nothing else (boot-only knobs) is
 //! disturbed.
 //!
+//! v1.1 workstream A addendum: a reload NEVER swaps (or uninstalls) the
+//! boot-installed OIDC verifier — the section's signature change warns in
+//! production and the restart applies it (docs/oidc.md rollout).
+//!
 //! The signal itself is `cfg(unix)` and cannot be delivered to a child on
 //! Windows CI, so the reload is applied through the same entry point the
 //! signal handler uses (`AppState::apply_reload`, fed by `config::load`), and
 //! the request path is then driven with real HMAC headers.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use cachette::auth::hmac;
-use cachette::config::Config;
+use cachette::config::{Config, OidcConfig};
 use cachette::state::AppState;
 
 /// Build a resolved [`Config`] with the given HMAC secret and cache size.
@@ -114,4 +120,82 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after the epoch")
         .as_secs() as i64
+}
+
+// -- v1.1 workstream A: reloads never swap (or uninstall) the OIDC verifier —
+
+/// A key source that is never consulted: the reload tests assert verifier
+/// identity, not token answers.
+struct ReloadKeys;
+
+impl cachette::auth::jwks::RsaKeySource for ReloadKeys {
+    fn key(&self, _issuer: &str, _kid: &str) -> Option<cachette::auth::jwks::JwksKey> {
+        None
+    }
+}
+
+/// Enabled `[auth.oidc]` surface with a distinct issuer string.
+fn oidc_config() -> Config {
+    let mut config = Config::default();
+    config.auth.oidc = Some(OidcConfig {
+        enabled: true,
+        issuers: vec![String::from("https://idp.example.org/realms/ci")],
+        audiences: vec![String::from("cachette")],
+        jwks_ca_pem: Some(std::path::PathBuf::from("/etc/cachette/idp-ca.pem")),
+        ..OidcConfig::default()
+    });
+    config
+}
+
+fn fixture_verifier(issuers: Vec<String>) -> cachette::auth::oidc::OidcVerifier {
+    cachette::auth::oidc::OidcVerifier::new(
+        issuers,
+        vec![String::from("cachette")],
+        BTreeMap::new(),
+        30,
+        Arc::new(ReloadKeys),
+    )
+}
+
+/// A SIGHUP reload keeps the boot-installed OIDC verifier — with the same
+/// section (warn-free), with a retuned section (warns in production), and
+/// even with `enabled = false`: toggling/uninstalling requires a restart.
+#[test]
+fn reload_keeps_the_boot_oidc_verifier_installed() {
+    let config = oidc_config();
+    let oidc_cfg = config.auth.oidc.clone().expect("table present");
+    let state = AppState::new();
+    state.install_oidc(fixture_verifier(oidc_cfg.issuers.clone()), &oidc_cfg);
+
+    let boot = state.oidc().expect("boot install");
+    assert!(
+        Arc::ptr_eq(&boot, state.oidc().as_ref().expect("kept")),
+        "the handle must stay stable between reads"
+    );
+
+    // Same-section reload: nothing changes.
+    state.apply_reload(&config);
+    assert!(
+        Arc::ptr_eq(&boot, state.oidc().as_ref().expect("kept")),
+        "a same-section reload must not swap the verifier"
+    );
+
+    // Retuned-but-enabled reload: the verifier is still the boot one (the
+    // production log warns about the signature change; the restart applies).
+    let mut retuned = oidc_config();
+    retuned.auth.oidc.as_mut().expect("present").leeway_seconds = 90;
+    state.apply_reload(&retuned);
+    assert!(
+        Arc::ptr_eq(&boot, state.oidc().as_ref().expect("kept")),
+        "a changed-section reload must not swap the verifier"
+    );
+
+    // Disabling in a reload keeps the verifier running, too.
+    let mut off = oidc_config();
+    off.auth.oidc.as_mut().expect("present").enabled = false;
+    state.apply_reload(&off);
+    assert!(
+        state.oidc().is_some(),
+        "a reload must never uninstall OIDC mid-flight"
+    );
 }

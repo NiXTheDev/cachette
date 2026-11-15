@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cachette::auth;
 use cachette::auth::{AuthPolicy, TokenStore};
 use cachette::cli::Cli;
 use cachette::cluster::heartbeat;
@@ -13,10 +15,16 @@ use cachette::routes;
 use cachette::state::{AppState, CacheLimits};
 use cachette::storage::StorageBackend;
 use cachette::storage::eviction::{Capacity, Reaper};
-use cachette::storage::fs::FsStorage;
+use cachette::storage::fs::{BackfillStep, FsStorage};
 use cachette::tls::{self, PeerPins};
 use clap::Parser;
 use tower_http::trace::TraceLayer;
+
+/// Backfill idle poll (docs/cdc.md, Migration): once the walker's step
+/// reports `Exhausted` it re-checks for newly-`whole` entries this often
+/// instead of pacing at `backfill_delay_ms` (one cheap `COUNT` per idle
+/// poll, not per conversion).
+const BACKFILL_IDLE: Duration = Duration::from_secs(30);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -141,6 +149,11 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.set_auth(AuthPolicy::from_config(&config));
+    // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
+    // enabled, build the JWKS cache + verifier and hang them on the state.
+    // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
+    // v1.0 behavior stays byte-identical. Reloads never swap the verifier.
+    auth::oidc::install(&state, &config)?;
     // Runner-visible base URL for capability URLs (`/v2/*`); the config
     // resolver always derives it from `listen` when `external_url` is unset.
     state.external_url = config.server.external_url.clone();
@@ -167,7 +180,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // exactly like `put_stream`/`finalize`/`delete`. That is what guarantees a
     // sweep never deletes a blob a download is reading and shutdown never
     // interrupts a parts-write mid-rename — both wait for the same lock.
-    let storage = Arc::new(FsStorage::open(&config.storage.fs.path)?);
+    // CDC `[storage.cdc]` (v1.1 workstream B): the flag only shapes new
+    // finalizations; reads stay layout-aware regardless of it, so flipping it
+    // off never orphans already-chunked at-rest data (docs/cdc.md).
+    let cdc = config
+        .storage
+        .cdc
+        .enabled
+        .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
+    let storage = Arc::new(FsStorage::open_cdc(&config.storage.fs.path, cdc)?);
     let backend: Arc<dyn StorageBackend> = storage.clone();
     state.storage = Some(backend.clone());
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
@@ -179,6 +200,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             tracing::info!(
                 reservations = report.reservations_reaped,
                 orphans = report.orphan_blobs_swept,
+                orphan_chunks = report.orphan_chunks_swept,
+                chunk_temps = report.chunk_temps_swept,
+                zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
                 "startup sweep complete"
             );
         }
@@ -271,11 +295,17 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                     }
                     if report.reservations_reaped > 0
                         || report.orphan_blobs_swept > 0
+                        || report.orphan_chunks_swept > 0
+                        || report.chunk_temps_swept > 0
+                        || report.zero_ref_chunk_rows_purged > 0
                         || report.chunk_locks_swept > 0
                     {
                         tracing::info!(
                             reservations = report.reservations_reaped,
                             orphans = report.orphan_blobs_swept,
+                            orphan_chunks = report.orphan_chunks_swept,
+                            chunk_temps = report.chunk_temps_swept,
+                            zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
                             chunk_locks = report.chunk_locks_swept,
                             "periodic sweep reclaimed storage"
                         );
@@ -288,6 +318,56 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             }
         }
     });
+
+    // Whole->chunked backfill (v1.1 workstream B, docs/cdc.md Migration):
+    // with `[storage.cdc] enabled = true` and `backfill` on (the default),
+    // converge pre-CDC `whole` entries onto the chunked layout in the
+    // background - one entry per step, smallest first, paced by
+    // `backfill_delay_ms`. A step's chunking pass holds no locks, so live
+    // traffic interleaves; a corrupt entry is parked in the local skip set
+    // for this process lifetime. No task when CDC is off: nothing converges
+    // and new writes stay whole anyway.
+    let backfill_task = if config.storage.cdc.enabled && config.storage.cdc.backfill {
+        let backfill_storage = storage.clone();
+        let backfill_params =
+            cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes);
+        let backfill_delay = Duration::from_millis(config.storage.cdc.backfill_delay_ms);
+        Some(tokio::spawn(async move {
+            let mut skip: HashSet<String> = HashSet::new();
+            loop {
+                match backfill_storage
+                    .backfill_step(backfill_params, &mut skip)
+                    .await
+                {
+                    Ok(BackfillStep::Converted(conversion)) => {
+                        let pending = backfill_storage.pending_whole_entries().await.unwrap_or(0);
+                        tracing::info!(
+                            entry = %conversion.id,
+                            blob_bytes = conversion.blob_bytes,
+                            chunk_bytes = conversion.chunk_bytes,
+                            pending,
+                            "backfill converted a whole entry to chunks"
+                        );
+                    }
+                    Ok(BackfillStep::Raced) => {
+                        tracing::debug!("backfill step raced a writer; re-picking");
+                    }
+                    Ok(BackfillStep::Exhausted) => {
+                        // Converged (for now): idle at a slow poll instead
+                        // of the conversion pace.
+                        tokio::time::sleep(BACKFILL_IDLE).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "backfill step failed");
+                    }
+                }
+                tokio::time::sleep(backfill_delay).await;
+            }
+        }))
+    } else {
+        None
+    };
 
     // Live config reload (plan task 49): SIGHUP on POSIX (plus the documented
     // test-only trigger) re-reads the config file and applies the reloadable
@@ -409,6 +489,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // then drop the storage handle. SQLite runs in WAL mode with
     // `synchronous=NORMAL`, so the committed final sweep is durable.
     sweep_task.abort();
+    if let Some(handle) = backfill_task {
+        handle.abort();
+    }
     reload_task.abort();
     if let Some(handle) = heartbeat_task {
         handle.abort();

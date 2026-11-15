@@ -56,7 +56,8 @@ use cachette::state::AppState;
 use cachette::tls::{self, PeerCert, PeerPins};
 use hmac::{Hmac, KeyInit, Mac};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+    BasicConstraints, Certificate, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
+    IsCa, Issuer, KeyPair, PublicKeyData,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -159,19 +160,16 @@ struct Pki {
 }
 
 /// Generate a key and a CA-signed certificate for `cn` with optional SAN.
-fn ca_signed(
-    ca: &Certificate,
-    ca_key: &KeyPair,
-    cn: &str,
-    san: Option<&str>,
-) -> (Certificate, KeyPair) {
+fn ca_signed(issuer: &Issuer<'_, KeyPair>, cn: &str, san: Option<&str>) -> (Certificate, KeyPair) {
     let key = KeyPair::generate().expect("generate key");
     let subject_alt_names = san.map_or_else(Vec::new, |name| vec![name.to_owned()]);
     let mut params = CertificateParams::new(subject_alt_names).expect("cert params");
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, cn);
     params.distinguished_name = dn;
-    let cert = params.signed_by(&key, ca, ca_key).expect("CA signs cert");
+    // rcgen 0.14: the signer is the CA's `Issuer` (its subject DN + key),
+    // not a `(Certificate, KeyPair)` pair.
+    let cert = params.signed_by(&key, issuer).expect("CA signs cert");
     (cert, key)
 }
 
@@ -182,16 +180,16 @@ fn build_pki() -> Pki {
     let mut ca_dn = DistinguishedName::new();
     ca_dn.push(DnType::CommonName, "cachette test root CA");
     ca_params.distinguished_name = ca_dn;
-    let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-signed CA");
 
-    let (server, server_key) = ca_signed(&ca, &ca_key, "cachette test server", Some("127.0.0.1"));
-    let (peer, peer_key) = ca_signed(&ca, &ca_key, "cachette test peer", None);
-    let (rogue, rogue_key) = ca_signed(&ca, &ca_key, "cachette test rogue", None);
+    let (server, server_key) = ca_signed(&ca, "cachette test server", Some("127.0.0.1"));
+    let (peer, peer_key) = ca_signed(&ca, "cachette test peer", None);
+    let (rogue, rogue_key) = ca_signed(&ca, "cachette test rogue", None);
     Pki {
-        ca: ca.der().clone(),
+        ca: ca.as_ref().der().clone(),
         server_cert_pem: server.pem(),
         server_key_pem: server_key.serialize_pem(),
-        peer_fp: fingerprint_spki(&peer_key.public_key_der()),
+        peer_fp: fingerprint_spki(&peer_key.subject_public_key_info()),
         peer_cert: peer.der().clone(),
         peer_key,
         rogue_cert: rogue.der().clone(),
