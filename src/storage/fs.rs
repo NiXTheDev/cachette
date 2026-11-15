@@ -177,14 +177,21 @@ pub struct FsStorage {
     root: PathBuf,
     conn: Arc<Mutex<Connection>>,
     /// Single-writer gate for put/finalize/delete; readers take it shared so
-    /// metadata is never observed describing a blob mid-swap.
-    gate: RwLock<()>,
-    /// Per-reservation chunk locks (see [`ChunkLocks`]).
-    chunk_locks: ChunkLocks,
+    /// metadata is never observed describing a blob mid-swap. Shared with the
+    /// namespace views: one gate for the whole index.
+    gate: Arc<RwLock<()>>,
+    /// Per-reservation chunk locks (see [`ChunkLocks`]). Shared with the
+    /// namespace views.
+    chunk_locks: Arc<ChunkLocks>,
     /// CDC cutting params (v1.1 workstream B): `None` publishes whole blobs
     /// like v1.0. Only shapes new finalizations; reads are layout-aware
     /// regardless (docs/cdc.md).
     cdc: Option<CdcParams>,
+    /// The namespace this view reads and writes (v1.2 workstream F,
+    /// docs/shared-cache.md). The default namespace ("") keeps the v1.1 id
+    /// derivation, so rows written before namespaces existed stay reachable;
+    /// other namespaces get their own ids and their own accounting.
+    namespace: String,
 }
 
 /// What one orphan-chunk sweep pass reclaimed (docs/cdc.md §GC).
@@ -283,12 +290,35 @@ impl FsStorage {
         let storage = Self {
             root,
             conn: Arc::new(Mutex::new(conn)),
-            gate: RwLock::new(()),
-            chunk_locks: Mutex::new(HashMap::new()),
+            gate: Arc::new(RwLock::new(())),
+            chunk_locks: Arc::new(Mutex::new(HashMap::new())),
             cdc,
+            namespace: String::new(),
         };
         storage.reconcile()?;
         Ok(storage)
+    }
+
+    /// A view of this index restricted to one namespace (v1.2 workstream F).
+    ///
+    /// The namespace is part of a row's identity: the ids differ, the
+    /// accounting is per namespace, and the view shares the connection, the
+    /// write gate and the chunk locks with the index it came from - two
+    /// namespaces never share a lock, and neither shares a row.
+    pub fn scoped(&self, namespace: &str) -> Self {
+        Self {
+            root: self.root.clone(),
+            conn: Arc::clone(&self.conn),
+            gate: Arc::clone(&self.gate),
+            chunk_locks: Arc::clone(&self.chunk_locks),
+            cdc: self.cdc,
+            namespace: namespace.to_owned(),
+        }
+    }
+
+    /// The id of the entry `key` resolves to in this view's namespace.
+    fn entry_id_for(&self, key: &str) -> String {
+        entry_id_in(&self.namespace, key)
     }
 
     /// Re-hash every published blob and compare it with the digest recorded
@@ -744,7 +774,7 @@ impl FsStorage {
         bytes: &[u8],
         expires_at: u64,
     ) -> io::Result<()> {
-        let id = entry_id(key);
+        let id = self.entry_id_for(key);
         let tmp = self.tmp_path(&id);
         let part = self.part_path(&id);
         let conn = Arc::clone(&self.conn);
@@ -917,7 +947,7 @@ impl StorageBackend for FsStorage {
             // scratch file if the future is cancelled mid-copy.
             let chunk_lock = self.chunk_lock(key);
             let _chunk_guard = chunk_lock.lock().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
             let guard = TmpGuard::new(tmp.clone());
@@ -942,7 +972,7 @@ impl StorageBackend for FsStorage {
                 return Err(invalid_range("range start after end"));
             }
             let _gate = self.gate.read().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let key = key.to_owned();
             let key_hint = key.clone();
             let blob = self.blob_path(&id);
@@ -1060,7 +1090,7 @@ impl StorageBackend for FsStorage {
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let _gate = self.gate.write().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let blob = self.blob_path(&id);
             let part = self.part_path(&id);
             let chunks_dir = self.root.join("chunks");
@@ -1102,7 +1132,7 @@ impl StorageBackend for FsStorage {
     fn stat<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<Option<EntryStat>>> {
         Box::pin(async move {
             let _gate = self.gate.read().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let conn = Arc::clone(&self.conn);
             blocking(move || {
                 let conn = lock(&conn)?;
@@ -1159,7 +1189,7 @@ impl StorageBackend for FsStorage {
     fn finalize<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let _gate = self.gate.write().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let key = key.to_owned();
             let part = self.part_path(&id);
             let blob = self.blob_path(&id);
@@ -1331,7 +1361,7 @@ impl StorageBackend for FsStorage {
         expires_at: u64,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let id = entry_id(cache_id);
+            let id = self.entry_id_for(cache_id);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
             let conn = Arc::clone(&self.conn);
@@ -1401,7 +1431,7 @@ impl StorageBackend for FsStorage {
             let chunk_lock = self.chunk_lock(key);
             let _chunk_guard = chunk_lock.lock().await;
             let _gate = self.gate.read().await;
-            let id = entry_id(key);
+            let id = self.entry_id_for(key);
             let now = unix_now();
             let conn = Arc::clone(&self.conn);
             let id_for_query = id.clone();
@@ -1471,7 +1501,8 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.write().await;
             let root = self.root.clone();
             let conn = Arc::clone(&self.conn);
-            let res_id = entry_id(cache_id);
+            let namespace = self.namespace.clone();
+            let res_id = entry_id_in(&namespace, cache_id);
             let cache_id = cache_id.to_owned();
             let cdc: Option<CdcParams> = self.cdc;
             blocking(move || {
@@ -1510,7 +1541,7 @@ impl StorageBackend for FsStorage {
                         "committed size does not match the uploaded chunks",
                     ));
                 }
-                let blob_id = entry_id(&artifact_key);
+                let blob_id = entry_id_in(&namespace, &artifact_key);
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
                 let chunks_dir = root.join("chunks");
                 if let Some(params) = cdc {
@@ -1645,7 +1676,7 @@ impl StorageBackend for FsStorage {
             // Stream into the scratch file first: the block body is never held
             // whole in memory (plan task 45). The guard drops the partial
             // scratch file if the future is cancelled mid-copy.
-            let res_id = entry_id(cache_id);
+            let res_id = self.entry_id_for(cache_id);
             let now = unix_now();
             let cache_id = cache_id.to_owned();
             let block_id = block_id.to_owned();
@@ -1710,7 +1741,8 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.write().await;
             let root = self.root.clone();
             let conn = Arc::clone(&self.conn);
-            let res_id = entry_id(cache_id);
+            let namespace = self.namespace.clone();
+            let res_id = entry_id_in(&namespace, cache_id);
             let cache_id = cache_id.to_owned();
             let ordered = ordered_block_ids.to_vec();
             let cdc: Option<CdcParams> = self.cdc;
@@ -1734,7 +1766,7 @@ impl StorageBackend for FsStorage {
                     return Err(not_found(&cache_id));
                 }
                 let blocks = root.join("parts").join(&cache_id).join("blocks");
-                let blob_id = entry_id(&artifact_key);
+                let blob_id = entry_id_in(&namespace, &artifact_key);
                 let blob = root.join("blobs").join(format!("{blob_id}.blob"));
                 let chunks_dir = root.join("chunks");
                 if let Some(params) = cdc {
@@ -2280,8 +2312,26 @@ fn pick_whole_entry(
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
 /// segments) and the one-visible-entry-per-key contract maps onto the PK.
+///
+/// In a namespace (v1.2 workstream F) the namespace is part of the
+/// address: hex(SHA-256(namespace || 0x00 || key)). The default namespace
+/// ("") keeps the v1.1 derivation verbatim, so rows written before
+/// namespaces existed stay reachable - a migration that rewrote every id
+/// would have orphaned every blob file.
+#[cfg(test)]
 fn entry_id(key: &str) -> String {
-    let digest = Sha256::digest(key.as_bytes());
+    entry_id_in("", key)
+}
+
+/// The namespaced form of [`entry_id`].
+fn entry_id_in(namespace: &str, key: &str) -> String {
+    let mut hasher = Sha256::new();
+    if !namespace.is_empty() {
+        hasher.update(namespace.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
     let mut id = String::with_capacity(digest.len() * 2);
     for &byte in digest.as_slice() {
         let _ = write!(id, "{byte:02x}");
@@ -3334,6 +3384,55 @@ mod storage_fs {
             body,
             vec![b'x'; stat.size as usize],
             "whole payload readable"
+        );
+    }
+
+    /// Two namespaces never see each other's rows (v1.2 workstream F): the
+    /// namespace is part of the row identity, so the same key in two
+    /// namespaces is two entries with two payloads - and the default
+    /// namespace keeps the v1.1 id derivation, so a row written before
+    /// namespaces existed stays reachable.
+    #[tokio::test]
+    async fn namespaces_are_isolated() {
+        let dir = TestDir::new();
+        let storage = FsStorage::open(dir.path()).expect("open");
+        let a = storage.scoped("forge-a");
+        let b = storage.scoped("forge-b");
+
+        a.put_stream("k", bytes(b"alpha")).await.expect("put a");
+        a.finalize("k").await.expect("finalize a");
+        b.put_stream("k", bytes(b"beta")).await.expect("put b");
+        b.finalize("k").await.expect("finalize b");
+
+        // Each namespace reads its own bytes.
+        assert_eq!(
+            read_all(a.get_range("k", 0..5).await.expect("read a")).await,
+            b"alpha"
+        );
+        assert_eq!(
+            read_all(b.get_range("k", 0..4).await.expect("read b")).await,
+            b"beta"
+        );
+
+        // The default namespace sees neither of them.
+        assert!(storage.stat("k").await.expect("stat default").is_none());
+
+        // A row in the default namespace stays where it always was.
+        storage
+            .put_stream("legacy", bytes(b"old"))
+            .await
+            .expect("put legacy");
+        storage.finalize("legacy").await.expect("finalize legacy");
+        assert!(storage.stat("legacy").await.expect("stat legacy").is_some());
+        assert_eq!(
+            read_all(
+                storage
+                    .get_range("legacy", 0..3)
+                    .await
+                    .expect("read legacy")
+            )
+            .await,
+            b"old"
         );
     }
 
