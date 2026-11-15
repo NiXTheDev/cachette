@@ -79,22 +79,28 @@ const SCHEMA: &str = "
         reservation_expires_at  INTEGER,
         artifact_key            TEXT NOT NULL DEFAULT '',
         digest                  TEXT NOT NULL DEFAULT '',
-        layout                  TEXT NOT NULL DEFAULT 'whole'
+        layout                  TEXT NOT NULL DEFAULT 'whole',
+        namespace               TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS entries_key_idx ON entries(key);
-    CREATE TABLE IF NOT EXISTS accounting (used_bytes INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS accounting (
+        namespace  TEXT NOT NULL DEFAULT '',
+        used_bytes INTEGER NOT NULL
+    );
     INSERT INTO accounting (used_bytes)
         SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM accounting);
     CREATE TABLE IF NOT EXISTS chunks (
         id          TEXT PRIMARY KEY,
         size        INTEGER NOT NULL,
         refs        INTEGER NOT NULL DEFAULT 0,
-        created_at  INTEGER NOT NULL
+        created_at  INTEGER NOT NULL,
+        namespace   TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS entry_chunks (
         entry_id  TEXT NOT NULL,
         seq       INTEGER NOT NULL,
         chunk_id  TEXT NOT NULL,
+        namespace TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (entry_id, seq)
     );
     CREATE INDEX IF NOT EXISTS entry_chunks_chunk_idx ON entry_chunks(chunk_id);
@@ -2288,8 +2294,11 @@ fn entry_id(key: &str) -> String {
 /// (a patch release must never look like a schema event). Ledger:
 ///   1: v1.0-era index - `artifact_key` (task 21) and `digest` (task 50);
 ///   2: v1.1 CDC - the `layout` column (the `chunks` / `entry_chunks`
-///      tables come from SCHEMA itself, so this step is the column alone).
-const SCHEMA_VERSION: u64 = 2;
+///      tables come from SCHEMA itself, so this step is the column alone);
+///   3: v1.2 multi-tenant - the `namespace` column (workstream F: the
+///      namespace is part of a row's identity and the unit the accounting
+///      and the quotas count in).
+const SCHEMA_VERSION: u64 = 3;
 
 /// One schema migration step: brings an index at the listed version's
 /// predecessor up to that version. Bodies stay introspection-guarded so a
@@ -2305,6 +2314,7 @@ const MIGRATIONS: &[(u64, &str, Migration)] = &[
         migrate_v1_columns,
     ),
     (2, "v1.1 CDC layout column", migrate_v2_layout),
+    (3, "v1.2 namespace column", migrate_v3_namespace),
 ];
 
 /// Task 21 + task 50: `artifact_key` lets a reservation carry the artifact
@@ -2368,6 +2378,49 @@ fn migrate_v2_layout(conn: &Connection) -> io::Result<()> {
     Ok(())
 }
 
+/// v1.2 (workstream F): the namespace column. A row's namespace is part
+/// of its identity - the namespace is the unit the accounting, the quotas
+/// and the eviction count in (docs/shared-cache.md). Pre-v1.2 rows belong
+/// to the default namespace, so the backfill is ''.
+fn migrate_v3_namespace(conn: &Connection) -> io::Result<()> {
+    for (table, column) in [
+        ("entries", "namespace"),
+        ("chunks", "namespace"),
+        ("entry_chunks", "namespace"),
+        ("accounting", "namespace"),
+    ] {
+        let present: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if present == 0 {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),
+                [],
+            )
+            .map_err(sql)?;
+        }
+    }
+    // The namespace-scoped lookups ride their own index; the plain key
+    // index stays for the single-namespace paths.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS entries_namespace_key_idx ON entries(namespace, key)",
+        [],
+    )
+    .map_err(sql)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS entry_chunks_namespace_idx ON entry_chunks(namespace, chunk_id)",
+        [],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
 /// The stored schema version; an index that predates the meta table (or has
 /// no stamp yet) reads as version 0. A corrupt value refuses rather than
 /// guessing.
@@ -2413,11 +2466,15 @@ fn verify_schema(conn: &Connection) -> io::Result<()> {
                 "artifact_key",
                 "digest",
                 "layout",
+                "namespace",
             ],
         ),
-        ("accounting", &["used_bytes"]),
-        ("chunks", &["id", "size", "refs", "created_at"]),
-        ("entry_chunks", &["entry_id", "seq", "chunk_id"]),
+        ("accounting", &["used_bytes", "namespace"]),
+        ("chunks", &["id", "size", "refs", "created_at", "namespace"]),
+        (
+            "entry_chunks",
+            &["entry_id", "seq", "chunk_id", "namespace"],
+        ),
         ("meta", &["key", "value"]),
     ];
     for &table in REQUIRED_TABLES {
@@ -4773,6 +4830,82 @@ mod storage_fs {
         assert_eq!(reports[0].health, EntryHealth::MissingDigest);
     }
 
+    /// v1.2 migration: a pre-v1.2 index (post v1.1, so it HAS the layout
+    /// column) gains the `namespace` column on every row table, and its
+    /// rows land in the default namespace - the namespace is part of a
+    /// row's identity (docs/shared-cache.md).
+    #[tokio::test]
+    async fn migration_adds_the_namespace_column_to_a_pre_v12_database() {
+        let dir = TestDir::new();
+        {
+            let conn =
+                Connection::open(dir.path().join("cachette.sqlite3")).expect("open legacy index");
+            conn.execute_batch(
+                "CREATE TABLE entries (\
+                     id TEXT PRIMARY KEY, \
+                     key TEXT NOT NULL, \
+                     version TEXT NOT NULL DEFAULT '', \
+                     size INTEGER NOT NULL, \
+                     created_at INTEGER NOT NULL, \
+                     accessed_at INTEGER NOT NULL, \
+                     complete INTEGER NOT NULL DEFAULT 0, \
+                     owner_node TEXT NOT NULL DEFAULT '', \
+                     reservation_expires_at INTEGER, \
+                     artifact_key TEXT NOT NULL DEFAULT '', \
+                     digest TEXT NOT NULL DEFAULT '', \
+                     layout TEXT NOT NULL DEFAULT 'whole');\
+                 CREATE TABLE accounting (used_bytes INTEGER NOT NULL);\
+                 INSERT INTO accounting (used_bytes) VALUES (0);",
+            )
+            .expect("legacy (post-v1.1) schema");
+            let old_id = entry_id("old");
+            conn.execute(
+                "INSERT INTO entries (id, key, version, size, created_at, accessed_at, \
+                     complete, artifact_key, digest, layout) \
+                     VALUES (?1, 'old', '', 11, 0, 0, 1, '', '', 'whole')",
+                [&old_id],
+            )
+            .expect("seed a legacy published row");
+        }
+        std::fs::create_dir_all(dir.path().join("blobs")).expect("seed the blobs dir");
+        std::fs::write(
+            dir.path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id("old"))),
+            b"hello world",
+        )
+        .expect("seed the legacy blob");
+
+        let storage = open_plain(&dir);
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            for table in ["entries", "chunks", "entry_chunks", "accounting"] {
+                let present: i64 = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'namespace'"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("probe");
+                assert_eq!(present, 1, "{table} must carry the namespace column");
+            }
+            let namespace: String = conn
+                .query_row(
+                    "SELECT namespace FROM entries WHERE id = ?1",
+                    [&entry_id("old")],
+                    |row| row.get(0),
+                )
+                .expect("legacy row");
+            assert_eq!(namespace, "", "pre-v1.2 rows land in the default namespace");
+        }
+
+        // The row still reads back: the migration moves no data.
+        let read = read_all(storage.get_range("old", 0..11).await.expect("read legacy")).await;
+        assert_eq!(read, b"hello world");
+    }
+
     // ==== docs/cdc.md §GC: the chunk-side sweeper (B commit 3) ====
 
     /// Backdate `path`'s mtime — the sweeps' grace input (same pattern as
@@ -5156,13 +5289,13 @@ mod storage_fs {
     }
 
     /// A lying stamp is caught on every boot: the schema claims the current
-    /// version but the `layout` column was hand-removed - the unconditional
-    /// verify refuses to open and names the gap.
+    /// version but the `namespace` column was hand-removed - the
+    /// unconditional verify refuses to open and names the gap.
     #[tokio::test]
     async fn a_version_row_that_lies_refuses_to_boot() {
         let dir = TestDir::new();
         {
-            // The current schema minus `layout`, stamped as current: the
+            // The current schema minus `namespace`, stamped as current: the
             // lie the version machinery exists to catch.
             let conn = Connection::open(dir.path().join("cachette.sqlite3")).expect("raw open");
             conn.execute_batch(
@@ -5177,7 +5310,8 @@ mod storage_fs {
                      owner_node TEXT NOT NULL DEFAULT '', \
                      reservation_expires_at INTEGER, \
                      artifact_key TEXT NOT NULL DEFAULT '', \
-                     digest TEXT NOT NULL DEFAULT '');\
+                     digest TEXT NOT NULL DEFAULT '', \
+                     layout TEXT NOT NULL DEFAULT 'whole');\
                  CREATE TABLE accounting (used_bytes INTEGER NOT NULL);\
                  INSERT INTO accounting (used_bytes) VALUES (0);\
                  CREATE TABLE chunks (\
@@ -5191,15 +5325,15 @@ mod storage_fs {
                      chunk_id TEXT NOT NULL, \
                      PRIMARY KEY (entry_id, seq));\
                  CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '3');",
             )
-            .expect("tampered (layout-less) schema stamped current");
+            .expect("tampered (namespace-less) schema stamped current");
         }
 
         let err = FsStorage::open(dir.path()).expect_err("a lying stamp must refuse");
         assert!(
             err.to_string()
-                .contains("column `layout` is missing from `entries`"),
+                .contains("column `namespace` is missing from `entries`"),
             "verify names the gap: {err}"
         );
     }
