@@ -1,0 +1,80 @@
+name: rustup mirror ladder
+description: >
+  Pick the first reachable rust distribution mirror and export
+  RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT, so the toolchain fetch stops
+  depending on the runners' flaky path to static.rust-lang.org.
+
+# WHY THIS EXISTS
+#
+# The v1.1.0 release cut (run 108) died on every x86_64 leg BEFORE a
+# single line was compiled, in two different places:
+#
+#   1. rustup-init fetch:
+#      error: command failed: downloader
+#      https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+#      warn: curl: (35) TLS connect error: SSL routines::unexpected eof while reading
+#
+#   2. toolchain channel fetch (the clippy job on the release branch):
+#      info: syncing channel updates for 1.99-x86_64-unknown-linux-gnu
+#      error: could not download file from
+#      'https://static.rust-lang.org/dist/channel-rust-1.99.toml.sha256' ... tls handshake eof
+#
+# Both are the fleet's egress wall hitting static.rust-lang.org - the same
+# wall the zig fetch already documented in release.yml (PR #7): connections
+# die at the TLS layer, and which mirror is fast varies by host and hour.
+# The rustup-init download in particular has NO retry of its own (the
+# rustup-init.sh bootstrapper calls curl once), so a single dropped
+# connection kills the job.
+#
+# WHAT IT DOES
+#
+# Probes a mirror ladder and exports the two env vars rustup honours:
+#
+#   RUSTUP_DIST_SERVER  - root that mirrors static.rust-lang.org/
+#                         (the channel manifests and toolchain archives)
+#   RUSTUP_UPDATE_ROOT  - root that mirrors static.rust-lang.org/rustup/
+#                         (where rustup-init itself lives)
+#
+# Nothing else changes: the dtolnay/rust-toolchain composite still installs
+# rustup and the pinned toolchain, but both fetches now go through the
+# mirror that actually answered. The composite does not define either var,
+# so the exported values reach its steps untouched.
+#
+# The probe fetches a channel manifest (a few hundred bytes), never a
+# toolchain archive, so the ladder costs nothing when the first mirror
+# answers.
+#
+# The ladder tries every mirror before falling back to the upstream, and
+# when NOTHING answers it leaves the defaults in place and warns - the
+# composite's own retries then apply, exactly as before this action.
+
+runs:
+  using: composite
+  steps:
+    - name: Probe the rust mirror ladder
+      shell: sh
+      run: |
+        set -eu
+        picked=0
+        while IFS='|' read -r dist update; do
+          [ -n "${dist:-}" ] || continue
+          echo "::group::rust mirror probe: $dist"
+          if curl -fsSL --retry 2 --retry-delay 3 --retry-all-errors \
+                    --connect-timeout 20 --max-time 60 \
+                    -o /dev/null "$dist/dist/channel-rust-stable.toml.sha256"; then
+            echo "picked mirror: dist=$dist update=$update"
+            echo "RUSTUP_DIST_SERVER=$dist" >> "$GITHUB_ENV"
+            echo "RUSTUP_UPDATE_ROOT=$update" >> "$GITHUB_ENV"
+            picked=1
+            break
+          fi
+          echo "::warning::rust mirror unreachable: $dist"
+        done <<'MIRRORS'
+        https://rsproxy.cn|https://rsproxy.cn/rustup
+        https://mirrors.ustc.edu.cn/rust-static|https://mirrors.ustc.edu.cn/rust-static/rustup
+        https://mirrors.tuna.tsinghua.edu.cn/rustup|https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+        https://static.rust-lang.org|https://static.rust-lang.org/rustup
+        MIRRORS
+        if [ "$picked" -eq 0 ]; then
+          echo "::warning::no rust mirror answered - keeping the upstream defaults"
+        fi
