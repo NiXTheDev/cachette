@@ -38,7 +38,8 @@ Nothing here is committed until its design doc says so.
   implementation gotchas are written up in `docs/image-stitching.md`. Adopt
   when arm64-in-QEMU compile cost after builder-base bumps outweighs the
   atomicity of the current single-invocation `buildx --push`.
-- **Rust toolchain bump** (zig 0.14.1 -> 0.17.x) - maintenance, not a
-  feature: it lands as a separate release-branch PR with a cargo-zigbuild
-  contract re-check, because the pin is a contract and not a preference.
+- **Zig toolchain bump** (0.14.1 -> 0.17.1) - landed on the v1.2 branch
+  (PR #13) instead of a separate release-branch PR, as its own commit next
+  to the rust 1.100 bump; the cargo-zigbuild contract is re-checked
+  empirically by the release legs and the docker leg.
 - *(extend this list as postponed ideas accumulate)*

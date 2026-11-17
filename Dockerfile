@@ -27,7 +27,7 @@
 #     is kept only as a package source (gcc/musl-dev/file, tar/xz); any
 #     musl-capable base would do.
 #
-# Toolchain: cargo-zigbuild + zig 0.14.1 - the SAME pair and pins the
+# Toolchain: cargo-zigbuild + zig 0.17.1 - the SAME pair and pins the
 #   release matrix runs (release.yml TOOLCHAIN JUSTIFICATION). zig cc
 #   drives the linker AND the C compiler for both musl targets; zig ships
 #   its own musl libc, so no cross libc packages are needed. The zig
@@ -92,13 +92,13 @@ ARG BUILDARCH
 # curl: the zig tarball + rustup mirror-ladder fetches below.
 RUN apk add --no-cache gcc musl-dev file tar xz curl
 
-# zig 0.14.1 - sha256-pinned tarball (aarch64-linux / x86_64-linux variants
+# zig 0.17.1 - sha256-pinned tarball (aarch64-linux / x86_64-linux variants
 # per the builder's own arch). ziglang.org is the runner-proven primary
 # (release.yml measured a clean ~8s fetch); the ladder just absorbs the
 # fleet's occasional TLS-EOF windows.
-ARG ZIG_VERSION=0.14.1
-ARG ZIG_SHA_AARCH64=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b
-ARG ZIG_SHA_X86_64=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+ARG ZIG_VERSION=0.17.1
+ARG ZIG_SHA_AARCH64=a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
+ARG ZIG_SHA_X86_64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
 RUN set -eu; \
     case "$BUILDARCH" in \
       arm64)  ZIG_ASSET="zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; ZIG_SHA="${ZIG_SHA_AARCH64}" ;; \
