@@ -188,7 +188,9 @@ over the tenant part so a whole owner never has to be enumerated:
 default = "20GiB"
 # exact namespace (the default namespace form is "<forge>|<tenant>")
 "https://hangar.nixthedev.ru|NiXTheDev/cachette" = "50GiB"
-# tenant-side wildcard: every repo of that owner, on any forge
+# tenant-side wildcard: EACH repo of that owner gets this limit - on any
+# forge. It is a per-repo limit, NOT a shared budget across the owner's
+# repos: ten repos under that pattern may hold ten times the limit.
 "NiXTheDev/*" = "5GiB"
 # forge-scoped wildcard: every repo of that owner on one forge
 "https://github.com|octo-org/*" = "5GiB"
@@ -201,6 +203,11 @@ Matching, most specific first:
    pattern without a `|` matches the **tenant part** of any forge's
    namespace (so `NiXTheDev/*` covers that owner everywhere);
 3. `default`.
+
+Every rule sets the limit of the namespaces it matches, one limit each: a
+wildcard is a shorthand for "the same limit for each of these namespaces",
+not a pool they share. The only way two namespaces share a budget is to
+put them in ONE namespace - an explicit, admin-side decision.
 
 The rules are overrides only: the default governs every namespace no rule
 matches, and a namespace with its own rule is budgeted by that rule alone.
