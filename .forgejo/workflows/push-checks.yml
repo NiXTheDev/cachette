@@ -665,12 +665,19 @@ jobs:
       # cache-binary on (its default). No continue-on-error here: if the
       # container builder cannot even start after rungs 1-2 failed, the job
       # is genuinely red.
+      # The builder itself is PINNED: one name (cachette-builder) reused by
+      # both workflows - an existing builder is adopted instead of spawning
+      # a fresh docker-buildx-<random> container per run, and cleanup=false
+      # leaves it standing (warm buildkit state included) on the runner
+      # host instead of piling temp builders into its storage.
       - name: Set up the buildkit container builder (rung 3)
         id: rung3_builder
         if: steps.rung1.outcome == 'failure' && (steps.rung2_merge.outcome == 'failure' || steps.rung2_merge.outcome == 'skipped')
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3.12.0
         with:
           version: v0.38.1
+          name: cachette-builder
+          cleanup: false
 
       - name: Publish multi-arch manifest (rung 3 - container builder)
         id: rung3
