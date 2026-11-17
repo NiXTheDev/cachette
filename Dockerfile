@@ -75,8 +75,7 @@
 # then replace the digest here AND in both workflows' pre-pull steps.
 # Only the runner-arch variant of this index is ever pulled now - the
 # builder stage is forced to $BUILDPLATFORM.
-FROM --platform=$BUILDPLATFORM \
-  rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
+FROM --platform=$BUILDPLATFORM rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
 
 # BUILDARCH is a predefined buildkit arg (amd64 | arm64) = the builder
 # stage's own platform. Predefined args are usable in FROM without a
@@ -125,25 +124,38 @@ ENV PATH="/opt/zig:${PATH}"
 RUN cargo install cargo-zigbuild --locked
 
 # The x86_64 musl std for the cross target - fetched through the SAME
-# mirror ladder the workflows use (.forgejo/actions/rustup-mirror): the
+# mirror race the workflows use (.forgejo/actions/rustup-mirror): the
 # runners' path to static.rust-lang.org dies at the TLS layer
 # intermittently (the v1.1.0 cut lost run 108 to exactly this, before a
 # single line was compiled). aarch64-unknown-linux-musl is the image's
 # host target and ships preinstalled.
+#
+# The race mirrors the action: all four probes run at once, the FIRST one
+# to answer wins via an atomic `ln` (EEXIST for everyone else), losers
+# are killed, deadline 60s. Inside a single RUN this all stays one shell
+# so `dist` reaches the rustup call below.
 RUN set -eu; \
-    dist=""; \
+    race="/tmp/rustup-mirror-race"; rm -rf "$race"; mkdir -p "$race"; \
+    i=0; pids=""; \
     for m in "https://rsproxy.cn" \
              "https://mirrors.ustc.edu.cn/rust-static" \
              "https://mirrors.tuna.tsinghua.edu.cn/rustup" \
              "https://static.rust-lang.org"; do \
-      if curl -fsSL --retry 2 --retry-delay 3 --retry-all-errors \
-                --connect-timeout 20 --max-time 60 \
+      i=$((i + 1)); \
+      printf '%s' "$m" > "$race/cand.$i"; \
+      ( if curl -fsSL --connect-timeout 15 --max-time 45 \
                 -o /dev/null "$m/dist/channel-rust-stable.toml.sha256"; then \
-        dist="$m"; break; \
-      fi; \
+          ln "$race/cand.$i" "$race/winner" 2>/dev/null || true; \
+        fi ) & \
+      pids="$pids $!"; \
     done; \
+    deadline=$(( $(date +%s) + 60 )); \
+    while [ ! -e "$race/winner" ] && [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done; \
+    kill $pids 2>/dev/null || true; wait || true; \
+    dist=""; \
+    if [ -e "$race/winner" ]; then dist="$(cat "$race/winner")"; fi; \
     if [ -n "$dist" ] && [ "$dist" != "https://static.rust-lang.org" ]; then \
-      echo "rust mirror picked: $dist"; \
+      echo "rust mirror picked (first to answer): $dist"; \
       export RUSTUP_DIST_SERVER="$dist"; \
     else \
       echo "no rust mirror answered - using the rustup defaults"; \
