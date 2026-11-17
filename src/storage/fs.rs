@@ -37,7 +37,7 @@
 //! (plan rule: never delete a blob that has a complete row — orphans belong
 //! to the reaper).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
@@ -672,7 +672,7 @@ impl FsStorage {
                 let conn = lock(&self.conn)?;
                 pick_whole_entry(&conn, skip)?
             };
-            let Some((id, blob_bytes, digest)) = picked else {
+            let Some((id, blob_bytes, digest, namespace)) = picked else {
                 return Ok(BackfillStep::Exhausted);
             };
             let blob_path = self.root.join("blobs").join(format!("{id}.blob"));
@@ -715,12 +715,11 @@ impl FsStorage {
                     return Ok(None);
                 }
                 let mut unlink = Vec::new();
-                let added = acquire_chunk_manifest(&tx, &row_id, &payload, &mut unlink)?;
-                tx.execute(
-                    "UPDATE accounting SET used_bytes = used_bytes - ?1 + ?2",
-                    params![blob_size, added],
-                )
-                .map_err(sql)?;
+                let added =
+                    acquire_chunk_manifest(&tx, &namespace, &row_id, &payload, &mut unlink)?;
+                let used = namespace_used_bytes(&tx, &namespace)?;
+                let used = used.saturating_sub(blob_size).saturating_add(added);
+                set_namespace_used_bytes(&tx, &namespace, used)?;
                 tx.commit().map_err(sql)?;
                 Ok(Some(added))
             })
@@ -778,6 +777,7 @@ impl FsStorage {
         let tmp = self.tmp_path(&id);
         let part = self.part_path(&id);
         let conn = Arc::clone(&self.conn);
+        let namespace = self.namespace.clone();
         let key = key.to_owned();
         let bytes = bytes.to_vec();
         let _gate = self.gate.write().await;
@@ -792,11 +792,11 @@ impl FsStorage {
             conn.execute(
                 "INSERT INTO entries \
                      (id, key, version, size, created_at, accessed_at, complete, \
-                      reservation_expires_at) \
-                 VALUES (?1, ?2, '', ?3, ?4, ?4, 0, ?5) \
+                      reservation_expires_at, namespace) \
+                 VALUES (?1, ?2, '', ?3, ?4, ?4, 0, ?5, ?6) \
                  ON CONFLICT(id) DO UPDATE SET \
                      complete = 0, reservation_expires_at = excluded.reservation_expires_at",
-                params![id, key, size, created_at, expires_at],
+                params![id, key, size, created_at, expires_at, namespace],
             )
             .map_err(sql)?;
             Ok(())
@@ -882,10 +882,64 @@ impl FsStorage {
         // blob sizes plus chunk sizes with live references. The chunk half
         // is exact even under dedup; blob-less chunked entries never
         // double-count.
+        //
+        // Per namespace (v1.2 workstream F): the namespace is the unit the
+        // accounting and the quotas count in, so each namespace's row is
+        // recomputed on its own and the total is the sum of them.
+        let mut per_namespace: BTreeMap<String, i64> = BTreeMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT namespace, SUM(size) FROM entries \
+                     WHERE complete = 1 AND layout = 'whole' GROUP BY namespace",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql)?;
+            for row in rows {
+                let (namespace, size) = row.map_err(sql)?;
+                per_namespace.entry(namespace.clone()).or_insert(0);
+                if let Some(total) = per_namespace.get_mut(&namespace) {
+                    *total += size;
+                }
+            }
+        }
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT namespace, SUM(size) FROM chunks WHERE refs > 0 GROUP BY namespace",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql)?;
+            for row in rows {
+                let (namespace, size) = row.map_err(sql)?;
+                per_namespace.entry(namespace.clone()).or_insert(0);
+                if let Some(total) = per_namespace.get_mut(&namespace) {
+                    *total += size;
+                }
+            }
+        }
+        for (namespace, used) in &per_namespace {
+            set_namespace_used_bytes(&conn, namespace, *used)?;
+        }
+        // Namespaces with nothing left must not keep a stale total: the
+        // accounting is recomputed from the surviving rows. The DEFAULT
+        // namespace's row is structural - delta writers upsert against it -
+        // so it is zeroed rather than deleted; its row is recreated on the
+        // next write either way.
+        if !per_namespace.contains_key("") {
+            set_namespace_used_bytes(&conn, "", 0)?;
+        }
         conn.execute(
-            "UPDATE accounting SET used_bytes = \
-             COALESCE((SELECT SUM(size) FROM entries WHERE complete = 1 AND layout = 'whole'), 0) \
-             + COALESCE((SELECT SUM(size) FROM chunks WHERE refs > 0), 0)",
+            "DELETE FROM accounting WHERE namespace != '' \
+             AND namespace NOT IN (SELECT namespace FROM entries WHERE complete = 1)",
             [],
         )
         .map_err(sql)?;
@@ -1089,6 +1143,7 @@ impl StorageBackend for FsStorage {
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            let namespace = self.namespace.clone();
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
             let blob = self.blob_path(&id);
@@ -1103,14 +1158,9 @@ impl StorageBackend for FsStorage {
                 // with a sibling stay at rest for it; a `whole` entry frees
                 // its blob size, the exact legacy math for v1.0 rows.
                 let (removed, _superseded_blob, chunk_unlinks) = release_previous(&tx, &id)?;
-                let used: i64 = tx
-                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                    .optional()
-                    .map_err(sql)?
-                    .unwrap_or(0);
+                let used = namespace_used_bytes(&tx, &namespace)?;
                 let used = used.saturating_sub(removed);
-                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                    .map_err(sql)?;
+                set_namespace_used_bytes(&tx, &namespace, used)?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&id])
                     .map_err(sql)?;
                 tx.commit().map_err(sql)?;
@@ -1188,6 +1238,7 @@ impl StorageBackend for FsStorage {
 
     fn finalize<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            let namespace = self.namespace.clone();
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
             let key = key.to_owned();
@@ -1242,8 +1293,8 @@ impl StorageBackend for FsStorage {
                     tx.execute(
                         "INSERT INTO entries \
                              (id, key, version, size, created_at, accessed_at, complete, \
-                              owner_node, artifact_key, digest, layout) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'chunked') \
+                              owner_node, artifact_key, digest, layout, namespace) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'chunked', ?7) \
                              ON CONFLICT(id) DO UPDATE SET \
                                  key = excluded.key, version = excluded.version, \
                                  size = excluded.size, \
@@ -1251,18 +1302,22 @@ impl StorageBackend for FsStorage {
                                  accessed_at = excluded.accessed_at, complete = 1, \
                                  artifact_key = '', digest = excluded.digest, \
                                  layout = 'chunked'",
-                        params![id, key, version, size, created_at, payload.digest],
+                        params![
+                            id,
+                            key,
+                            version,
+                            size,
+                            created_at,
+                            payload.digest,
+                            namespace
+                        ],
                     )
                     .map_err(sql)?;
-                    let added = acquire_chunk_manifest(&tx, &id, &payload, &mut chunk_unlinks)?;
-                    let used: i64 = tx
-                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                        .optional()
-                        .map_err(sql)?
-                        .unwrap_or(0);
+                    let added =
+                        acquire_chunk_manifest(&tx, &namespace, &id, &payload, &mut chunk_unlinks)?;
+                    let used = namespace_used_bytes(&tx, &namespace)?;
                     let used = used.saturating_sub(removed).saturating_add(added);
-                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                        .map_err(sql)?;
+                    set_namespace_used_bytes(&tx, &namespace, used)?;
                     tx.commit().map_err(sql)?;
                     drop(conn);
                     // Files last (B5 convention): zero-ref chunk files and a
@@ -1306,8 +1361,8 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, digest, layout) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'whole') \
+                          owner_node, artifact_key, digest, layout, namespace) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', ?6, 'whole', ?7) \
                          ON CONFLICT(id) DO UPDATE SET \
                              key = excluded.key, version = excluded.version, \
                              size = excluded.size, \
@@ -1315,17 +1370,12 @@ impl StorageBackend for FsStorage {
                              accessed_at = excluded.accessed_at, complete = 1, \
                              artifact_key = '', digest = excluded.digest, \
                              layout = 'whole'",
-                    params![id, key, version, size, created_at, digest],
+                    params![id, key, version, size, created_at, digest, namespace],
                 )
                 .map_err(sql)?;
-                let used: i64 = tx
-                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                    .optional()
-                    .map_err(sql)?
-                    .unwrap_or(0);
+                let used = namespace_used_bytes(&tx, &namespace)?;
                 let used = used.saturating_sub(removed).saturating_add(size);
-                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                    .map_err(sql)?;
+                set_namespace_used_bytes(&tx, &namespace, used)?;
                 tx.commit().map_err(sql)?;
                 drop(conn);
                 for chunk_id in &chunk_unlinks {
@@ -1342,11 +1392,9 @@ impl StorageBackend for FsStorage {
             let conn = Arc::clone(&self.conn);
             blocking(move || {
                 let conn = lock(&conn)?;
-                let used: i64 = conn
-                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                    .optional()
-                    .map_err(sql)?
-                    .unwrap_or(0);
+                // The TOTAL across namespaces: the eviction floor is the
+                // admin's disk budget, which is absolute for the whole index.
+                let used = total_used_bytes(&conn)?;
                 Ok(used.max(0) as u64)
             })
             .await
@@ -1361,6 +1409,7 @@ impl StorageBackend for FsStorage {
         expires_at: u64,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            let namespace = self.namespace.clone();
             let id = self.entry_id_for(cache_id);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
@@ -1378,15 +1427,17 @@ impl StorageBackend for FsStorage {
                 conn.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          reservation_expires_at, artifact_key) \
-                     VALUES (?1, ?2, ?3, 0, ?4, ?4, 0, ?5, ?6) \
+                          reservation_expires_at, artifact_key, namespace) \
+                     VALUES (?1, ?2, ?3, 0, ?4, ?4, 0, ?5, ?6, ?7) \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, size = 0, \
                          created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 0, \
                          reservation_expires_at = excluded.reservation_expires_at, \
                          artifact_key = excluded.artifact_key",
-                    params![id, cache_id, version, created_at, expires_at, key],
+                    params![
+                        id, cache_id, version, created_at, expires_at, key, namespace
+                    ],
                 )
                 .map_err(sql)?;
                 Ok(())
@@ -1569,29 +1620,22 @@ impl StorageBackend for FsStorage {
                     tx.execute(
                         "INSERT INTO entries \
                              (id, key, version, size, created_at, accessed_at, complete, \
-                              owner_node, artifact_key, reservation_expires_at, digest, layout) \
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked') \
+                              owner_node, artifact_key, reservation_expires_at, digest, layout, namespace) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked', ?7) \
                           ON CONFLICT(id) DO UPDATE SET \
                               key = excluded.key, version = excluded.version, \
                               size = excluded.size, created_at = excluded.created_at, \
                               accessed_at = excluded.accessed_at, complete = 1, \
                               artifact_key = '', reservation_expires_at = NULL, \
                               digest = excluded.digest, layout = 'chunked'",
-                        params![blob_id, artifact_key, version, size, now, payload.digest],
+                        params![blob_id, artifact_key, version, size, now, payload.digest, namespace],
                     )
                     .map_err(sql)?;
                     tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
                         .map_err(sql)?;
                     let added =
-                        acquire_chunk_manifest(&tx, &blob_id, &payload, &mut chunk_unlinks)?;
-                    let used: i64 = tx
-                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                        .optional()
-                        .map_err(sql)?
-                        .unwrap_or(0);
-                    let used = used.saturating_sub(removed).saturating_add(added);
-                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                        .map_err(sql)?;
+                        acquire_chunk_manifest(&tx, &namespace, &blob_id, &payload, &mut chunk_unlinks)?;
+                    let used = namespace_used_bytes(&tx, &namespace)?;                    let used = used.saturating_sub(removed).saturating_add(added);                    set_namespace_used_bytes(&tx, &namespace, used)?;
                     tx.commit().map_err(sql)?;
                     drop(conn);
                     // Files last: superseded blob + zero-ref chunks + the
@@ -1632,27 +1676,20 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at, digest, layout) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole') \
+                          owner_node, artifact_key, reservation_expires_at, digest, layout, namespace) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole', ?7) \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
                          artifact_key = '', reservation_expires_at = NULL, \
                          digest = excluded.digest, layout = 'whole'",
-                    params![blob_id, artifact_key, version, size, now, digest],
+                    params![blob_id, artifact_key, version, size, now, digest, namespace],
                 )
                 .map_err(sql)?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
                     .map_err(sql)?;
-                let used: i64 = tx
-                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                    .optional()
-                    .map_err(sql)?
-                    .unwrap_or(0);
-                let used = used.saturating_sub(removed).saturating_add(size);
-                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                    .map_err(sql)?;
+                let used = namespace_used_bytes(&tx, &namespace)?;                let used = used.saturating_sub(removed).saturating_add(size);                set_namespace_used_bytes(&tx, &namespace, used)?;
                 tx.commit().map_err(sql)?;
                 drop(conn);
                 for chunk_id in &chunk_unlinks {
@@ -1801,29 +1838,22 @@ impl StorageBackend for FsStorage {
                     tx.execute(
                         "INSERT INTO entries \
                              (id, key, version, size, created_at, accessed_at, complete, \
-                              owner_node, artifact_key, reservation_expires_at, digest, layout) \
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked') \
+                              owner_node, artifact_key, reservation_expires_at, digest, layout, namespace) \
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'chunked', ?7) \
                           ON CONFLICT(id) DO UPDATE SET \
                               key = excluded.key, version = excluded.version, \
                               size = excluded.size, created_at = excluded.created_at, \
                               accessed_at = excluded.accessed_at, complete = 1, \
                               artifact_key = '', reservation_expires_at = NULL, \
                               digest = excluded.digest, layout = 'chunked'",
-                        params![blob_id, artifact_key, version, size, now, payload.digest],
+                        params![blob_id, artifact_key, version, size, now, payload.digest, namespace],
                     )
                     .map_err(sql)?;
                     tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
                         .map_err(sql)?;
                     let added =
-                        acquire_chunk_manifest(&tx, &blob_id, &payload, &mut chunk_unlinks)?;
-                    let used: i64 = tx
-                        .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                        .optional()
-                        .map_err(sql)?
-                        .unwrap_or(0);
-                    let used = used.saturating_sub(removed).saturating_add(added);
-                    tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                        .map_err(sql)?;
+                        acquire_chunk_manifest(&tx, &namespace, &blob_id, &payload, &mut chunk_unlinks)?;
+                    let used = namespace_used_bytes(&tx, &namespace)?;                    let used = used.saturating_sub(removed).saturating_add(added);                    set_namespace_used_bytes(&tx, &namespace, used)?;
                     tx.commit().map_err(sql)?;
                     drop(conn);
                     // Files last: superseded blob + zero-ref chunks + the
@@ -1871,27 +1901,20 @@ impl StorageBackend for FsStorage {
                 tx.execute(
                     "INSERT INTO entries \
                          (id, key, version, size, created_at, accessed_at, complete, \
-                          owner_node, artifact_key, reservation_expires_at, digest, layout) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole') \
+                          owner_node, artifact_key, reservation_expires_at, digest, layout, namespace) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, '', '', NULL, ?6, 'whole', ?7) \
                      ON CONFLICT(id) DO UPDATE SET \
                          key = excluded.key, version = excluded.version, \
                          size = excluded.size, created_at = excluded.created_at, \
                          accessed_at = excluded.accessed_at, complete = 1, \
                          artifact_key = '', reservation_expires_at = NULL, \
                          digest = excluded.digest, layout = 'whole'",
-                    params![blob_id, artifact_key, version, size, now, digest],
+                    params![blob_id, artifact_key, version, size, now, digest, namespace],
                 )
                 .map_err(sql)?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", [&res_id])
                     .map_err(sql)?;
-                let used: i64 = tx
-                    .query_row("SELECT used_bytes FROM accounting", [], |row| row.get(0))
-                    .optional()
-                    .map_err(sql)?
-                    .unwrap_or(0);
-                let used = used.saturating_sub(removed).saturating_add(size);
-                tx.execute("UPDATE accounting SET used_bytes = ?1", [used])
-                    .map_err(sql)?;
+                let used = namespace_used_bytes(&tx, &namespace)?;                let used = used.saturating_sub(removed).saturating_add(size);                set_namespace_used_bytes(&tx, &namespace, used)?;
                 tx.commit().map_err(sql)?;
                 drop(conn);
                 for chunk_id in &chunk_unlinks {
@@ -2217,6 +2240,7 @@ fn release_entry_manifest(conn: &Connection, id: &str) -> io::Result<Vec<String>
 /// unlinking are pruned from `unlink` when this entry still holds them.
 fn acquire_chunk_manifest(
     conn: &Connection,
+    namespace: &str,
     id: &str,
     payload: &CdcPayload,
     unlink: &mut Vec<String>,
@@ -2244,9 +2268,9 @@ fn acquire_chunk_manifest(
                     // 0 and dropped its row): registered at one ref.
                     let size = i64::try_from(*chunk_size).unwrap_or(i64::MAX);
                     conn.execute(
-                        "INSERT INTO chunks (id, size, refs, created_at) \
-                         VALUES (?1, ?2, 1, ?3)",
-                        params![chunk_id, size, created_at],
+                        "INSERT INTO chunks (id, size, refs, created_at, namespace) \
+                         VALUES (?1, ?2, 1, ?3, ?4)",
+                        params![chunk_id, size, created_at, namespace],
                     )
                     .map_err(sql)?;
                     added = added.saturating_add(size);
@@ -2267,10 +2291,10 @@ fn acquire_chunk_manifest(
             }
         }
         conn.execute(
-            "INSERT INTO entry_chunks (entry_id, seq, chunk_id) \
-             VALUES (?1, ?2, ?3) \
+            "INSERT INTO entry_chunks (entry_id, seq, chunk_id, namespace) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(entry_id, seq) DO UPDATE SET chunk_id = excluded.chunk_id",
-            params![id, seq, chunk_id],
+            params![id, seq, chunk_id, namespace],
         )
         .map_err(sql)?;
     }
@@ -2285,9 +2309,9 @@ fn acquire_chunk_manifest(
 fn pick_whole_entry(
     conn: &Connection,
     skip: &HashSet<String>,
-) -> io::Result<Option<(String, u64, String)>> {
+) -> io::Result<Option<(String, u64, String, String)>> {
     let mut query = String::from(
-        "SELECT id, size, digest FROM entries \
+        "SELECT id, size, digest, namespace FROM entries \
          WHERE complete = 1 AND layout = 'whole' AND digest != ''",
     );
     let mut values: Vec<String> = Vec::new();
@@ -2303,11 +2327,57 @@ fn pick_whole_entry(
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .optional()
         .map_err(sql)?;
-    Ok(row.map(|(id, size, digest)| (id, u64::try_from(size.max(0)).unwrap_or(0), digest)))
+    Ok(row.map(|(id, size, digest, namespace)| {
+        (
+            id,
+            u64::try_from(size.max(0)).unwrap_or(0),
+            digest,
+            namespace,
+        )
+    }))
+}
+
+/// The accounted bytes of one namespace (0 when it has no row yet).
+///
+/// The accounting table holds one row per namespace (v1.2 workstream F):
+/// the namespace is the unit the quotas and the eviction count in, so a
+/// namespace's usage is readable without summing anybody else's.
+fn namespace_used_bytes(conn: &Connection, namespace: &str) -> io::Result<i64> {
+    conn.query_row(
+        "SELECT used_bytes FROM accounting WHERE namespace = ?1",
+        [namespace],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql)
+    .map(|used| used.unwrap_or(0))
+}
+
+/// Set one namespace's accounted bytes, creating its row on demand.
+fn set_namespace_used_bytes(conn: &Connection, namespace: &str, used: i64) -> io::Result<()> {
+    conn.execute(
+        "INSERT INTO accounting (namespace, used_bytes) VALUES (?1, ?2) \
+         ON CONFLICT(namespace) DO UPDATE SET used_bytes = ?2",
+        params![namespace, used],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// The accounted bytes across every namespace: the eviction floor's input
+/// (the admin's `min_free` is absolute across the whole index).
+fn total_used_bytes(conn: &Connection) -> io::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(used_bytes), 0) FROM accounting",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql)
 }
 
 /// Address for a key: hex(SHA-256(key)). Keys stay opaque (never path
@@ -2465,6 +2535,12 @@ fn migrate_v3_namespace(conn: &Connection) -> io::Result<()> {
     .map_err(sql)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS entry_chunks_namespace_idx ON entry_chunks(namespace, chunk_id)",
+        [],
+    )
+    .map_err(sql)?;
+    // One accounting row per namespace: the quota work upserts into it.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS accounting_namespace_idx ON accounting(namespace)",
         [],
     )
     .map_err(sql)?;
