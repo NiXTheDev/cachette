@@ -262,23 +262,26 @@ jobs:
           key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
-      # tests fail, not skip, when a toolchain is missing).
-      - name: Install Node.js
-        uses: https://hangar.nixthedev.ru/actions/setup-node@v4
+      # tests fail, not skip, when a toolchain is missing). node/npm ship in
+      # the runner images themselves (act-runner's ubuntu-latest image on
+      # amd64, node:24-trixie on arm64), so there is nothing to install -
+      # the assert below fails loudly if that ever stops being true. The
+      # npm tarball caching that setup-node used to provide moves to plain
+      # actions/cache: same key shape (lock hash), same ~/.npm path.
+      - name: Cache npm tarballs
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
-          node-version: "20"
-          # Built-in restore-at-start/store-at-end of the npm tarballs via the
-          # toolkit; the fixture's `npm ci` then makes no registry fetches.
-          cache: "npm"
-          cache-dependency-path: tests/fixtures/package-lock.json
+          path: ~/.npm
+          key: npm-${{ runner.arch }}-${{ hashFiles('tests/fixtures/package-lock.json') }}
+      # go is NOT in the arm64 image (node:24-trixie), so the pin stays
+      # explicit here on all arches. setup-go caches ~/.cache/go-build +
+      # ~/go/pkg/mod natively (restore-at-start / store-at-end), so the
+      # vendored fixture builds below don't refetch/recompile from zero
+      # each run.
       - name: Install Go
         uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
           go-version: "1.25"
-      # Both setup steps above cache through the toolkit natively
-      # (restore-at-start / store-at-end): node caches the npm tarballs, go caches
-      # ~/.cache/go-build + ~/go/pkg/mod by default - so the vendored fixture
-      # builds below don't refetch/recompile from zero each run.
       - name: Cache cargo registry/build
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header; job-scoped key, see the check job.
