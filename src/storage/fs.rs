@@ -988,6 +988,13 @@ impl FsStorage {
 }
 
 impl StorageBackend for FsStorage {
+    fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend> {
+        // The inherent `FsStorage::scoped` builds a cheap namespaced view
+        // (shared connection/gate/locks); boxing it satisfies the trait's
+        // dyn view without re-opening the index.
+        Arc::new(FsStorage::scoped(self, namespace))
+    }
+
     fn put_stream<'a>(
         &'a self,
         key: &'a str,

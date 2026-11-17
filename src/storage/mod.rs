@@ -25,6 +25,7 @@ use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -391,17 +392,47 @@ pub trait StorageBackend: Send + Sync {
         cache_id: &'a str,
         ordered_block_ids: &'a [String],
     ) -> BoxFuture<'a, io::Result<u64>>;
+
+    /// A view of this backend restricted to one namespace (v1.2 workstream F,
+    /// `docs/shared-cache.md` §1/§4).
+    ///
+    /// The namespace is part of a row's identity: a view only ever observes
+    /// and mutates rows in its own namespace, so two namespaces never see
+    /// each other's rows even with identical keys and versions (the design's
+    /// isolation guarantee), while views of the same namespace deliberately
+    /// share rows on purpose. The view shares the backend's underlying state
+    /// (connection, write gate, chunk locks) with `self`; creating one is
+    /// cheap enough for the per-request namespace resolution the route layer
+    /// performs. The legacy single-tenant rows live in the `""` namespace
+    /// (schema v3 backfill) and are what an unscoped backend operates on.
+    fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend>;
 }
 
 /// In-memory [`StorageBackend`] double for unit and handler tests:
 /// concurrent-safe (`tokio::sync::RwLock`), no filesystem involvement.
+/// Namespace-aware (v1.2 workstream F): each view shares one inner state and
+/// reads/writes exactly its own namespace's rows, mirroring the FS backend's
+/// namespaced index views.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
-    inner: RwLock<MemoryState>,
+    inner: Arc<RwLock<MemoryState>>,
+    /// The namespace this view reads and writes; `""` is the legacy
+    /// single-tenant row set (`MemoryStorage::new()`'s namespace), reachable
+    /// exactly as before namespaces existed.
+    namespace: String,
 }
 
 #[derive(Debug, Default)]
 struct MemoryState {
+    /// Rows per namespace: the namespace is part of a row's identity
+    /// (`docs/shared-cache.md` §4), so two namespaces holding the same key
+    /// and version are two distinct rows by construction.
+    namespaces: HashMap<String, NsState>,
+}
+
+/// One namespace's rows inside [`MemoryState`].
+#[derive(Debug, Default)]
+struct NsState {
     /// Staged (put, not yet finalized) blobs.
     staged: HashMap<String, Staged>,
     /// Visible (finalized) blobs.
@@ -413,6 +444,22 @@ struct MemoryState {
     /// Azure "Put Block" blocks staged per reservation `cache_id`:
     /// `block_id` (hex token) → bytes (plan task 25).
     blocks: HashMap<String, HashMap<String, Vec<u8>>>,
+}
+
+/// A lazily-created empty [`NsState`] so read paths on a namespace that has
+/// never been written behave like "no rows" without inserting a row set.
+static EMPTY_NS: std::sync::LazyLock<NsState> = std::sync::LazyLock::new(NsState::default);
+
+impl MemoryState {
+    /// The rows of `namespace` (an empty set when it holds none yet).
+    fn ns(&self, namespace: &str) -> &NsState {
+        self.namespaces.get(namespace).unwrap_or(&EMPTY_NS)
+    }
+
+    /// The rows of `namespace`, created when absent (write paths).
+    fn ns_mut(&mut self, namespace: &str) -> &mut NsState {
+        self.namespaces.entry(namespace.to_owned()).or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -442,14 +489,30 @@ struct Visible {
 }
 
 impl MemoryStorage {
-    /// Fresh, empty storage.
+    /// Fresh, empty storage in the legacy (`""`) namespace.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A view of this state restricted to one namespace (v1.2 workstream F,
+    /// the in-memory twin of [`FsStorage::scoped`]): the view shares the
+    /// inner state with `self` and only ever touches its own namespace's
+    /// rows, so two views of different namespaces never share a row.
+    #[must_use]
+    pub fn scoped(&self, namespace: &str) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            namespace: namespace.to_owned(),
+        }
+    }
 }
 
 impl StorageBackend for MemoryStorage {
+    fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend> {
+        Arc::new(MemoryStorage::scoped(self, namespace))
+    }
+
     fn put_stream<'a>(
         &'a self,
         key: &'a str,
@@ -459,7 +522,7 @@ impl StorageBackend for MemoryStorage {
             let mut data = Vec::new();
             source.read_to_end(&mut data).await?;
             let mut state = self.inner.write().await;
-            state.staged.insert(
+            state.ns_mut(&self.namespace).staged.insert(
                 key.to_owned(),
                 Staged {
                     data,
@@ -480,7 +543,8 @@ impl StorageBackend for MemoryStorage {
                 return Err(invalid_range("range start after end"));
             }
             let mut state = self.inner.write().await;
-            let entry = state.visible.get_mut(key).ok_or_else(|| not_found(key))?;
+            let ns = state.ns_mut(&self.namespace);
+            let entry = ns.visible.get_mut(key).ok_or_else(|| not_found(key))?;
             let size = entry.data.len() as u64;
             if range.start > size {
                 return Err(invalid_range("range start past end of entry"));
@@ -496,11 +560,12 @@ impl StorageBackend for MemoryStorage {
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            state.staged.remove(key);
-            state.visible.remove(key);
-            state.reservations.remove(key);
-            state.chunks.remove(key);
-            state.blocks.remove(key);
+            let ns = state.ns_mut(&self.namespace);
+            ns.staged.remove(key);
+            ns.visible.remove(key);
+            ns.reservations.remove(key);
+            ns.chunks.remove(key);
+            ns.blocks.remove(key);
             Ok(())
         })
     }
@@ -508,12 +573,16 @@ impl StorageBackend for MemoryStorage {
     fn stat<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<Option<EntryStat>>> {
         Box::pin(async move {
             let state = self.inner.read().await;
-            Ok(state.visible.get(key).map(|entry| EntryStat {
-                key: key.to_owned(),
-                size: entry.data.len() as u64,
-                created_at: entry.created_at,
-                accessed_at: entry.accessed_at,
-            }))
+            Ok(state
+                .ns(&self.namespace)
+                .visible
+                .get(key)
+                .map(|entry| EntryStat {
+                    key: key.to_owned(),
+                    size: entry.data.len() as u64,
+                    created_at: entry.created_at,
+                    accessed_at: entry.accessed_at,
+                }))
         })
     }
 
@@ -521,6 +590,7 @@ impl StorageBackend for MemoryStorage {
         Box::pin(async move {
             let state = self.inner.read().await;
             let mut entries: Vec<EntryStat> = state
+                .ns(&self.namespace)
                 .visible
                 .iter()
                 .map(|(key, entry)| EntryStat {
@@ -538,11 +608,12 @@ impl StorageBackend for MemoryStorage {
     fn finalize<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            match state.staged.remove(key) {
+            let ns = state.ns_mut(&self.namespace);
+            match ns.staged.remove(key) {
                 Some(staged) => {
-                    state.reservations.remove(key);
-                    state.chunks.remove(key);
-                    state.visible.insert(
+                    ns.reservations.remove(key);
+                    ns.chunks.remove(key);
+                    ns.visible.insert(
                         key.to_owned(),
                         Visible {
                             data: staged.data,
@@ -553,7 +624,7 @@ impl StorageBackend for MemoryStorage {
                     Ok(())
                 }
                 // Idempotent commit of an already-visible key.
-                None if state.visible.contains_key(key) => Ok(()),
+                None if ns.visible.contains_key(key) => Ok(()),
                 None => Err(not_found(key)),
             }
         })
@@ -563,6 +634,7 @@ impl StorageBackend for MemoryStorage {
         Box::pin(async move {
             let state = self.inner.read().await;
             let total = state
+                .ns(&self.namespace)
                 .visible
                 .values()
                 .map(|entry| entry.data.len() as u64)
@@ -580,7 +652,8 @@ impl StorageBackend for MemoryStorage {
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            state.reservations.insert(
+            let ns = state.ns_mut(&self.namespace);
+            ns.reservations.insert(
                 cache_id.to_owned(),
                 Reservation {
                     key: key.to_owned(),
@@ -588,7 +661,7 @@ impl StorageBackend for MemoryStorage {
                 },
             );
             // A fresh reserve supersedes any blocks staged for this cache_id.
-            state.blocks.remove(cache_id);
+            ns.blocks.remove(cache_id);
             Ok(())
         })
     }
@@ -601,6 +674,7 @@ impl StorageBackend for MemoryStorage {
         Box::pin(async move {
             let state = self.inner.read().await;
             Ok(state
+                .ns(&self.namespace)
                 .reservations
                 .values()
                 .any(|reservation| reservation.key == key && reservation.expires_at > now_unix))
@@ -616,16 +690,17 @@ impl StorageBackend for MemoryStorage {
             let mut data = Vec::new();
             chunk.body.read_to_end(&mut data).await?;
             let mut state = self.inner.write().await;
-            match state.reservations.get(cache_id) {
+            let ns = state.ns_mut(&self.namespace);
+            match ns.reservations.get(cache_id) {
                 None => return Err(not_found(cache_id)),
                 Some(reservation) if reservation.expires_at <= unix_now() => {
-                    state.reservations.remove(cache_id);
-                    state.chunks.remove(cache_id);
+                    ns.reservations.remove(cache_id);
+                    ns.chunks.remove(cache_id);
                     return Err(not_found(cache_id));
                 }
                 Some(_) => {}
             }
-            let staged = state.chunks.entry(cache_id.to_owned()).or_default();
+            let staged = ns.chunks.entry(cache_id.to_owned()).or_default();
             for existing in staged.iter() {
                 if existing.range == chunk.range {
                     return Ok(ChunkOutcome::AlreadyPresent);
@@ -649,17 +724,18 @@ impl StorageBackend for MemoryStorage {
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            let Some(reservation) = state.reservations.get(cache_id) else {
+            let ns = state.ns_mut(&self.namespace);
+            let Some(reservation) = ns.reservations.get(cache_id) else {
                 return Err(not_found(cache_id));
             };
             if reservation.expires_at <= unix_now() {
-                state.reservations.remove(cache_id);
-                state.chunks.remove(cache_id);
-                state.blocks.remove(cache_id);
+                ns.reservations.remove(cache_id);
+                ns.chunks.remove(cache_id);
+                ns.blocks.remove(cache_id);
                 return Err(not_found(cache_id));
             }
             let key = reservation.key.clone();
-            let mut staged = state.chunks.remove(cache_id).unwrap_or_default();
+            let mut staged = ns.chunks.remove(cache_id).unwrap_or_default();
             staged.sort_by_key(|chunk| chunk.range.start);
             let mut expected = 0_u64;
             let mut contiguous = true;
@@ -671,7 +747,7 @@ impl StorageBackend for MemoryStorage {
                 expected = expected.saturating_add(chunk.range.len());
             }
             if !contiguous || expected != declared_size {
-                state.reservations.remove(cache_id);
+                ns.reservations.remove(cache_id);
                 return Err(invalid_range(
                     "committed size does not match the uploaded chunks",
                 ));
@@ -681,7 +757,7 @@ impl StorageBackend for MemoryStorage {
                 data.extend_from_slice(&chunk.data);
             }
             let created_at = unix_now();
-            state.visible.insert(
+            ns.visible.insert(
                 key,
                 Visible {
                     data,
@@ -689,8 +765,8 @@ impl StorageBackend for MemoryStorage {
                     accessed_at: created_at,
                 },
             );
-            state.reservations.remove(cache_id);
-            state.blocks.remove(cache_id);
+            ns.reservations.remove(cache_id);
+            ns.blocks.remove(cache_id);
             Ok(())
         })
     }
@@ -705,17 +781,17 @@ impl StorageBackend for MemoryStorage {
             let mut data = Vec::new();
             source.read_to_end(&mut data).await?;
             let mut state = self.inner.write().await;
-            match state.reservations.get(cache_id) {
+            let ns = state.ns_mut(&self.namespace);
+            match ns.reservations.get(cache_id) {
                 None => return Err(not_found(cache_id)),
                 Some(reservation) if reservation.expires_at <= unix_now() => {
-                    state.reservations.remove(cache_id);
-                    state.blocks.remove(cache_id);
+                    ns.reservations.remove(cache_id);
+                    ns.blocks.remove(cache_id);
                     return Err(not_found(cache_id));
                 }
                 Some(_) => {}
             }
-            state
-                .blocks
+            ns.blocks
                 .entry(cache_id.to_owned())
                 .or_default()
                 .insert(block_id.to_owned(), data);
@@ -730,16 +806,17 @@ impl StorageBackend for MemoryStorage {
     ) -> BoxFuture<'a, io::Result<u64>> {
         Box::pin(async move {
             let mut state = self.inner.write().await;
-            let Some(reservation) = state.reservations.get(cache_id) else {
+            let ns = state.ns_mut(&self.namespace);
+            let Some(reservation) = ns.reservations.get(cache_id) else {
                 return Err(not_found(cache_id));
             };
             if reservation.expires_at <= unix_now() {
-                state.reservations.remove(cache_id);
-                state.blocks.remove(cache_id);
+                ns.reservations.remove(cache_id);
+                ns.blocks.remove(cache_id);
                 return Err(not_found(cache_id));
             }
             let key = reservation.key.clone();
-            let staged = state.blocks.get(cache_id);
+            let staged = ns.blocks.get(cache_id);
             let mut data = Vec::new();
             for block_id in ordered_block_ids {
                 let Some(bytes) = staged.and_then(|blocks| blocks.get(block_id)) else {
@@ -749,7 +826,7 @@ impl StorageBackend for MemoryStorage {
             }
             let size = data.len() as u64;
             let created_at = unix_now();
-            state.visible.insert(
+            ns.visible.insert(
                 key,
                 Visible {
                     data,
@@ -757,8 +834,8 @@ impl StorageBackend for MemoryStorage {
                     accessed_at: created_at,
                 },
             );
-            state.reservations.remove(cache_id);
-            state.blocks.remove(cache_id);
+            ns.reservations.remove(cache_id);
+            ns.blocks.remove(cache_id);
             Ok(size)
         })
     }
@@ -976,6 +1053,156 @@ mod trait_contract {
         assert_eq!(normalize_key("MiXeD-Key", KeyCase::Preserve), "MiXeD-Key");
         // Non-ASCII bytes are untouched by the Lower rule (ASCII-only).
         assert_eq!(normalize_key("ÄBC", KeyCase::Lower), "Äbc");
+    }
+}
+
+#[cfg(test)]
+mod namespace_scoping {
+    //! The design's isolation guarantees (docs/shared-cache.md §Test plan),
+    //! exercised through the trait so both backends must honor them.
+
+    use std::io::Cursor;
+
+    use super::*;
+
+    async fn put_visible(storage: &dyn StorageBackend, key: &str, data: &[u8]) {
+        storage
+            .put_stream(key, Box::pin(Cursor::new(data.to_vec())))
+            .await
+            .expect("put");
+        storage.finalize(key).await.expect("finalize");
+    }
+
+    /// Two namespaces, same key: two distinct rows — a write in one namespace
+    /// is invisible to a view of the other, and each view's `stat`/`list`
+    /// only sees its own row set.
+    #[tokio::test]
+    async fn two_namespaces_same_key_are_distinct_rows() {
+        let root = MemoryStorage::new();
+        let a = root.scoped("forge-a");
+        let b = root.scoped("forge-b");
+
+        put_visible(&a, "shared-key", b"a-data").await;
+
+        assert!(b.stat("shared-key").await.expect("stat").is_none());
+        assert!(b.list().await.expect("list").is_empty());
+
+        put_visible(&b, "shared-key", b"b-data").await;
+
+        // Both rows coexist under one key; neither view sees the other's.
+        let stat_a = a.stat("shared-key").await.expect("stat").expect("a row");
+        let stat_b = b.stat("shared-key").await.expect("stat").expect("b row");
+        assert_eq!(stat_a.size, 6);
+        assert_eq!(stat_b.size, 6);
+        assert_eq!(
+            a.list().await.expect("list").len(),
+            1,
+            "a view lists only its own namespace's rows"
+        );
+    }
+
+    /// A cross-namespace read is a miss (the route layer maps that to 204).
+    #[tokio::test]
+    async fn cross_namespace_read_is_a_miss() {
+        let root = MemoryStorage::new();
+        let a = root.scoped("forge-a");
+        put_visible(&a, "k", b"data").await;
+
+        let err = root
+            .get_range("k", 0..4)
+            .await
+            .err()
+            .expect("the legacy view must not see a namespaced row");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A cross-namespace delete is a no-op against the other namespace's row.
+    #[tokio::test]
+    async fn cross_namespace_delete_is_a_no_op() {
+        let root = MemoryStorage::new();
+        let a = root.scoped("forge-a");
+        let b = root.scoped("forge-b");
+        put_visible(&a, "k", b"data").await;
+
+        b.delete("k").await.expect("delete");
+
+        assert!(
+            a.stat("k").await.expect("stat").is_some(),
+            "deleting in namespace b must not touch namespace a's row"
+        );
+    }
+
+    /// A cross-namespace finalize cannot publish: staging in namespace a and
+    /// committing in namespace b leaves a's data staged (invisible) and b
+    /// without a row.
+    #[tokio::test]
+    async fn cross_namespace_finalize_cannot_publish() {
+        let root = MemoryStorage::new();
+        let a = root.scoped("forge-a");
+        let b = root.scoped("forge-b");
+        a.put_stream("k", Box::pin(Cursor::new(b"staged".to_vec())))
+            .await
+            .expect("stage in a");
+
+        let err = b
+            .finalize("k")
+            .await
+            .expect_err("finalize in b must not see a's staged data");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        assert!(
+            a.stat("k").await.expect("stat").is_none(),
+            "a's staged data stays invisible"
+        );
+        assert!(b.stat("k").await.expect("stat").is_none());
+    }
+
+    /// Views of the SAME namespace deliberately share rows (the
+    /// shared-namespace case; the admin decided, the client cannot opt out).
+    #[tokio::test]
+    async fn same_namespace_views_share_rows() {
+        let root = MemoryStorage::new();
+        let a1 = root.scoped("shared");
+        let a2 = root.scoped("shared");
+        put_visible(&a1, "k", b"data").await;
+
+        let stat = a2.stat("k").await.expect("stat").expect("shared row");
+        assert_eq!(stat.size, 4);
+        assert_eq!(a2.used_bytes().await.expect("used"), 4);
+    }
+
+    /// Duplicate-reservation detection (`reservation_exists`, the v2
+    /// CreateCacheEntry rule) is namespace-scoped: a concurrent same-key
+    /// reserve in another namespace is allowed, in the same one rejected.
+    #[tokio::test]
+    async fn reservation_exists_is_namespace_scoped() {
+        let root = MemoryStorage::new();
+        let a = root.scoped("forge-a");
+        let b = root.scoped("forge-b");
+        a.reserve("cid", "k", "2", u64::MAX).await.expect("reserve");
+
+        assert!(
+            a.reservation_exists("k", 0).await.expect("exists"),
+            "same namespace sees the open reservation"
+        );
+        assert!(
+            !b.reservation_exists("k", 0).await.expect("exists"),
+            "another namespace must not see it"
+        );
+    }
+
+    /// The trait-level `scoped` works through `dyn StorageBackend` — the
+    /// shape the route layer will consume when it resolves a request's
+    /// namespace from its credential.
+    #[tokio::test]
+    async fn trait_scoped_returns_an_isolated_dyn_view() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryStorage::new());
+        let a = backend.scoped("forge-a");
+        let b = backend.scoped("forge-b");
+        put_visible(&*a, "k", b"data").await;
+
+        assert!(b.stat("k").await.expect("stat").is_none());
+        assert!(a.stat("k").await.expect("stat").is_some());
     }
 }
 
