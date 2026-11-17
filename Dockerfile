@@ -80,7 +80,10 @@ FROM --platform=$BUILDPLATFORM rust:1.100-alpine@sha256:de1e0058543a81ed7b046629
 # BUILDARCH is a predefined buildkit arg (amd64 | arm64) = the builder
 # stage's own platform. Predefined args are usable in FROM without a
 # declaration (the --platform=$BUILDPLATFORM above) but a RUN only sees
-# them once the stage re-declares them - hence this line.
+# them once the stage re-declares them - hence this line. NOTE: the
+# naming is Go/GOARCH style (amd64, arm64) - NOT the aarch64/x86_64
+# spelling zig tarballs and rust targets use; case-branches on
+# BUILDARCH must use the Go spelling and map to the target's spelling.
 ARG BUILDARCH
 
 # gcc/musl-dev: fallback C toolchain for the native target (zig cc covers
@@ -98,8 +101,8 @@ ARG ZIG_SHA_AARCH64=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c
 ARG ZIG_SHA_X86_64=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
 RUN set -eu; \
     case "$BUILDARCH" in \
-      aarch64) ZIG_ASSET="zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; ZIG_SHA="${ZIG_SHA_AARCH64}" ;; \
-      x86_64)  ZIG_ASSET="zig-x86_64-linux-${ZIG_VERSION}.tar.xz";  ZIG_SHA="${ZIG_SHA_X86_64}" ;; \
+      arm64)  ZIG_ASSET="zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; ZIG_SHA="${ZIG_SHA_AARCH64}" ;; \
+      amd64)  ZIG_ASSET="zig-x86_64-linux-${ZIG_VERSION}.tar.xz";  ZIG_SHA="${ZIG_SHA_X86_64}" ;; \
       *) echo "unsupported BUILDARCH for zig: ${BUILDARCH}"; exit 1 ;; \
     esac; \
     url="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ASSET}"; \
@@ -196,8 +199,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       cargo zigbuild --release --locked --target "$t"; \
     done; \
     case "$BUILDARCH" in \
-      aarch64) NATIVE_BIN="target/aarch64-unknown-linux-musl/release/cachette" ;; \
-      x86_64)  NATIVE_BIN="target/x86_64-unknown-linux-musl/release/cachette" ;; \
+      arm64) NATIVE_BIN="target/aarch64-unknown-linux-musl/release/cachette" ;; \
+      amd64) NATIVE_BIN="target/x86_64-unknown-linux-musl/release/cachette" ;; \
       *) echo "unsupported BUILDARCH for the version assert: ${BUILDARCH}"; exit 1 ;; \
     esac; \
     "./${NATIVE_BIN}" --version; \
