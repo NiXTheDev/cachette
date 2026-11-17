@@ -78,6 +78,12 @@
 FROM --platform=$BUILDPLATFORM \
   rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
 
+# BUILDARCH is a predefined buildkit arg (amd64 | arm64) = the builder
+# stage's own platform. Predefined args are usable in FROM without a
+# declaration (the --platform=$BUILDPLATFORM above) but a RUN only sees
+# them once the stage re-declares them - hence this line.
+ARG BUILDARCH
+
 # gcc/musl-dev: fallback C toolchain for the native target (zig cc covers
 #   both targets; this stays only as a floor if a cc-rs crate refuses zig).
 # file(1): build-time static-link assertion. tar/xz: unpack the zig tarball.
@@ -147,7 +153,7 @@ RUN set -eu; \
 # Optional crates.io source replacement for restricted networks (CI needs NONE;
 # CI runners reach crates.io directly):
 #   --build-arg CARGO_MIRROR=sparse+https://<registry-host>/crates.io-index/
-ARG CARGO_MIRROR=
+ARG CARGO_MIRROR=''
 RUN if [ -n "$CARGO_MIRROR" ]; then \
       printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
         "$CARGO_MIRROR" > "$CARGO_HOME/config.toml"; \
