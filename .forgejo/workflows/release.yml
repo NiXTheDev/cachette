@@ -68,7 +68,7 @@
 # .forgejo/actions/rustup-mirror probes a ladder (rsproxy -> USTC -> tuna ->
 # upstream) and exports RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT, so the
 # dtolnay/rust-toolchain composite installs through whichever mirror
-# actually answered. The pin stays 1.99; only the fetch path moves.
+# actually answered. The pin stays 1.100; only the fetch path moves.
 #
 # The toolchain cache is now restored BEFORE the install (see the step), so a
 # warm cache means no fetch at all - the header promise ("the download
@@ -504,7 +504,7 @@ jobs:
       # sailed through. Host-scoped, the gnu leg's cache hands the musl and
       # windows-gnu legs the toolchain for free; they only fetch their own
       # std archive. The version pin in the key IS the toolchain contract
-      # now (pinned: 1.99, the version the battery + docker base validate).
+      # now (pinned: 1.100, the version the battery + docker base validate).
       #
       # RESTORE-BEFORE-INSTALL (was after): the cache used to be restored
       # AFTER the toolchain step, so the download happened on EVERY leg of
@@ -516,8 +516,8 @@ jobs:
       #
       # The key cannot read steps.toolchain.outputs.cachekey any more (that
       # step has not run yet at restore time), so the pin moves into the key
-      # itself: rustup-1.99-<arch>. One-time cost: the entries written under
-      # the old key are orphaned and every runner arch downloads 1.99 once
+      # itself: rustup-1.100-<arch>. One-time cost: the entries written under
+      # the old key are orphaned and every runner arch downloads 1.100 once
       # more (through the mirror ladder). ~/.rustup/settings.toml rides along
       # so rustup's installed-toolchain registry comes back with the
       # toolchain it describes.
@@ -527,13 +527,13 @@ jobs:
           path: |
             ~/.rustup/toolchains
             ~/.rustup/settings.toml
-          key: rustup-1.99-${{ runner.arch }}
+          key: rustup-1.100-${{ runner.arch }}
 
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry/build

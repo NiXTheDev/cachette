@@ -1,6 +1,6 @@
 # Multistage build for cachette (plan task 36).
 #
-# Builder: rust:1.98-alpine, run ONCE on the runner's own platform
+# Builder: rust:1.100-alpine, run ONCE on the runner's own platform
 #   (--platform=$BUILDPLATFORM), cross-compiling BOTH static musl binaries:
 #     aarch64-unknown-linux-musl  (the image's own host target - std ships in
 #                                  the rust image)
@@ -70,12 +70,12 @@
 # dependency is docker.io's blob CDN (production.cloudfront.docker.com),
 # which EOF'd the 1.0.0-class docker legs mid-build. The pin lets the
 # workflows' pre-pull ladder warm the host store for the EXACT manifest
-# buildkit needs, so a republished `1.98-alpine` upstream cannot revolve
-# under us mid-fleet. To bump: `docker manifest inspect rust:1.98-alpine`,
+# buildkit needs, so a republished `1.100-alpine` upstream cannot revolve
+# under us mid-fleet. To bump: `docker manifest inspect rust:1.100-alpine`,
 # then replace the digest here AND in both workflows' pre-pull steps.
 # Only the runner-arch variant of this index is ever pulled now - the
 # builder stage is forced to $BUILDPLATFORM.
-FROM --platform=$BUILDPLATFORM rust:1.98-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
+FROM --platform=$BUILDPLATFORM rust:1.100-alpine@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS builder
 
 # BUILDARCH is a predefined buildkit arg (amd64 | arm64) = the builder
 # stage's own platform. Predefined args are usable in FROM without a

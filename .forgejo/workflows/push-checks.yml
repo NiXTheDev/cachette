@@ -100,7 +100,7 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
           components: rustfmt
       # The component fetch is its own network leg and rustup carries no
       # ladder of its own (run 5's fmt died in 14s when the toolchain host
@@ -127,7 +127,7 @@ jobs:
           exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -150,14 +150,14 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -195,7 +195,7 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
           components: clippy
       # Same component-fetch ladder as the fmt job (docs above).
       - name: Ensure the components landed (retry ladder)
@@ -214,7 +214,7 @@ jobs:
           exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -246,14 +246,14 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -315,14 +315,14 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
@@ -460,7 +460,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="rust:1.98-alpine"
+          base="rust:1.100-alpine"
           digest="sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f"
           ok=0
           for attempt in 1 2 3 4 5 6 7 8; do
