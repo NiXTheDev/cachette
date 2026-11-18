@@ -93,31 +93,75 @@ ARG BUILDARCH
 RUN apk add --no-cache gcc musl-dev file tar xz curl
 
 # zig 0.17.1 - sha256-pinned tarball (aarch64-linux / x86_64-linux variants
-# per the builder's own arch). ziglang.org is the runner-proven primary
-# (release.yml measured a clean ~8s fetch); the ladder just absorbs the
-# fleet's occasional TLS-EOF windows.
+# per the builder's own arch). THE FETCH IS NOT FROM ZIGLANG.ORG FIRST:
+# ziglang.org is a deliberate one-computer host whose 51 MiB tarballs stall
+# mid-transfer on the fleet's egress path - pr-13 run #137 lost every docker
+# rung to `curl (56) Recv failure: Operation timed out` three times in a
+# row (~10 min per stall), 4 buildx invocations in a row (~2h wasted).
+# So: /opt/zig is a cache mount (a warm build skips the fetch entirely),
+# and a cold build walks the ZSF community-mirror list - shuffled so we
+# don't hammer one mirror - with stall-killing curl flags (< 4 KiB/s for
+# 30 s aborts the attempt, 10 min hard cap), ziglang.org itself last.
+# The sha256 pin below is the trust anchor: mirrors are untrusted per the
+# ZSF's own framing, and a tampered or truncated tarball fails the hash.
 ARG ZIG_VERSION=0.17.1
 ARG ZIG_SHA_AARCH64=a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
 ARG ZIG_SHA_X86_64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
-RUN set -eu; \
+RUN --mount=type=cache,target=/opt/zig,sharing=locked \
+    set -eu; \
+    if [ -x /opt/zig/zig ] && /opt/zig/zig version | grep -Fxq "${ZIG_VERSION}"; then \
+      echo "zig ${ZIG_VERSION} already in the /opt/zig cache - skipping fetch"; \
+      exit 0; \
+    fi; \
     case "$BUILDARCH" in \
       arm64)  ZIG_ASSET="zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; ZIG_SHA="${ZIG_SHA_AARCH64}" ;; \
       amd64)  ZIG_ASSET="zig-x86_64-linux-${ZIG_VERSION}.tar.xz";  ZIG_SHA="${ZIG_SHA_X86_64}" ;; \
       *) echo "unsupported BUILDARCH for zig: ${BUILDARCH}"; exit 1 ;; \
     esac; \
-    url="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ASSET}"; \
+    mirrors=""; \
+    if curl -fsSL --connect-timeout 15 --max-time 30 \
+         -o /tmp/zig-mirrors.txt \
+         "https://ziglang.org/download/community-mirrors.txt"; then \
+      # busybox has no shuf(1); a Fisher-Yates pass in awk keeps the load
+      # off whichever mirror happens to be first in the list (ZSF asks
+      # automations to randomize).
+      mirrors="$(awk 'BEGIN { srand(); n = 0 } \
+        { a[n++] = $0 } \
+        END { for (i = n - 1; i > 0; i--) { \
+                j = int(rand() * (i + 1)); t = a[i]; a[i] = a[j]; a[j] = t \
+              } \
+              for (i = 0; i < n; i++) print a[i] }')" /tmp/zig-mirrors.txt; \
+    fi; \
     got=0; \
-    for attempt in 1 2 3; do \
-      echo "== zig download attempt $attempt =="; \
-      if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /tmp/zig.tar.xz; then got=1; break; fi; \
-      sleep $((attempt * 5)); \
+    for m in $mirrors; do \
+      echo "== zig mirror try: ${m} =="; \
+      if curl -fL --connect-timeout 15 --max-time 600 \
+               --speed-limit 4096 --speed-time 30 \
+               -o /tmp/zig.tar.xz "${m}/${ZIG_ASSET}?source=cachette-docker"; then \
+        got=1; break; \
+      fi; \
+      rm -f /tmp/zig.tar.xz; \
     done; \
-    [ "$got" -eq 1 ] || { echo "zig tarball unavailable after 3 attempts: $url"; exit 1; }; \
+    if [ "$got" -ne 1 ]; then \
+      echo "no community mirror served ${ZIG_ASSET} - ziglang.org fallback"; \
+      for attempt in 1 2 3; do \
+        echo "== zig download attempt $attempt =="; \
+        if curl -fL --connect-timeout 20 --max-time 600 \
+                 --speed-limit 4096 --speed-time 30 \
+                 -o /tmp/zig.tar.xz \
+                 "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ASSET}?source=cachette-docker"; then \
+          got=1; break; \
+        fi; \
+        sleep $((attempt * 5)); \
+      done; \
+    fi; \
+    [ "$got" -eq 1 ] || { echo "zig tarball unavailable from every mirror: ${ZIG_ASSET}"; exit 1; }; \
     echo "${ZIG_SHA}  /tmp/zig.tar.xz" | sha256sum -c -; \
+    find /opt/zig -mindepth 1 -delete 2>/dev/null || true; \
     mkdir -p /opt/zig; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
     rm /tmp/zig.tar.xz; \
-    zig version | grep -Fx "${ZIG_VERSION}"
+    /opt/zig/zig version | grep -Fx "${ZIG_VERSION}"
 ENV PATH="/opt/zig:${PATH}"
 
 # cargo-zigbuild - the SAME driver command the release legs use. It sets
