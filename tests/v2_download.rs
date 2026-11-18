@@ -416,7 +416,7 @@ async fn download_unknown_entry_with_valid_signature_is_404() {
     let app = routes::router(state);
 
     let path = "/v2/artifacts/ghost-cache";
-    let signed = urls::mint(path, "ghost-cache", SECRET, 900, now_secs());
+    let signed = urls::mint(path, "ghost-cache", SECRET, 900, now_secs(), "");
     let uri = format!("{path}{}", signed.query());
     let reply = send(app, "GET", &uri, &[], Vec::new()).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
@@ -446,6 +446,7 @@ async fn download_without_a_valid_signature_is_403() {
         SECRET,
         900,
         now_secs(),
+        "",
     );
     let mut mac = signed.mac.clone().into_bytes();
     mac[0] = if mac[0] == b'0' { b'1' } else { b'0' };
@@ -459,7 +460,7 @@ async fn download_without_a_valid_signature_is_403() {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 
     // A URL minted for a DIFFERENT path must not authorize this one.
-    let other = urls::mint("/v2/artifacts/other", "other", SECRET, 900, now_secs());
+    let other = urls::mint("/v2/artifacts/other", "other", SECRET, 900, now_secs(), "");
     let uri = format!("/v2/artifacts/anything{}", other.query());
     let reply = send(app, "GET", &uri, &[], Vec::new()).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);

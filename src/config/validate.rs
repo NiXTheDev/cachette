@@ -2,6 +2,8 @@
 //! cannot express. Closed sets (eviction, key_case, tiebreak, mode, backend,
 //! log level/format) are enforced by their serde enums at parse time.
 
+use std::collections::BTreeMap;
+
 use crate::config::Config;
 use crate::config::error::ConfigError;
 
@@ -52,7 +54,25 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::CertPathCollides);
     }
+    validate_namespaces(&config.storage.namespaces)?;
     validate_oidc(config)?;
+    Ok(())
+}
+
+/// `[storage.namespaces]` mapping keys are credential identities
+/// (`docs/shared-cache.md` §7): `"<forge>|<tenant>"`, both halves present.
+/// The tenant half is dynamic (only the admin knows which repos exist), so
+/// this is a shape check - a mistyped tenant simply keeps its own default
+/// namespace rather than joining the intended shared one.
+fn validate_namespaces(namespaces: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    for key in namespaces.keys() {
+        let well_formed = key
+            .split_once('|')
+            .is_some_and(|(forge, tenant)| !forge.trim().is_empty() && !tenant.trim().is_empty());
+        if !well_formed {
+            return Err(ConfigError::NamespaceMappingKey { key: key.clone() });
+        }
+    }
     Ok(())
 }
 
@@ -110,6 +130,14 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError::OidcIssuerMissing {
                 issuer: issuer.clone(),
                 field: "audiences",
+            });
+        }
+        // The tenant namespace's second half comes from this claim's value;
+        // an empty name would silently address a claim no token carries.
+        if block.tenant_claim.trim().is_empty() {
+            return Err(ConfigError::OidcIssuerMissing {
+                issuer: issuer.clone(),
+                field: "tenant_claim",
             });
         }
         if let Some(url) = &block.jwks_url
@@ -635,6 +663,40 @@ mod tests {
                 assert_eq!(issuer, "http://bad.example.org/realms/ci");
             }
             other => panic!("expected OidcIssuerPlaintext, got {other:?}"),
+        }
+    }
+
+    /// `[storage.namespaces]` keys are credential identities
+    /// (`docs/shared-cache.md` §7): both halves must be present. A target
+    /// may be any name (including `""`, the legacy opt-in).
+    #[test]
+    fn namespace_mappings_require_forge_and_tenant_halves() {
+        let mut config = Config::default();
+        config.storage.namespaces.insert(
+            String::from("https://hangar.nixthedev.ru|NiXTheDev/cachette"),
+            String::from("nixthedev"),
+        );
+        config.storage.namespaces.insert(
+            String::from("https://github.com|octo-org/api"),
+            String::new(),
+        );
+        assert!(validate(&config).is_ok());
+
+        for key in [
+            "NiXTheDev/cachette",
+            "|NiXTheDev/cachette",
+            "https://forge|",
+        ] {
+            let mut config = Config::default();
+            config
+                .storage
+                .namespaces
+                .insert(String::from(key), String::from("shared"));
+            let err = validate(&config).expect_err("malformed mapping key");
+            assert!(
+                matches!(&err, ConfigError::NamespaceMappingKey { key: got } if got == key),
+                "unexpected error: {err:?}"
+            );
         }
     }
 }

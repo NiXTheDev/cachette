@@ -143,7 +143,7 @@ pub async fn find(
     {
         Ok(Some(entry)) => {
             let base = state.external_url.as_deref().unwrap_or_default();
-            return signed_find_hit(&state, base, &entry.key);
+            return signed_find_hit(&state, base, &namespace, &entry.key);
         }
         Ok(None) => {}
         Err(err) => {
@@ -160,7 +160,9 @@ pub async fn find(
         Some(hit) => {
             let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
             tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
-            signed_find_hit(&state, &base, &hit.key)
+            // Peer rows are the legacy namespace until the cluster-wire slice
+            // carries namespaces (§8), so their URLs bind nothing.
+            signed_find_hit(&state, &base, &Namespace::legacy(), &hit.key)
         }
         None => {
             tracing::warn!(
@@ -199,8 +201,15 @@ pub(crate) async fn lookup_local(
 }
 
 /// Mint the signed `archiveLocation` hit body against `base` (the host that
-/// actually holds the blob — self or a remote owner).
-fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
+/// actually holds the blob — self or a remote owner). The minting namespace
+/// is MAC-bound into the URL (`docs/shared-cache.md` §4); a peer owner's rows
+/// are still the legacy namespace until the cluster-wire slice (§8).
+fn signed_find_hit(
+    state: &AppState,
+    base: &str,
+    namespace: &Namespace,
+    cache_key: &str,
+) -> Response {
     let policy = state.auth();
     let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
     let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
@@ -210,6 +219,7 @@ fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
         secret,
         SIGNED_URL_TTL_SECONDS,
         auth::now_secs(),
+        &namespace.0,
     );
     Json(json!({
         "result": "hit",
@@ -476,20 +486,22 @@ pub async fn download(
 ) -> Response {
     // Authorize before touching storage so a bad/missing signature is a
     // fail-closed 403 even when the backend is misconfigured.
+    //
+    // The namespace rides in the capability data, not in a credential: this
+    // path is authorized by the signed URL alone (M2/M3), so the credential
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    let mut namespace = Namespace::legacy();
     if requires_signed_url(&state) {
         let policy = state.auth();
         let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
-        if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
-            return ApiError::from(err).into_response();
+        match urls::validate(&query, uri.path(), secret, auth::now_secs()) {
+            Ok(resolved) => namespace = resolved,
+            Err(err) => return ApiError::from(err).into_response(),
         }
     }
-    // The namespace rides in the capability data, not in a credential: this
-    // path is authorized by the signed URL alone (M2/M3), so the credential
-    // gate never inserts an extension here. The credential-plane slice binds
-    // the minting namespace into the signed URL payload (server-side field,
-    // the client only echoes the URL); until then these requests serve the
-    // legacy single-tenant namespace (docs/shared-cache.md §Rollout).
-    let namespace = Namespace::legacy();
     let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();

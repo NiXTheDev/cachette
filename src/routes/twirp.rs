@@ -29,7 +29,9 @@
 //! Auth policy on `/twirp/*` (mirrors the v1 handler matrix):
 //! * static tokens (`[auth] tokens` + the dynamic `TokenStore`) are accepted in
 //!   **every** mode;
-//! * a self-minted JWT is accepted only in `bearer`/`merge` modes;
+//! * a self-minted JWT is accepted only in `bearer`/`merge` modes, and an
+//!   OIDC JWT is attempted after it in the same modes (the shared bearer
+//!   chain `require_auth` uses);
 //! * in `hmac` mode a JWT is **never** accepted (Forgejo HMAC headers do not
 //!   authenticate v2 either);
 //! * missing/invalid credentials → `401 {"code":"unauthenticated",...}`.
@@ -44,7 +46,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::auth::{self, Namespace, jwt, urls};
+use crate::auth::{self, Namespace, bearer, urls};
 use crate::cluster::relay::{self, V2Finalize, V2Reserve};
 use crate::config::AuthMode;
 use crate::error::ApiError;
@@ -92,19 +94,17 @@ pub async fn dispatch(
     let Some(known) = Method::from_path(&method) else {
         return bad_route(&method);
     };
-    if !authorized(&state, &headers).await {
-        return ApiError::Unauthorized(String::from("authentication required"))
-            .into_twirp_response();
-    }
     // v1.2 workstream F (docs/shared-cache.md §1/§3): the credential resolves
     // to a namespace the handlers scope storage through. The twirp gate is
     // this module's own `authorized` (it never runs under `require_auth`),
-    // so its resolution point is here. The credential-plane slices wire the
-    // per-plane extraction (Plane A: "<issuer>|<tenant>", Plane B: the
-    // runtime token's forge id + tenant claim) into this spot; until then
-    // every accepted credential resolves to the legacy single-tenant
-    // namespace — byte-identical behavior (§Rollout: default off).
-    let namespace = Namespace::legacy();
+    // so its resolution point is here; Plane A (OIDC) yields
+    // "<issuer>|<tenant>", tenant-less bearer paths and static tokens the
+    // legacy namespace. The admin mapping applies last (§7).
+    let Some(namespace) = authorized(&state, &headers).await else {
+        return ApiError::Unauthorized(String::from("authentication required"))
+            .into_twirp_response();
+    };
+    let namespace = state.resolve_namespace(namespace);
     if !accepts_json(&headers) {
         return ApiError::BadRequest(String::from(
             "unsupported content type; use application/json",
@@ -266,7 +266,7 @@ async fn create_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]
                             owner = %owner.node_id, addr = %owner.addr, cache_id = %cache_id,
                             "v2 create: reserved on remote owner"
                         );
-                        mint_create_response(state, &base, &cache_id)
+                        mint_create_response(state, &base, namespace, true, &cache_id)
                     }
                     V2Reserve::Duplicate => duplicate_entry_response(),
                     V2Reserve::NoCapacity => {
@@ -351,28 +351,39 @@ async fn create_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]
         tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (self-owned entry)");
     }
     let base = state.external_url.as_deref().unwrap_or_default();
-    mint_create_response(state, base, &cache_id)
+    mint_create_response(state, base, namespace, false, &cache_id)
 }
 
 /// Mint the `CreateCacheEntry` capability URLs against `base` (the host that
 /// owns the entry: self on the single-node/self-owner path, a remote owner B on
 /// the cluster path). The MAC key is the shared secret (M12), so B validates
 /// URLs A minted, and the paths match the `/v2/upload` + `/v2/artifacts`
-/// handlers.
-fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Response {
+/// handlers. The namespace the reservation was made in rides in the MAC
+/// (`docs/shared-cache.md` §4), so the capability paths resolve to it —
+/// except for a REMOTE owner's host (`base` not self): the owner's
+/// reservation was relayed into its legacy-namespace rows until the
+/// cluster-wire slice (§8), so such URLs bind nothing.
+fn mint_create_response(
+    state: &AppState,
+    base: &str,
+    namespace: &Namespace,
+    remote_owner: bool,
+    cache_id: &str,
+) -> Response {
     let policy = state.auth();
     let secret = super::signing_secret(&policy);
     let now = auth::now_secs();
     let ttl = state.cache_limits().signed_url_ttl_seconds;
+    let ns: &str = if remote_owner { "" } else { &namespace.0 };
     let upload_path = format!("{UPLOAD_PATH_PREFIX}{cache_id}");
     let download_path = format!("{ARTIFACT_PATH_PREFIX}{cache_id}");
     let signed_upload = format!(
         "{base}{upload_path}{}",
-        urls::mint(&upload_path, cache_id, secret, ttl, now).query()
+        urls::mint(&upload_path, cache_id, secret, ttl, now, ns).query()
     );
     let signed_download = format!(
         "{base}{download_path}{}",
-        urls::mint(&download_path, cache_id, secret, ttl, now).query()
+        urls::mint(&download_path, cache_id, secret, ttl, now, ns).query()
     );
     // `snake_case` proto/Twirp JSON names (see the module docs): the vendored
     // go-actions-cache `cache_v2.go` reads `signed_upload_url` from this
@@ -565,29 +576,28 @@ async fn get_cache_entry_download_url(
         &Version::from(request.version.as_str()),
         limits.key_case,
     ) {
-        {
-            let matched_key = entry.key.clone();
-            let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
-            let base = state.external_url.as_deref().unwrap_or_default();
-            let signed = format!(
-                "{}{artifact_path}{}",
-                base,
-                urls::mint(
-                    &artifact_path,
-                    &matched_key,
-                    super::signing_secret(&policy),
-                    limits.signed_url_ttl_seconds,
-                    auth::now_secs(),
-                )
-                .query()
-            );
-            return Json(json!({
-                "ok": true,
-                "signed_download_url": signed,
-                "matched_key": matched_key,
-            }))
-            .into_response();
-        }
+        let matched_key = entry.key.clone();
+        let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
+        let base = state.external_url.as_deref().unwrap_or_default();
+        let signed = format!(
+            "{}{artifact_path}{}",
+            base,
+            urls::mint(
+                &artifact_path,
+                &matched_key,
+                super::signing_secret(&policy),
+                limits.signed_url_ttl_seconds,
+                auth::now_secs(),
+                &namespace.0,
+            )
+            .query()
+        );
+        return Json(json!({
+            "ok": true,
+            "signed_download_url": signed,
+            "matched_key": matched_key,
+        }))
+        .into_response();
     }
     // Local miss: fan out to owners (plan task 32). Only queries peers, never
     // proxies the download body.
@@ -606,6 +616,10 @@ async fn get_cache_entry_download_url(
                     super::signing_secret(&policy),
                     limits.signed_url_ttl_seconds,
                     auth::now_secs(),
+                    // The owner's rows are the legacy namespace until the
+                    // cluster-wire slice carries namespaces (§8); a URL for a
+                    // peer-held row binds nothing.
+                    "",
                 )
                 .query()
             );
@@ -737,30 +751,25 @@ fn generate_cache_id(key: &str, version: &str) -> String {
 }
 
 /// Bearer/JWT gate: static tokens first (all modes), then dynamic tokens
-/// (all modes), then a self-minted JWT in `bearer`/`merge` modes only.
-async fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(token) = auth::bearer_token(headers) else {
-        return false;
-    };
+/// (all modes), then the shared bearer chain in `bearer`/`merge` modes only
+/// (cachette's self-minted JWT, then - when installed - OIDC). Returns the
+/// namespace the accepted credential resolves to; twirp has no HMAC arm, so
+/// a request this gate accepts always carries a namespace.
+async fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Namespace> {
+    let token = auth::bearer_token(headers)?;
     let policy = state.auth();
     let is_static = policy
         .static_tokens
         .iter()
         .any(|candidate| auth::constant_time_eq(candidate.as_bytes(), token.as_bytes()));
     if is_static || state.tokens.is_valid(token).await.unwrap_or(false) {
-        return true;
+        return Some(Namespace::legacy());
     }
     match policy.mode {
-        AuthMode::Hmac => false,
-        AuthMode::Bearer | AuthMode::Merge => jwt_is_valid(state, token),
-    }
-}
-
-/// Validate a self-minted JWT against the configured signing secret.
-fn jwt_is_valid(state: &AppState, token: &str) -> bool {
-    match state.auth().secret.as_deref() {
-        Some(secret) => jwt::validate(token, secret, auth::now_secs()).is_ok(),
-        None => false,
+        AuthMode::Hmac => None,
+        AuthMode::Bearer | AuthMode::Merge => {
+            bearer::verify(&policy, &state.tokens, state.oidc().as_ref(), headers).await
+        }
     }
 }
 

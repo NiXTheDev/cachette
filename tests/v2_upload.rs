@@ -353,7 +353,7 @@ async fn expired_signed_url_is_403() {
 
     // A genuinely minted URL whose exp is one second in the past.
     let path = format!("/v2/upload/{cache_id}");
-    let signed = urls::mint(&path, &cache_id, SECRET, 0, now_secs() - 1);
+    let signed = urls::mint(&path, &cache_id, SECRET, 0, now_secs() - 1, "");
     let id = URL_SAFE_NO_PAD.encode(block_body(0));
     let uri = format!(
         "{path}{}&comp=block&blockid={}",
@@ -371,7 +371,7 @@ async fn unknown_entry_id_is_404() {
 
     let unknown = "deadbeefdeadbeefdeadbeefdeadbeef";
     let path = format!("/v2/upload/{unknown}");
-    let signed = urls::mint(&path, unknown, SECRET, 900, now_secs());
+    let signed = urls::mint(&path, unknown, SECRET, 900, now_secs(), "");
     let id = URL_SAFE_NO_PAD.encode(block_body(0));
     let uri = format!(
         "{path}{}&comp=block&blockid={}",

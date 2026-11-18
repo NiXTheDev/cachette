@@ -101,12 +101,17 @@ fn sign_rs256(fx: &RsaFixture, header_seg: &str, payload_seg: &str) -> String {
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&signature))
 }
 
-/// Conformant claims at the given mint time (exp +10 min, nbf -10s).
+/// Conformant claims at the given mint time (exp +10 min, nbf -10s). Since
+/// v1.2 the default `tenant_claim` is `repository`, so every conformant
+/// token carries it (a token without it is a structural rejection).
+const TENANT: &str = "NiXTheDev/cachette";
+
 fn claims_json(issuer: &str, now: i64) -> String {
     json!({
         "iss": issuer,
         "aud": AUDIENCE,
         "sub": "ci-1",
+        "repository": TENANT,
         "exp": now + 600,
         "nbf": now - 10,
     })
@@ -118,6 +123,7 @@ fn expired_claims_json(issuer: &str, now: i64) -> String {
         "iss": issuer,
         "aud": AUDIENCE,
         "sub": "ci-1",
+        "repository": TENANT,
         "exp": now - 6000,
     })
     .to_string()
@@ -128,6 +134,7 @@ fn aud_claims_json(issuer: &str, now: i64, aud: &str) -> String {
         "iss": issuer,
         "aud": aud,
         "sub": "ci-1",
+        "repository": TENANT,
         "exp": now + 600,
         "nbf": now - 10,
     })
@@ -770,6 +777,7 @@ fn oidc_toml_surface_roundtrips() {
             OidcIssuerConfig {
                 audiences: vec![String::from("cachette")],
                 jwks_url: Some(String::from("https://idp.example.org/jwks.json")),
+                tenant_claim: String::from("repository"),
                 require: BTreeMap::from([(String::from("sub"), String::from("ci-"))]),
                 leeway_seconds: 90,
                 ca_pem: None,
@@ -790,6 +798,7 @@ fn oidc_toml_surface_roundtrips() {
         Some("https://idp.example.org/jwks.json")
     );
     assert_eq!(block.require.get("sub").map(String::as_str), Some("ci-"));
+    assert_eq!(block.tenant_claim, "repository");
     assert_eq!(block.leeway_seconds, 90);
     assert_eq!(roundtrip.jwks_refresh_seconds, 300);
     assert_eq!(roundtrip.jwks_max_keys, 64);

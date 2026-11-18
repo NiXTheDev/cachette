@@ -42,10 +42,10 @@ pub const ARTIFACTCACHE_PREFIX: &str = "/_apis/artifactcache";
 /// the namespace into the request extensions; handlers scope storage through
 /// [`crate::state::AppState::storage_scoped`] so a view only ever touches its
 /// own namespace's rows. The composite identity is plane-specific: Plane A
-/// (OIDC) yields `"<issuer>|<tenant>"` from the issuer block and its pinned
-/// claim, Plane B (runtime tokens) the forge id and the tenant claim, Plane C
-/// (HMAC) is single-tenant by definition. Until the credential-plane slices
-/// wire that extraction, every accepted credential resolves to the legacy
+/// (OIDC) yields `"<issuer>|<tenant>"` from the issuer block's `tenant_claim`,
+/// Plane B (runtime tokens) the configured forge id and the tenant claim,
+/// Plane C (HMAC) is single-tenant by definition. Static bearer tokens and
+/// cachette's own minted JWTs carry no tenant and stay on the legacy
 /// namespace — byte-identical behavior (§Rollout: default off).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Namespace(pub String);
@@ -133,29 +133,33 @@ pub async fn require_auth(
     // boot; a token that fails the static/store/signature checks is
     // attempted as an RS256 JWT when one is installed (docs/oidc.md).
     let oidc = state.oidc();
-    let authorized = match policy.mode {
-        AuthMode::Hmac => hmac::verify(&policy, request.headers()),
+    // v1.2 workstream F (docs/shared-cache.md §1/§3): resolve the credential
+    // to a namespace the handlers scope storage through. Plane A (OIDC)
+    // yields "<issuer>|<tenant>"; HMAC and the tenant-less bearer paths are
+    // single-tenant and resolve to the legacy namespace. HMAC in a
+    // multi-tenant boot is refused before this layer is ever reached.
+    let namespace = match policy.mode {
+        AuthMode::Hmac => hmac::verify(&policy, request.headers()).then(Namespace::legacy),
         AuthMode::Bearer => {
             bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
         }
         AuthMode::Merge => {
-            hmac::verify(&policy, request.headers())
-                || bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+            if hmac::verify(&policy, request.headers()) {
+                Some(Namespace::legacy())
+            } else {
+                bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+            }
         }
     };
-    if authorized {
-        // v1.2 workstream F (docs/shared-cache.md §1/§3): resolve the
-        // credential to a namespace the handlers scope storage through. The
-        // credential-plane slices wire the per-plane extraction (Plane A:
-        // "<issuer>|<tenant>" from the OIDC issuer block and its pinned
-        // claim; Plane B: the runtime token's forge id + tenant claim;
-        // Plane C/HMAC: refused at boot in multi-tenant mode). Until then
-        // every accepted credential resolves to the legacy single-tenant
-        // namespace — byte-identical behavior (§Rollout: default off).
-        request.extensions_mut().insert(Namespace::legacy());
-        next.run(request).await
-    } else {
-        ApiError::Unauthorized(String::from("authentication required")).into_response()
+    match namespace {
+        Some(namespace) => {
+            // The admin may map this identity into a shared namespace
+            // (docs/shared-cache.md §7); handlers only see the resolved one.
+            let namespace = state.resolve_namespace(namespace);
+            request.extensions_mut().insert(namespace);
+            next.run(request).await
+        }
+        None => ApiError::Unauthorized(String::from("authentication required")).into_response(),
     }
 }
 

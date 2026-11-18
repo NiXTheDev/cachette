@@ -89,6 +89,10 @@ pub enum ConfigError {
     ShortSecret { len: usize },
 
     /// `[auth.oidc] enabled without a required list, pin or CA bundle.
+    #[error(
+        "storage.namespaces key {key:?} must have the form \"<forge>|<tenant>\" with both halves non-empty"
+    )]
+    NamespaceMappingKey { key: String },
     #[error("auth.oidc is enabled but {field} must be configured")]
     OidcMissingRequired { field: &'static str },
 

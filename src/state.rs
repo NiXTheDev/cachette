@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::auth::oidc::OidcVerifier;
-use crate::auth::{AuthPolicy, TokenStore};
+use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
 use crate::config::{Config, KeyCase, MinFree, OidcConfig};
@@ -121,6 +121,11 @@ pub struct AppState {
     /// reload (plan task 49) can refresh them live. Readers take a `Copy`
     /// snapshot through [`AppState::cache_limits`].
     pub cache: Arc<RwLock<CacheLimits>>,
+    /// Admin namespace mappings (v1.2 workstream F, `docs/shared-cache.md`
+    /// §7): `"<forge>|<tenant>"` -> namespace name. Boot-time wiring (the
+    /// Rollout contract: changing tenancy needs a restart); the default is
+    /// empty, so every credential keeps its derived namespace.
+    pub namespaces: Arc<std::collections::BTreeMap<String, String>>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -163,6 +168,7 @@ impl AppState {
             auth: Arc::new(RwLock::new(Arc::new(AuthPolicy::default()))),
             oidc: Arc::new(RwLock::new(OidcRuntime::default())),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
+            namespaces: Arc::new(std::collections::BTreeMap::new()),
             external_url: None,
             relay: None,
             capacity_total: 0,
@@ -242,6 +248,18 @@ impl AppState {
         self.storage
             .as_ref()
             .map(|backend| backend.scoped(namespace))
+    }
+
+    /// Apply the admin namespace mapping (v1.2 workstream F,
+    /// `docs/shared-cache.md` §7): an exact `"<forge>|<tenant>"` match
+    /// replaces the derived namespace; every other identity keeps it. The
+    /// mapping is boot-time wiring - tenancy changes need a restart.
+    #[must_use]
+    pub fn resolve_namespace(&self, namespace: Namespace) -> Namespace {
+        self.namespaces
+            .get(&namespace.0)
+            .map(|mapped| Namespace(mapped.clone()))
+            .unwrap_or(namespace)
     }
 
     /// Replace the live cache limits (boot + SIGHUP reload).
@@ -328,6 +346,8 @@ fn default_node_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Plan task 3 acceptance: unit-test the version parse - the crate's
     /// own version is semver: exactly three numeric components. (The
     /// literal [1, 0, 0] this once pinned died with the 1.1.0 cut: a
@@ -340,5 +360,32 @@ mod tests {
             .map(|part| part.parse::<u64>().expect("version component is numeric"))
             .collect();
         assert_eq!(components.len(), 3, "unexpected version: {raw}");
+    }
+
+    /// `docs/shared-cache.md` §7: an exact `"<forge>|<tenant>"` mapping
+    /// replaces the derived namespace; every other identity keeps it.
+    #[test]
+    fn resolve_namespace_applies_the_admin_mapping() {
+        let mut state = AppState::new();
+        state.namespaces = Arc::new(std::collections::BTreeMap::from([(
+            String::from("https://forge.example.org|octo-org/api"),
+            String::from("acme-shared"),
+        )]));
+        assert_eq!(
+            state.resolve_namespace(Namespace(String::from(
+                "https://forge.example.org|octo-org/api"
+            ))),
+            Namespace(String::from("acme-shared"))
+        );
+        assert_eq!(
+            state.resolve_namespace(Namespace(String::from(
+                "https://forge.example.org|octo-org/other"
+            ))),
+            Namespace(String::from("https://forge.example.org|octo-org/other"))
+        );
+        assert_eq!(
+            state.resolve_namespace(Namespace::legacy()),
+            Namespace::legacy()
+        );
     }
 }

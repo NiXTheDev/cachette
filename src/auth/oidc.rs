@@ -15,8 +15,11 @@
 //!    *anything* from the token;
 //! 5. claims-side gates, strictly post-signature, in this order: `iss` in
 //!    the configured issuers, `aud` in the configured audiences, `exp`/
-//!    `nbf` with the configured leeway, then the optional `require` pins
-//!    (exact string equality; array claims must contain the value).
+//!    `nbf` with the configured leeway, the optional `require` pins (exact
+//!    string equality; array claims must contain the value), then the
+//!    issuer's `tenant_claim` - whose value becomes the tenant half of the
+//!    namespace (docs/shared-cache.md §7). A missing or non-string tenant
+//!    claim is a structural rejection, never a default tenant.
 //!
 //! Error variants are plain tags by design: nothing from the token (claims,
 //! segment bytes, kid text) is ever echoed to logs or responses.
@@ -66,6 +69,28 @@ pub enum OidcError {
     NotYetValid,
     #[error("required claim mismatch")]
     Require,
+    #[error("tenant claim missing")]
+    Tenant,
+}
+
+/// The identity a verified OIDC token yields to the shared cache
+/// (`docs/shared-cache.md` §7): the issuer is the **forge**, the configured
+/// tenant claim's value is the **tenant**, and the default namespace is
+/// `"<issuer>|<tenant>"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcTenant {
+    /// The token's `iss` (an exact configured issuer string).
+    pub issuer: String,
+    /// The value of that issuer block's `tenant_claim`.
+    pub tenant: String,
+}
+
+impl OidcTenant {
+    /// The default namespace for this identity: `"<issuer>|<tenant>"`.
+    #[must_use]
+    pub fn namespace(&self) -> String {
+        format!("{}|{}", self.issuer, self.tenant)
+    }
 }
 
 /// Stateless verifier for RS256 OIDC bearer tokens. Holds the configured
@@ -82,14 +107,27 @@ pub struct OidcVerifier {
 
 /// One issuer's trust set: what its tokens may claim, and how much clock
 /// skew the gate tolerates.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct IssuerTrust {
     /// `aud` values a token may state (any of).
     pub audiences: Vec<String>,
+    /// Claim whose value is the tenant (docs/shared-cache.md §7).
+    pub tenant_claim: String,
     /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
     pub require: BTreeMap<String, String>,
     /// Clock skew tolerated on `exp`/`nbf` (seconds).
     pub leeway_seconds: u64,
+}
+
+impl Default for IssuerTrust {
+    fn default() -> Self {
+        Self {
+            audiences: Vec::new(),
+            tenant_claim: String::from("repository"),
+            require: BTreeMap::new(),
+            leeway_seconds: 0,
+        }
+    }
 }
 
 impl fmt::Debug for OidcVerifier {
@@ -110,11 +148,13 @@ impl OidcVerifier {
         Self { issuers, keys }
     }
 
-    /// Verify `token` at unix time `now_unix` (docs/oidc.md chain).
+    /// Verify `token` at unix time `now_unix` (docs/oidc.md chain) and return
+    /// the identity it yields: the issuer (forge) and the configured tenant
+    /// claim's value (`docs/shared-cache.md` §7).
     ///
     /// # Errors
     /// The stage the token failed; the caller logs the stage and 401s.
-    pub fn verify(&self, token: &str, now_unix: i64) -> Result<(), OidcError> {
+    pub fn verify(&self, token: &str, now_unix: i64) -> Result<OidcTenant, OidcError> {
         let mut parts = token.split('.');
         let header_seg = parts.next().ok_or(OidcError::Malformed)?;
         let payload_seg = parts.next().ok_or(OidcError::Malformed)?;
@@ -203,7 +243,20 @@ impl OidcVerifier {
                 return Err(OidcError::Require);
             }
         }
-        Ok(())
+        // Tenant extraction is the LAST gate: the signature and every pin
+        // have already bound the claims. The tenant must be a single
+        // non-empty string - an array or a missing claim is structural, not
+        // a default, because defaulting would silently merge tenants.
+        let Some(tenant) = claims.get(&trust.tenant_claim).and_then(Value::as_str) else {
+            return Err(OidcError::Tenant);
+        };
+        if tenant.is_empty() {
+            return Err(OidcError::Tenant);
+        }
+        Ok(OidcTenant {
+            issuer: issuer.to_owned(),
+            tenant: tenant.to_owned(),
+        })
     }
 }
 
@@ -248,6 +301,7 @@ pub fn install(state: &AppState, config: &Config) -> Result<(), JwksCacheError> 
                 issuer.clone(),
                 IssuerTrust {
                     audiences: block.audiences.clone(),
+                    tenant_claim: block.tenant_claim.clone(),
                     require: block.require.clone(),
                     leeway_seconds: block.leeway_seconds,
                 },
@@ -376,6 +430,7 @@ mod tests {
                     issuer,
                     IssuerTrust {
                         audiences: vec![String::from("cachette")],
+                        tenant_claim: String::from("repository"),
                         require: require.clone(),
                         leeway_seconds,
                     },
@@ -398,9 +453,11 @@ mod tests {
 
     const HEADER: &str = r#"{"alg":"RS256","typ":"JWT","kid":"test-key-1"}"#;
 
+    const REPOSITORY: &str = "NiXTheDev/cachette";
+
     fn claims(iss: &str) -> String {
         format!(
-            r#"{{"iss":"{iss}","aud":"cachette","sub":"ci-1","exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{iss}","aud":"cachette","sub":"ci-1","repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             NOW + 300,
             NOW - 5
         )
@@ -414,7 +471,62 @@ mod tests {
     fn valid_token_is_accepted() {
         let (fx, v) = std_setup();
         let token = signed_token(&fx, HEADER, &claims(&fx.issuer));
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
+    }
+
+    /// The verified identity is the namespace input: the issuer (forge) plus
+    /// the value of the issuer block's tenant claim (`docs/shared-cache.md`
+    /// §7), and the default namespace is their `|`-joined pair.
+    #[test]
+    fn verified_token_yields_issuer_and_tenant() {
+        let (fx, v) = std_setup();
+        let token = signed_token(&fx, HEADER, &claims(&fx.issuer));
+        assert_eq!(
+            v.verify(&token, NOW),
+            Ok(OidcTenant {
+                issuer: fx.issuer.clone(),
+                tenant: String::from(REPOSITORY),
+            })
+        );
+        assert_eq!(
+            v.verify(&token, NOW).expect("verified").namespace(),
+            format!("{}|{REPOSITORY}", fx.issuer)
+        );
+    }
+
+    /// No tenant claim means no tenant: a structural rejection, never a
+    /// silent default namespace.
+    #[test]
+    fn a_token_without_the_tenant_claim_is_rejected() {
+        let (fx, v) = std_setup();
+        let payload = format!(
+            r#"{{"iss":"{}","aud":"cachette","exp":{},"nbf":{}}}"#,
+            fx.issuer,
+            NOW + 300,
+            NOW - 5
+        );
+        let token = signed_token(&fx, HEADER, &payload);
+        assert_eq!(v.verify(&token, NOW), Err(OidcError::Tenant));
+    }
+
+    /// The tenant claim is a per-issuer knob: any claim that carries a
+    /// single non-empty string can name the tenant.
+    #[test]
+    fn a_custom_tenant_claim_is_honoured() {
+        let (fx, source) = key_source();
+        let trust = BTreeMap::from([(
+            fx.issuer.clone(),
+            IssuerTrust {
+                audiences: vec![String::from("cachette")],
+                tenant_claim: String::from("sub"),
+                require: BTreeMap::new(),
+                leeway_seconds: 30,
+            },
+        )]);
+        let v = OidcVerifier::new(trust, Arc::new(source));
+        let token = signed_token(&fx, HEADER, &claims(&fx.issuer));
+        let identity = v.verify(&token, NOW).expect("verified");
+        assert_eq!(identity.tenant, "ci-1");
     }
 
     /// RFC 7519 section 4.1.5: `nbf` is OPTIONAL. An absent claim means no
@@ -425,12 +537,12 @@ mod tests {
     fn absent_nbf_is_accepted_and_a_broken_one_is_malformed() {
         let (fx, v) = std_setup();
         let payload = format!(
-            r#"{{"iss":"{}","aud":"cachette","sub":"ci-1","exp":{}}}"#,
+            r#"{{"iss":"{}","aud":"cachette","sub":"ci-1","repository":"{REPOSITORY}","exp":{}}}"#,
             fx.issuer,
             NOW + 300
         );
         let token = signed_token(&fx, HEADER, &payload);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
 
         let payload = format!(
             r#"{{"iss":"{}","aud":"cachette","exp":{},"nbf":"soon"}}"#,
@@ -459,6 +571,7 @@ mod tests {
                 fx.issuer.clone(),
                 IssuerTrust {
                     audiences: vec![String::from("cachette")],
+                    tenant_claim: String::from("repository"),
                     require: BTreeMap::new(),
                     leeway_seconds: 30,
                 },
@@ -467,6 +580,7 @@ mod tests {
                 other.clone(),
                 IssuerTrust {
                     audiences: vec![String::from("other-svc")],
+                    tenant_claim: String::from("repository"),
                     require: BTreeMap::from([(String::from("sub"), String::from("ci-2"))]),
                     leeway_seconds: 30,
                 },
@@ -487,13 +601,13 @@ mod tests {
 
         // The second issuer's own token passes its audience and its pin.
         let payload = format!(
-            r#"{{"iss":"{}","aud":"other-svc","sub":"ci-2","exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{}","aud":"other-svc","sub":"ci-2","repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             other,
             NOW + 300,
             NOW - 5
         );
         let token = signed_token(&fx, HEADER, &payload);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
 
         // ... and the same token with another subject fails that pin.
         let payload = format!(
@@ -510,13 +624,13 @@ mod tests {
     fn array_audience_claim_is_accepted_on_any_overlap() {
         let (fx, v) = std_setup();
         let payload = format!(
-            r#"{{"iss":"{}","aud":["other-svc","cachette"],"exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{}","aud":["other-svc","cachette"],"repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             fx.issuer,
             NOW + 300,
             NOW - 5
         );
         let token = signed_token(&fx, HEADER, &payload);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
     }
 
     #[test]
@@ -598,13 +712,13 @@ mod tests {
 
         // exp = NOW - 29 is one leeway-second short of expiring: accepted.
         let within_leeway = format!(
-            r#"{{"iss":"{}","aud":"cachette","exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{}","aud":"cachette","repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             fx.issuer,
             NOW - 29,
             NOW - 40
         );
         let token = signed_token(&fx, HEADER, &within_leeway);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
     }
 
     #[test]
@@ -639,13 +753,13 @@ mod tests {
         assert_eq!(v.verify(&token, NOW), Err(OidcError::NotYetValid));
 
         let within_leeway = format!(
-            r#"{{"iss":"{}","aud":"cachette","exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{}","aud":"cachette","repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             fx.issuer,
             NOW + 300,
             NOW + 30
         );
         let token = signed_token(&fx, HEADER, &within_leeway);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
     }
 
     #[test]
@@ -656,13 +770,13 @@ mod tests {
         require.insert(String::from("groups"), String::from("ci"));
         let v = verifier(vec![fx.issuer.clone()], require, 30, Arc::new(source));
         let payload = format!(
-            r#"{{"iss":"{}","aud":"cachette","sub":"ci-1","groups":["devs","ci"],"exp":{},"nbf":{}}}"#,
+            r#"{{"iss":"{}","aud":"cachette","sub":"ci-1","groups":["devs","ci"],"repository":"{REPOSITORY}","exp":{},"nbf":{}}}"#,
             fx.issuer,
             NOW + 300,
             NOW - 5
         );
         let token = signed_token(&fx, HEADER, &payload);
-        assert_eq!(v.verify(&token, NOW), Ok(()));
+        assert!(v.verify(&token, NOW).is_ok());
 
         // Wrong exact string value.
         let wrong_sub = format!(

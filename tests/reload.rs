@@ -166,6 +166,7 @@ fn fixture_verifier(issuers: Vec<String>) -> cachette::auth::oidc::OidcVerifier 
                 issuer,
                 cachette::auth::oidc::IssuerTrust {
                     audiences: vec![String::from("cachette")],
+                    tenant_claim: String::from("repository"),
                     require: BTreeMap::new(),
                     leeway_seconds: 30,
                 },

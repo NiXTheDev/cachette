@@ -114,12 +114,15 @@ admin-configured per source.
 
 **Plane A - OIDC (v1.1, reshaped in v1.2).** An RS256 token from a
 configured IdP, verified against that IdP's JWKS. Per-issuer blocks (see
-`docs/oidc.md`) carry the audiences, the claim pins and the trust roots, so
-one deployment can trust many IdPs at once - a Forgejo instance's Actions
-issuer, a Gitea instance's issuer, GitHub's OIDC issuer, a corporate
-Keycloak. The tenant is a pinned claim: with Forgejo's Actions ID token,
-`require = { "repository" = "NiXTheDev/cachette" }` yields the tenant per
-job. Revocable, per-job, no secret in the runner.
+`docs/oidc.md`) carry the audiences, the tenant claim, the claim pins and
+the trust roots, so one deployment can trust many IdPs at once - a Forgejo
+instance's Actions issuer, a Gitea instance's issuer, GitHub's OIDC issuer,
+a corporate Keycloak. The **tenant** is the VALUE of the issuer block's
+`tenant_claim` (default `repository`): one issuer serves many repositories
+on that forge, so a constant pin cannot be the tenant - it would collapse
+them all into one namespace. `require` pins only narrow which tokens are
+accepted; a token without the tenant claim is a structural rejection, never
+a default. Revocable, per-job, no secret in the runner.
 
 **Plane B - NEW: forge runtime tokens (HS256).** The forge hands every job
 an `ACTIONS_RUNTIME_TOKEN`; the v1 toolkit presents it, and it is the
@@ -176,6 +179,14 @@ silently degraded.
   reachable as today. In multi-tenant mode they are reachable only through
   an explicit namespace mapping - the admin can map a namespace to `''` if
   they want the pre-existing cache to stay shared.
+- Signed capability URLs carry the namespace inside the MAC:
+  `archiveLocation` and the v2 upload/download URLs append the resolved
+  namespace to the existing payload (`"{path}|{id}|{exp}|{ns}"`) and send
+  `ns` percent-encoded in the query. The MAC covers the raw form. A URL
+  minted for one namespace therefore cannot be replayed against another -
+  stripping or swapping `ns` is a MAC mismatch, exactly like tampering with
+  `id` - and URLs minted before namespaces (no `ns`) validate to `''`, so a
+  rolling upgrade keeps serving them.
 
 ### 5. Quotas and eviction fairness
 
@@ -208,6 +219,11 @@ Every rule sets the limit of the namespaces it matches, one limit each: a
 wildcard is a shorthand for "the same limit for each of these namespaces",
 not a pool they share. The only way two namespaces share a budget is to
 put them in ONE namespace - an explicit, admin-side decision.
+
+Rules match the **resolved** namespace, after `[storage.namespaces]`
+mapping: a tenant mapped to `nixthedev` is budgeted by a rule naming
+`nixthedev` (or a pattern matching that name), not by the default-form
+`"<forge>|<tenant>"` string it no longer uses.
 
 The rules are overrides only: the default governs every namespace no rule
 matches, and a namespace with its own rule is budgeted by that rule alone.
@@ -245,7 +261,7 @@ that vouched for the credential:
 
 | plane | forge | tenant | typical source |
 |---|---|---|---|
-| A (OIDC) | the issuer string | a pinned claim | Forgejo Actions ID token, GitHub OIDC, Keycloak |
+| A (OIDC) | the issuer string | the value of the issuer block's `tenant_claim` (default `repository`) | Forgejo Actions ID token, GitHub OIDC, Keycloak |
 | B (runtime) | the configured forge id | `oidc_extra.repository` | Forgejo / Gitea runners |
 | C (HMAC) | - | - | single-tenant only |
 
@@ -261,6 +277,11 @@ forge - and the admin overrides it explicitly to share:
 
 A tenant of forge A can therefore never land in a namespace of forge B
 unless the admin says so.
+
+The mapping is applied where the credential is verified, after the plane
+yields `"<forge>|<tenant>"` and before anything touches storage; the
+RESOLVED namespace is the one the request's storage view, quota rules,
+and signed-URL MAC see. It is boot-time wiring: a change needs a restart.
 
 **What "serve GitHub's runners" can and cannot mean** - worth being precise,
 because the two halves differ:
@@ -294,9 +315,11 @@ namespace a request belongs to beyond carrying it.
 
 ### 9. Failure modes
 
-- A namespace mapping pointing at a namespace that does not exist: refuse at
-  boot (typo protection; an unknown namespace would otherwise silently
-  create a private cache for a tenant that believes it is sharing).
+- A `[storage.namespaces]` key that is not `"<forge>|<tenant>"` (a missing
+  or empty half): refuse at boot. Namespaces themselves need no
+  declaration - a name exists once a tenant mapped to it stores rows - so
+  a mistyped *tenant* cannot be detected at boot; it simply keeps its own
+  default namespace, which `cachette doctor --namespaces` makes visible.
 - A credential that yields no tenant (an OIDC token without the pinned
   claim, a runtime token without `oidc_extra.repository`): rejected as a
   structural failure. In multi-tenant mode there is **no anonymous
@@ -350,3 +373,9 @@ a credential plane that yields a tenant (Plane A and/or B) and, optionally,
 namespace mappings; that wiring is boot-time, so it needs a restart - no
 client-visible protocol change beyond the namespace that rides along inside
 the authenticated request.
+
+An enabled OIDC block is tenant-yielding by construction (its
+`tenant_claim` must be present on every accepted token), so enabling tenancy
+also means the HMAC plane must be off: Plane C cannot express a tenant, and
+the boot guard refuses it rather than silently degrading every HMAC request
+to one shared namespace.

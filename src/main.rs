@@ -149,6 +149,10 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         &config.storage.fs.path.join("cachette.sqlite3"),
     )?);
     state.set_auth(AuthPolicy::from_config(&config));
+    // Admin namespace mappings (v1.2 workstream F): a tenant the admin mapped
+    // into a shared namespace resolves there; every other credential keeps
+    // its derived namespace. Boot-time wiring, like the credential planes.
+    state.namespaces = Arc::new(config.storage.namespaces.clone());
     // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
     // enabled, build the JWKS cache + verifier and hang them on the state.
     // A failure is boot-fatal; a disabled/absent table is a silent no-op, so

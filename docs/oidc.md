@@ -194,7 +194,9 @@ jwks_ca_pem = "/etc/ssl/certs/ca-certificates.crt"   # default trust roots
 [auth.oidc."https://hangar.nixthedev.ru/api/actions"]
 audiences = ["u:1:7aa18c62-d578-484f-8d6e-2b62a540c95a"]
 jwks_url = "https://hangar.nixthedev.ru/api/actions/.well-known/keys"
-require = { "repository" = "NiXTheDev/cachette" }
+# the claim whose VALUE is the tenant (workstream F); default "repository"
+tenant_claim = "repository"
+require = { "repository" = "NiXTheDev/cachette" }    # optional narrowing
 leeway_seconds = 30
 ca_pem = "/etc/ssl/certs/private-root.pem"           # overrides the default roots
 
@@ -209,8 +211,9 @@ TOML allows the parent table plus any number of quoted sub-tables, so one
 block.
 
 - **Per issuer:** `audiences` (required), `jwks_url` (defaults to
-  `{issuer}/.well-known/jwks.json`), `require`, `leeway_seconds`, and
-  `ca_pem` (overrides the global roots for a private-CA issuer).
+  `{issuer}/.well-known/jwks.json`), `tenant_claim` (default
+  `repository`), `require`, `leeway_seconds`, and `ca_pem` (overrides the
+  global roots for a private-CA issuer).
 - **Global:** `enabled`, `jwks_refresh_seconds`, `jwks_max_keys`,
   `jwks_ca_pem` (the default trust roots).
 
@@ -244,8 +247,14 @@ affected; the OAuth2-app family was.)
 ### Per-issuer tenants (workstream F)
 
 The OIDC plane is one of the credential planes of the multi-tenant shared
-cache (`docs/shared-cache.md`): the issuer block is the **forge**, the pinned
-`require` claim yields the **tenant**, and the namespace defaults to
-`"<issuer>|<tenant>"`. That is why the per-issuer shape is load-bearing
-rather than cosmetic - one deployment can trust many forges at once, each
-with its own audiences, pins and roots.
+cache (`docs/shared-cache.md`): the issuer block is the **forge**, and the
+**tenant** is the VALUE of the block's `tenant_claim` (default
+`repository`), so the namespace is `"<issuer>|<tenant>"`. The tenant cannot
+be a fixed pin: one issuer serves every repository on that forge, so a
+constant would collapse all of them into one namespace. `require` pins
+narrow which tokens are accepted (and may pin the same claim to a single
+repo), but they do not define the tenant; a token without the tenant claim
+is a structural rejection, never the default namespace. That is why the
+per-issuer shape is load-bearing rather than cosmetic - one deployment can
+trust many forges at once, each with its own audiences, pins, roots and
+tenant claim.

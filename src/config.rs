@@ -357,6 +357,35 @@ mod tests {
         assert_eq!(parsed["server"]["listen"], "127.0.0.1:9000");
     }
 
+    /// `docs/shared-cache.md` §7: the mapping is `[storage.namespaces]`,
+    /// identity -> namespace name, and its keys are validated.
+    #[test]
+    fn storage_namespace_mappings_parse_and_validate() {
+        let config = from_sources(
+            Some("[storage.namespaces]\n\"https://forge|owner/repo\" = \"shared\"\n"),
+            &[],
+        )
+        .expect("mapping parses");
+        assert_eq!(
+            config
+                .storage
+                .namespaces
+                .get("https://forge|owner/repo")
+                .map(String::as_str),
+            Some("shared")
+        );
+
+        let bad = from_sources(
+            Some("[storage.namespaces]\n\"owner/repo\" = \"shared\"\n"),
+            &[],
+        )
+        .expect_err("malformed key");
+        assert!(
+            matches!(&bad, ConfigError::NamespaceMappingKey { .. }),
+            "unexpected error: {bad:?}"
+        );
+    }
+
     #[test]
     fn unknown_keys_in_sections_and_unknown_sections_are_rejected() {
         let in_section =

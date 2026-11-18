@@ -71,25 +71,29 @@ pub async fn upload(
     Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response {
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
+    //
     // The namespace rides in the capability data, not in a credential: this
     // path is authorized by the signed URL alone (task 24), so the credential
-    // gate never inserts an extension here. The credential-plane slice binds
-    // the minting namespace into the signed URL payload (server-side field,
-    // the client only echoes the URL); until then these requests serve the
-    // legacy single-tenant namespace (docs/shared-cache.md §Rollout).
-    let namespace = Namespace::legacy();
-    let Some(storage) = state.storage_scoped(&namespace.0) else {
-        return ApiError::Unavailable(String::from("storage backend not configured"))
-            .into_response();
-    };
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    //
     // The MAC binds the exact resource path task 24 minted, reconstructed from
     // the route param (so it can never be spoofed by a traversal-style path).
     let path = format!("/v2/upload/{entry_id}");
     let policy = state.auth();
     let secret = super::signing_secret(&policy);
-    if let Err(err) = urls::validate(&query, &path, secret, auth::now_secs()) {
-        return ApiError::from(err).into_response();
-    }
+    let namespace = match urls::validate(&query, &path, secret, auth::now_secs()) {
+        Ok(resolved) => resolved,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     let max_bytes = usize::try_from(state.cache_limits().max_chunk_bytes).unwrap_or(usize::MAX);
     match query.get("comp").map(String::as_str) {
         Some("block") => stage_block(storage.as_ref(), &entry_id, &query, body, max_bytes).await,

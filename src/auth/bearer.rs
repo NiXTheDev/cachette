@@ -16,10 +16,15 @@ use axum::http::HeaderMap;
 
 use crate::auth::jwt::{JwtError, validate};
 use crate::auth::oidc::{OidcError, OidcVerifier};
-use crate::auth::{AuthPolicy, TokenStore, constant_time_eq, now_secs};
+use crate::auth::{AuthPolicy, Namespace, TokenStore, constant_time_eq, now_secs};
 
 /// Verify the request's bearer token against static tokens, the dynamic
 /// store, the self-minted JWT key, and (when installed) the OIDC verifier.
+///
+/// Returns the namespace the accepted credential resolves to: an OIDC token
+/// yields `"<issuer>|<tenant>"` (`docs/shared-cache.md` §7), while the
+/// pre-v1.2 acceptance paths (static tokens, the store, cachette's own
+/// minted JWT) carry no tenant and resolve to the legacy namespace.
 ///
 /// `oidc` is the boot-installed verifier (docs/oidc.md); `None` keeps the
 /// v1.0 acceptance paths minus the JWT step — a JWT-looking token is then
@@ -29,19 +34,17 @@ pub async fn verify(
     tokens: &TokenStore,
     oidc: Option<&Arc<OidcVerifier>>,
     headers: &HeaderMap,
-) -> bool {
-    let Some(token) = crate::auth::bearer_token(headers) else {
-        return false;
-    };
+) -> Option<Namespace> {
+    let token = crate::auth::bearer_token(headers)?;
     if policy
         .static_tokens
         .iter()
         .any(|candidate| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
     {
-        return true;
+        return Some(Namespace::legacy());
     }
     if tokens.is_valid(token).await.unwrap_or(false) {
-        return true;
+        return Some(Namespace::legacy());
     }
     // Self-minted JWT (v1.0 shape, now verified in the bearer gate): the
     // mint CLI signs with `[auth].secret`, the server holds that key, so
@@ -52,7 +55,7 @@ pub async fn verify(
     // would accept (`UnsupportedAlg` is RS256 territory).
     if let Some(secret) = policy.secret.as_deref() {
         match validate(token, secret, now_secs()) {
-            Ok(_) => return true,
+            Ok(_) => return Some(Namespace::legacy()),
             // Well-formed but signed by an unknown key: one warn line, same
             // reasoning as the OIDC gate's bad signature. `header.alg` said
             // HS256, so the OIDC verifier (RS256 pin) would reject it too —
@@ -71,22 +74,22 @@ pub async fn verify(
     // list, the store, nor the signing key is attempted as an RS256 JWT.
     // The verifier never echoes token material; each rejection is one line
     // naming the stage.
-    let Some(oidc) = oidc else {
-        return false;
-    };
+    let oidc = oidc?;
     match oidc.verify(token, now_secs()) {
-        Ok(()) => true,
+        // The verified token yields its tenant: the namespace is the
+        // issuer|tenant pair unless an admin mapping overrides it.
+        Ok(identity) => Some(Namespace(identity.namespace())),
         // Structural garbage (not a JWT at all) is everyday scanner noise:
         // a debug line. Anything well-formed but untrustable — a bad
         // signature, an unconfigured issuer/audience — is worth a warn:
         // both are single lines and neither carries token material.
         Err(OidcError::Malformed) => {
             tracing::debug!("bearer token rejected by the oidc verifier: malformed token");
-            false
+            None
         }
         Err(stage) => {
             tracing::warn!(stage = %stage, "bearer token rejected by the oidc verifier");
-            false
+            None
         }
     }
 }

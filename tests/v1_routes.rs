@@ -62,7 +62,7 @@ fn now_secs() -> i64 {
 
 fn signed_url(key: &str) -> String {
     let path = format!("/_apis/artifactcache/artifacts/{key}");
-    let signed = urls::mint(&path, key, SECRET, 900, now_secs());
+    let signed = urls::mint(&path, key, SECRET, 900, now_secs(), "");
     format!("{path}{}", signed.query())
 }
 
@@ -1153,7 +1153,7 @@ async fn find_returns_absolute_archive_location_when_external_url_configured() {
 async fn download_rejects_tampered_signed_url() {
     let app = routes::router(fixture_state().await);
     let path = format!("/_apis/artifactcache/artifacts/{FIXTURE_KEY}");
-    let signed = urls::mint(&path, FIXTURE_KEY, SECRET, 900, now_secs());
+    let signed = urls::mint(&path, FIXTURE_KEY, SECRET, 900, now_secs(), "");
     let mut mac = signed.mac.into_bytes();
     mac[0] = if mac[0] == b'0' { b'1' } else { b'0' };
     let damaged = format!(

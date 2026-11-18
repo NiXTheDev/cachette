@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{self, Namespace, urls};
+use crate::auth::{self, urls};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -41,29 +41,33 @@ pub async fn download(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
+    //
     // The namespace rides in the capability data, not in a credential: this
     // path is authorized by the signed URL alone (task 26), so the credential
-    // gate never inserts an extension here. The credential-plane slice binds
-    // the minting namespace into the signed URL payload (server-side field,
-    // the client only echoes the URL); until then these requests serve the
-    // legacy single-tenant namespace (docs/shared-cache.md §Rollout).
-    let namespace = Namespace::legacy();
-    let Some(storage) = state.storage_scoped(&namespace.0) else {
-        return ApiError::Unavailable(String::from("storage backend not configured"))
-            .into_response();
-    };
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    //
     // The MAC binds the exact resource path, reconstructed from the route param
     // (so a traversal-style path can never spoof it).
     let path = format!("/v2/artifacts/{entry_id}");
     let policy = state.auth();
-    if let Err(err) = urls::validate(
+    let namespace = match urls::validate(
         &query,
         &path,
         super::signing_secret(&policy),
         auth::now_secs(),
     ) {
-        return ApiError::from(err).into_response();
-    }
+        Ok(resolved) => resolved,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     if policy.cluster_enabled {
         tracing::debug!(
             entry_id = %entry_id,

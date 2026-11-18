@@ -52,6 +52,10 @@ pub struct StorageConfig {
     /// Finalize-time content-defined chunking (v1.1); `[storage.cdc]` may
     /// be absent entirely - everything defaults off.
     pub cdc: CdcConfig,
+    /// Admin namespace mappings (v1.2 workstream F,
+    /// `docs/shared-cache.md` §7): `"<forge>|<tenant>"` -> namespace name.
+    /// A tenant not listed keeps its default `"<forge>|<tenant>"` namespace.
+    pub namespaces: BTreeMap<String, String>,
 }
 
 impl Default for StorageConfig {
@@ -60,6 +64,7 @@ impl Default for StorageConfig {
             backend: Backend::Fs,
             fs: FsConfig::default(),
             cdc: CdcConfig::default(),
+            namespaces: BTreeMap::new(),
         }
     }
 }
@@ -221,6 +226,7 @@ pub enum AuthMode {
 /// [auth.oidc."https://idp.example.org/realms/ci"]
 /// audiences = ["cachette"]
 /// jwks_url = "https://idp.example.org/realms/ci/protocol/openid-connect/certs"
+/// tenant_claim = "repository"
 /// require = { "groups" = "ci" }
 /// leeway_seconds = 30
 /// ca_pem = "/etc/ssl/certs/private-root.pem"
@@ -286,6 +292,13 @@ pub struct OidcIssuerConfig {
     /// Explicit JWKS URL; the default endpoint is derived as
     /// `{issuer}/.well-known/jwks.json` (docs/oidc.md §JWKS handling).
     pub jwks_url: Option<String>,
+    /// Claim whose VALUE is the tenant of this issuer's tokens
+    /// (`docs/shared-cache.md` §7): the namespace becomes
+    /// `"<issuer>|<tenant>"` unless an admin mapping overrides it. Defaults
+    /// to `repository`; a token without this claim is rejected in
+    /// multi-tenant use, never defaulted.
+    #[serde(default = "default_tenant_claim")]
+    pub tenant_claim: String,
     /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
     /// Array-valued claims authorize when they contain the value.
     pub require: BTreeMap<String, String>,
@@ -296,11 +309,16 @@ pub struct OidcIssuerConfig {
     pub ca_pem: Option<PathBuf>,
 }
 
+fn default_tenant_claim() -> String {
+    String::from("repository")
+}
+
 impl Default for OidcIssuerConfig {
     fn default() -> Self {
         Self {
             audiences: Vec::new(),
             jwks_url: None,
+            tenant_claim: default_tenant_claim(),
             require: BTreeMap::new(),
             leeway_seconds: 30,
             ca_pem: None,
