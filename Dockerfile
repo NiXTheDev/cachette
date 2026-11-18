@@ -130,7 +130,7 @@ RUN --mount=type=cache,target=/opt/zig,sharing=locked \
         END { for (i = n - 1; i > 0; i--) { \
                 j = int(rand() * (i + 1)); t = a[i]; a[i] = a[j]; a[j] = t \
               } \
-              for (i = 0; i < n; i++) print a[i] }')" /tmp/zig-mirrors.txt; \
+              for (i = 0; i < n; i++) print a[i] }' /tmp/zig-mirrors.txt)"; \
     fi; \
     got=0; \
     for m in $mirrors; do \
