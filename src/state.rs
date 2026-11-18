@@ -227,6 +227,23 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// A view of the storage backend restricted to `namespace` (v1.2
+    /// workstream F, `docs/shared-cache.md` §1/§4).
+    ///
+    /// The namespace is part of a row's identity: the view only ever observes
+    /// and mutates rows of its own namespace, so two tenants never share a
+    /// row even with identical keys and versions. The legacy `""` namespace
+    /// is the single-tenant row set — what the unscoped backend operates on —
+    /// so single-tenant deployments are unchanged. Creating a view is cheap
+    /// (shared connection/gate/locks, no re-open), which is what makes
+    /// per-request namespace resolution viable.
+    #[must_use]
+    pub fn storage_scoped(&self, namespace: &str) -> Option<Arc<dyn StorageBackend>> {
+        self.storage
+            .as_ref()
+            .map(|backend| backend.scoped(namespace))
+    }
+
     /// Replace the live cache limits (boot + SIGHUP reload).
     pub fn set_cache_limits(&self, limits: CacheLimits) {
         *self

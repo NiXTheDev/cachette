@@ -18,6 +18,7 @@ pub mod oidc;
 pub mod tokens;
 pub mod urls;
 
+use axum::Extension;
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
@@ -33,6 +34,38 @@ pub use urls::{SignedUrl, UrlError};
 
 /// Path prefix guarded by [`require_auth`]; plan task 18 owns the handlers.
 pub const ARTIFACTCACHE_PREFIX: &str = "/_apis/artifactcache";
+
+/// The namespace a request's credential resolved to (v1.2 workstream F,
+/// `docs/shared-cache.md` §1/§3).
+///
+/// [`require_auth`] resolves the credential to `(forge, tenant)` and inserts
+/// the namespace into the request extensions; handlers scope storage through
+/// [`crate::state::AppState::storage_scoped`] so a view only ever touches its
+/// own namespace's rows. The composite identity is plane-specific: Plane A
+/// (OIDC) yields `"<issuer>|<tenant>"` from the issuer block and its pinned
+/// claim, Plane B (runtime tokens) the forge id and the tenant claim, Plane C
+/// (HMAC) is single-tenant by definition. Until the credential-plane slices
+/// wire that extraction, every accepted credential resolves to the legacy
+/// namespace — byte-identical behavior (§Rollout: default off).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Namespace(pub String);
+
+impl Namespace {
+    /// The legacy single-tenant namespace: the schema v3 `''` default every
+    /// pre-namespaces row carries. What an absent extension (an ungated path)
+    /// and — for now — every gated credential resolve to.
+    #[must_use]
+    pub fn legacy() -> Self {
+        Self(String::new())
+    }
+
+    /// The namespace of an optional `Extension` extraction, defaulting to the
+    /// legacy namespace when the gate did not insert one (ungated paths).
+    #[must_use]
+    pub fn from_extension(ext: Option<Extension<Self>>) -> Self {
+        ext.map(|Extension(ns)| ns).unwrap_or_else(Self::legacy)
+    }
+}
 
 /// Artifact **downloads** are authorized by their signed URL alone: the GitHub
 /// contract calls `archiveLocation` "already authenticated", and both real
@@ -86,7 +119,11 @@ impl Default for AuthPolicy {
 /// axum's `route_layer` panics on an empty router, so the gate is applied as
 /// a path-scoped layer instead: requests outside the prefix pass through
 /// untouched, everything under it must authenticate.
-pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
     if !path.starts_with(ARTIFACTCACHE_PREFIX) || path.starts_with(ARTIFACT_DOWNLOAD_PREFIX) {
         return next.run(request).await;
@@ -107,6 +144,15 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
         }
     };
     if authorized {
+        // v1.2 workstream F (docs/shared-cache.md §1/§3): resolve the
+        // credential to a namespace the handlers scope storage through. The
+        // credential-plane slices wire the per-plane extraction (Plane A:
+        // "<issuer>|<tenant>" from the OIDC issuer block and its pinned
+        // claim; Plane B: the runtime token's forge id + tenant claim;
+        // Plane C/HMAC: refused at boot in multi-tenant mode). Until then
+        // every accepted credential resolves to the legacy single-tenant
+        // namespace — byte-identical behavior (§Rollout: default off).
+        request.extensions_mut().insert(Namespace::legacy());
         next.run(request).await
     } else {
         ApiError::Unauthorized(String::from("authentication required")).into_response()

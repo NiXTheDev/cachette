@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{self, urls};
+use crate::auth::{self, Namespace, urls};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -41,7 +41,14 @@ pub async fn download(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    // The namespace rides in the capability data, not in a credential: this
+    // path is authorized by the signed URL alone (task 26), so the credential
+    // gate never inserts an extension here. The credential-plane slice binds
+    // the minting namespace into the signed URL payload (server-side field,
+    // the client only echoes the URL); until then these requests serve the
+    // legacy single-tenant namespace (docs/shared-cache.md §Rollout).
+    let namespace = Namespace::legacy();
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -78,7 +85,7 @@ pub async fn download(
         .or_else(|| headers.get(header::RANGE))
         .and_then(|value| value.to_str().ok());
     match range {
-        None => match read_range(storage, &entry_id, 0..size).await {
+        None => match read_range(storage.as_ref(), &entry_id, 0..size).await {
             Some(bytes) => (
                 StatusCode::OK,
                 [(header::ACCEPT_RANGES, String::from("bytes"))],
@@ -91,7 +98,7 @@ pub async fn download(
             let Some((start, end)) = parse_range(raw, size) else {
                 return range_not_satisfiable(size);
             };
-            let Some(bytes) = read_range(storage, &entry_id, start..end + 1).await else {
+            let Some(bytes) = read_range(storage.as_ref(), &entry_id, start..end + 1).await else {
                 return range_not_satisfiable(size);
             };
             (

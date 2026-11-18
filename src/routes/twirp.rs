@@ -44,7 +44,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::auth::{self, jwt, urls};
+use crate::auth::{self, Namespace, jwt, urls};
 use crate::cluster::relay::{self, V2Finalize, V2Reserve};
 use crate::config::AuthMode;
 use crate::error::ApiError;
@@ -96,6 +96,15 @@ pub async fn dispatch(
         return ApiError::Unauthorized(String::from("authentication required"))
             .into_twirp_response();
     }
+    // v1.2 workstream F (docs/shared-cache.md §1/§3): the credential resolves
+    // to a namespace the handlers scope storage through. The twirp gate is
+    // this module's own `authorized` (it never runs under `require_auth`),
+    // so its resolution point is here. The credential-plane slices wire the
+    // per-plane extraction (Plane A: "<issuer>|<tenant>", Plane B: the
+    // runtime token's forge id + tenant claim) into this spot; until then
+    // every accepted credential resolves to the legacy single-tenant
+    // namespace — byte-identical behavior (§Rollout: default off).
+    let namespace = Namespace::legacy();
     if !accepts_json(&headers) {
         return ApiError::BadRequest(String::from(
             "unsupported content type; use application/json",
@@ -107,12 +116,14 @@ pub async fn dispatch(
             .into_twirp_response();
     }
     match known {
-        Method::CreateCacheEntry => create_cache_entry(&state, &body).await,
-        Method::FinalizeCacheEntryUpload => finalize_cache_entry(&state, &body).await,
-        Method::SupersedeCacheEntry => supersede_cache_entry(&state, &body).await,
-        Method::GetCacheEntryDownloadURL => get_cache_entry_download_url(&state, &body).await,
+        Method::CreateCacheEntry => create_cache_entry(&state, &namespace, &body).await,
+        Method::FinalizeCacheEntryUpload => finalize_cache_entry(&state, &namespace, &body).await,
+        Method::SupersedeCacheEntry => supersede_cache_entry(&state, &namespace, &body).await,
+        Method::GetCacheEntryDownloadURL => {
+            get_cache_entry_download_url(&state, &namespace, &body).await
+        }
         Method::FindMissingOrStaleCacheEntries => {
-            find_missing_or_stale_cache_entries(&state, &body).await
+            find_missing_or_stale_cache_entries(&state, &namespace, &body).await
         }
     }
 }
@@ -213,7 +224,7 @@ struct CacheMetadata {
 /// floor (logged, not rejected — the eviction service is off the request
 /// path). Single-node: the owner is this node, so the URLs point at our own
 /// external host (`server.external_url`).
-async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn create_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: CreateCacheEntryRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -221,7 +232,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
                 .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
@@ -387,7 +398,7 @@ fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Respons
 ///
 /// Single-node: the blob is local. In cluster mode the owning node may be a
 /// peer; task 32 forwards this call to `POST B/_internal/peers/v2/finalize`.
-async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn finalize_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: FinalizeCacheEntryUploadRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -397,12 +408,12 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache_limits().key_case);
-    let stat = match stat_key_or_id(storage, &key, request.cache_id.as_deref()).await {
+    let stat = match stat_key_or_id(storage.as_ref(), &key, request.cache_id.as_deref()).await {
         Ok(stat) => stat,
         Err(err) => {
             tracing::error!(error = %err, "v2 finalize: stat failed");
@@ -461,7 +472,7 @@ pub(crate) async fn stat_key_or_id(
 ///
 /// Single-node: deletes locally. In cluster mode task 32 forwards this to the
 /// owner (`POST B/_internal/peers/v2/supersede`).
-async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn supersede_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: SupersedeCacheEntryRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -469,7 +480,7 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
                 .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
@@ -498,7 +509,11 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
 /// Single-node: mints locally. In cluster mode the entry node first checks
 /// locally (self-owned) and, on miss, fans out to the owner (task 32) — it
 /// never proxies the download body.
-async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response {
+async fn get_cache_entry_download_url(
+    state: &AppState,
+    namespace: &Namespace,
+    body: &[u8],
+) -> Response {
     let request: GetCacheEntryDownloadURLRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -508,7 +523,7 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
@@ -612,7 +627,11 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
 ///
 /// Single-node: reports this node's entries. In cluster mode task 32 fans the
 /// query out across healthy peers and unions the responses.
-async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> Response {
+async fn find_missing_or_stale_cache_entries(
+    state: &AppState,
+    namespace: &Namespace,
+    body: &[u8],
+) -> Response {
     let request: FindMissingOrStaleCacheEntriesRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -622,7 +641,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return Json(json!({"cache_entries": []})).into_response();
     };
     let limits = state.cache_limits();
