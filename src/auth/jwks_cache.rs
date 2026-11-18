@@ -897,6 +897,23 @@ mod tests {
         cache
     }
 
+    /// Wait until the endpoint has been quiet for a moment. The boot prefetch
+    /// and `warm_boot`'s first lazy poll race by design, so a fetch triggered
+    /// by the warm-up can still land after it reports the key cached; tests
+    /// that count requests must drain that race first.
+    async fn quiesce(server: &JwksServer) {
+        let start = std::time::Instant::now();
+        let mut last = server.hits();
+        while std::time::Instant::now() < start + Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let hits = server.hits();
+            if hits == last {
+                return;
+            }
+            last = hits;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_refresh_resolves_a_rotated_kid() {
         let kid_a = rsa().kid;
@@ -1038,6 +1055,8 @@ mod tests {
         let kid = rsa().kid;
         let server = spawn_jwks_server(&jwks_doc(&[kid.as_str()])).await;
         let cache = warm_boot(&server, &kid).await;
+        // Drain the boot/lazy-refresh race before counting (see `quiesce`).
+        quiesce(&server).await;
         let hits_after_prefetch = server.hits();
 
         // An issuer the node never configured must not trigger any fetch.
