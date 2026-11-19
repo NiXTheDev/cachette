@@ -130,6 +130,27 @@ pub enum ConfigError {
     )]
     OidcIssuerPlaintext { issuer: String },
 
+    /// A tenant-yielding credential plane is enabled (`[auth.oidc]
+    /// enabled = true`) together with the HMAC plane. Plane C's repo/run
+    /// fields are client-asserted and cannot express a tenant, so an
+    /// `hmac`/`merge` mode would funnel every HMAC request into one shared
+    /// namespace (`docs/shared-cache.md` §2/§9).
+    #[error(
+        "auth.mode = \"{mode}\" with a tenant-yielding credential plane ([auth.oidc] enabled) \
+         is a multi-tenant deployment, but HMAC cannot express a tenant - set \
+         auth.mode = \"bearer\""
+    )]
+    HmacInMultiTenant { mode: &'static str },
+
+    /// A tenant-yielding credential plane is enabled with `cluster.enabled`.
+    /// The peer wire does not carry namespaces yet (§8), so a peer would
+    /// relay and store namespaced rows as legacy ones.
+    #[error(
+        "cluster.enabled with a tenant-yielding credential plane ([auth.oidc] enabled) is not \
+         supported yet: the peer wire does not carry namespaces (docs/shared-cache.md §8)"
+    )]
+    ClusterInMultiTenant,
+
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.
     #[error("internal config serialization error: {0}")]

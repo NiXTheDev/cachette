@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cachette::auth::hmac;
-use cachette::config::{Config, OidcConfig};
+use cachette::config::{AuthMode, Config, OidcConfig};
 use cachette::state::AppState;
 
 /// Build a resolved [`Config`] with the given HMAC secret and cache size.
@@ -134,9 +134,11 @@ impl cachette::auth::jwks::RsaKeySource for ReloadKeys {
     }
 }
 
-/// Enabled `[auth.oidc]` surface with a distinct issuer string.
+/// Enabled `[auth.oidc]` surface with a distinct issuer string. The table
+/// is tenant-yielding, so the HMAC plane is off (`validate_tenancy`).
 fn oidc_config() -> Config {
     let mut config = Config::default();
+    config.auth.mode = AuthMode::Bearer;
     config.auth.oidc = Some(OidcConfig {
         enabled: true,
         jwks_ca_pem: Some(std::path::PathBuf::from("/etc/cachette/idp-ca.pem")),

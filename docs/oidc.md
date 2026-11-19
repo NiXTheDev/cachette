@@ -171,6 +171,17 @@ jwks_ca_pem = ""      # path to PEM bundle; required when enabled
 Default **off**; toggling `enabled` on a live node requires only a restart.
 No wire or client changes of any kind.
 
+An enabled `[auth.oidc]` is a **tenant-yielding plane** in the multi-tenant
+shared cache (`docs/shared-cache.md`): every accepted token must carry the
+issuer block's `tenant_claim`, and the token's tenant selects the storage
+namespace. That makes the deployment multi-tenant by definition, so the
+HMAC plane cannot be enabled alongside it - HMAC's repo/run fields are
+client-asserted and cannot express a tenant. `auth.mode = "hmac"` or
+`"merge"` with `[auth.oidc] enabled = true` is therefore a boot-time
+error; use `auth.mode = "bearer"`. So is `cluster.enabled`: the peer wire
+does not carry namespaces yet (`docs/shared-cache.md` §8), so a peer would
+store this tenant's rows as legacy ones.
+
 ## v1.2 amendments (2026-11-15)
 
 ### Per-issuer configuration blocks

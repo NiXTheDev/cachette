@@ -313,6 +313,10 @@ another's. Peers relay and store the same namespaced rows; the namespace is
 part of the row identity everywhere, so a peer never has to know which
 namespace a request belongs to beyond carrying it.
 
+Until that wire lands, `cluster.enabled` together with a tenant-yielding
+credential plane is a boot error: a peer would relay and store namespaced
+rows as legacy ones, silently merging tenants.
+
 ### 9. Failure modes
 
 - A `[storage.namespaces]` key that is not `"<forge>|<tenant>"` (a missing
@@ -326,6 +330,8 @@ namespace a request belongs to beyond carrying it.
   fallback** - an unauthenticated request is a miss/error, never "the
   default tenant".
 - HMAC enabled together with multi-tenant mode: boot error.
+- Cluster mode enabled together with multi-tenant mode before the peer wire
+  carries namespaces (§8): boot error, same reason.
 - A cluster with peers of different protocol versions: refuse to join (the
   existing version negotiation).
 

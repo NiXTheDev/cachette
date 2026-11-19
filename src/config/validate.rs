@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::Config;
 use crate::config::error::ConfigError;
+use crate::config::{AuthMode, Config};
 
 /// Split `host:port` (IPv6 literals bracketed: `[::1]:8080`).
 pub(crate) fn split_host_port(raw: &str) -> Option<(&str, u16)> {
@@ -56,6 +56,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     }
     validate_namespaces(&config.storage.namespaces)?;
     validate_oidc(config)?;
+    validate_tenancy(config)?;
     Ok(())
 }
 
@@ -159,6 +160,34 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Multi-tenant boot guard (`docs/shared-cache.md` §2/§9 and §8). A
+/// credential plane that yields a tenant makes the deployment
+/// multi-tenant; Plane A (`[auth.oidc] enabled`) is such a plane, Plane B
+/// joins when it lands. Then:
+/// - the HMAC plane must be off: its repo/run fields are client-asserted
+///   and cannot express a tenant, so `hmac`/`merge` would silently funnel
+///   every HMAC request into one shared namespace;
+/// - cluster mode must be off until the peer wire carries namespaces (§8):
+///   peers would relay and store namespaced rows as legacy ones.
+///
+/// No tenant-yielding plane means v1.1 behavior, which validates unchanged.
+/// Runs after [`validate_oidc`] so a structural OIDC error takes precedence.
+fn validate_tenancy(config: &Config) -> Result<(), ConfigError> {
+    let oidc_enabled = config.auth.oidc.as_ref().is_some_and(|oidc| oidc.enabled);
+    if !oidc_enabled {
+        return Ok(());
+    }
+    match config.auth.mode {
+        AuthMode::Bearer => {}
+        AuthMode::Hmac => return Err(ConfigError::HmacInMultiTenant { mode: "hmac" }),
+        AuthMode::Merge => return Err(ConfigError::HmacInMultiTenant { mode: "merge" }),
+    }
+    if config.cluster.enabled {
+        return Err(ConfigError::ClusterInMultiTenant);
+    }
+    Ok(())
+}
+
 fn validate_listen(listen: &str) -> Result<(), ConfigError> {
     if split_host_port(listen).is_some() {
         return Ok(());
@@ -193,11 +222,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::config::{OidcConfig, OidcIssuerConfig};
+    use crate::config::{AuthMode, OidcConfig, OidcIssuerConfig};
 
-    /// A `Config` with `[auth.oidc]` built from the default surface.
+    /// A `Config` with `[auth.oidc]` built from the default surface. An
+    /// enabled OIDC table is tenant-yielding, so the HMAC plane must be off
+    /// (`validate_tenancy`); every OIDC fixture therefore serves bearer-only.
     fn oidc_config(fields: impl FnOnce(&mut OidcConfig)) -> Config {
         let mut config = Config::default();
+        config.auth.mode = AuthMode::Bearer;
         let mut oidc = OidcConfig::default();
         fields(&mut oidc);
         config.auth.oidc = Some(oidc);
@@ -490,6 +522,57 @@ mod tests {
         );
 
         assert!(validate(&enabled_oidc()).is_ok());
+    }
+
+    /// `docs/shared-cache.md` §2/§9: the HMAC plane cannot express a
+    /// tenant, so a tenant-yielding plane (enabled OIDC) refuses `hmac` and
+    /// `merge` with a precise error naming the mode.
+    #[test]
+    fn tenant_yielding_plane_refuses_the_hmac_plane() {
+        let mut config = enabled_oidc();
+        assert!(
+            validate(&config).is_ok(),
+            "bearer + OIDC is the supported shape"
+        );
+
+        config.auth.mode = AuthMode::Hmac;
+        let err = validate(&config).expect_err("hmac with OIDC");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "hmac"),
+            "unexpected error: {err:?}"
+        );
+
+        config.auth.mode = AuthMode::Merge;
+        let err = validate(&config).expect_err("merge with OIDC");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "merge"),
+            "unexpected error: {err:?}"
+        );
+
+        // No tenant-yielding plane: HMAC keeps its v1.1 behavior.
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::Hmac;
+        assert!(validate(&config).is_ok());
+    }
+
+    /// `docs/shared-cache.md` §8: the peer wire does not carry namespaces
+    /// yet, so a tenant-yielding plane with cluster mode would relay and
+    /// store tenant rows as legacy ones.
+    #[test]
+    fn tenant_yielding_plane_refuses_cluster_mode() {
+        let mut config = enabled_oidc();
+        config.cluster.enabled = true;
+        let err = validate(&config).expect_err("cluster with OIDC");
+        assert!(
+            matches!(err, ConfigError::ClusterInMultiTenant),
+            "unexpected error: {err:?}"
+        );
+
+        // Cluster mode alone (no tenant-yielding plane) is unchanged.
+        let mut config = Config::default();
+        config.cluster.enabled = true;
+        config.auth.mode = AuthMode::Hmac;
+        assert!(validate(&config).is_ok());
     }
 
     /// A per-issuer `ca_pem` covers that issuer on its own; the global
