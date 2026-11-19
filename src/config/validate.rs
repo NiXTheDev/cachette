@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::error::ConfigError;
-use crate::config::{AuthMode, Config};
+use crate::config::{AuthMode, Config, RuntimeForgeConfig};
 
 /// Split `host:port` (IPv6 literals bracketed: `[::1]:8080`).
 pub(crate) fn split_host_port(raw: &str) -> Option<(&str, u16)> {
@@ -56,6 +56,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     }
     validate_namespaces(&config.storage.namespaces)?;
     validate_oidc(config)?;
+    validate_runtime(&config.auth.runtime)?;
     validate_tenancy(config)?;
     Ok(())
 }
@@ -160,10 +161,39 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// `[auth.runtime]` wiring rules (v1.2 Plane B, `docs/shared-cache.md` §3).
+/// A forge id is the forge half of `"<forge>|<tenant>"`, so it must be
+/// non-empty and cannot contain `|`. An enabled block needs a secret file
+/// path and a tenant claim path; a disabled block is inert and may be
+/// half-filled.
+fn validate_runtime(runtime: &BTreeMap<String, RuntimeForgeConfig>) -> Result<(), ConfigError> {
+    for (forge, block) in runtime {
+        if forge.trim().is_empty() || forge.contains('|') {
+            return Err(ConfigError::RuntimeForgeKey {
+                forge: forge.clone(),
+            });
+        }
+        if !block.enabled {
+            continue;
+        }
+        if block.secret.as_os_str().is_empty() {
+            return Err(ConfigError::RuntimeSecretMissing {
+                forge: forge.clone(),
+            });
+        }
+        if block.tenant_claim.trim().is_empty() {
+            return Err(ConfigError::RuntimeTenantClaimMissing {
+                forge: forge.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Multi-tenant boot guard (`docs/shared-cache.md` §2/§9 and §8). A
 /// credential plane that yields a tenant makes the deployment
-/// multi-tenant; Plane A (`[auth.oidc] enabled`) is such a plane, Plane B
-/// joins when it lands. Then:
+/// multi-tenant: Plane A (`[auth.oidc] enabled`) and Plane B (any
+/// `[auth.runtime."<forge>"]` block enabled) both do. Then:
 /// - the HMAC plane must be off: its repo/run fields are client-asserted
 ///   and cannot express a tenant, so `hmac`/`merge` would silently funnel
 ///   every HMAC request into one shared namespace;
@@ -171,10 +201,12 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
 ///   peers would relay and store namespaced rows as legacy ones.
 ///
 /// No tenant-yielding plane means v1.1 behavior, which validates unchanged.
-/// Runs after [`validate_oidc`] so a structural OIDC error takes precedence.
+/// Runs after [`validate_oidc`]/[`validate_runtime`] so a structural
+/// credential-plane error takes precedence.
 fn validate_tenancy(config: &Config) -> Result<(), ConfigError> {
     let oidc_enabled = config.auth.oidc.as_ref().is_some_and(|oidc| oidc.enabled);
-    if !oidc_enabled {
+    let runtime_enabled = config.auth.runtime.values().any(|block| block.enabled);
+    if !oidc_enabled && !runtime_enabled {
         return Ok(());
     }
     match config.auth.mode {
@@ -222,7 +254,23 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::config::{AuthMode, OidcConfig, OidcIssuerConfig};
+    use crate::config::{AuthMode, OidcConfig, OidcIssuerConfig, RuntimeForgeConfig};
+
+    /// Enabled Plane B surface. Validation only checks the block's shape -
+    /// the secret file is read by `auth::runtime::install` at boot.
+    fn enabled_runtime() -> Config {
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::Bearer;
+        config.auth.runtime.insert(
+            String::from("https://forge.example.org"),
+            RuntimeForgeConfig {
+                enabled: true,
+                secret: PathBuf::from("/etc/cachette/forgejo-token-secret"),
+                ..RuntimeForgeConfig::default()
+            },
+        );
+        config
+    }
 
     /// A `Config` with `[auth.oidc]` built from the default surface. An
     /// enabled OIDC table is tenant-yielding, so the HMAC plane must be off
@@ -573,6 +621,87 @@ mod tests {
         config.cluster.enabled = true;
         config.auth.mode = AuthMode::Hmac;
         assert!(validate(&config).is_ok());
+    }
+
+    /// `docs/shared-cache.md` §3: an enabled runtime block needs a secret
+    /// file and a tenant path; forge keys are namespace halves. A disabled
+    /// block is inert and may be half-filled.
+    #[test]
+    fn runtime_blocks_are_validated_per_forge() {
+        assert!(validate(&enabled_runtime()).is_ok());
+
+        for key in ["", "  ", "https://forge|other"] {
+            let mut config = Config::default();
+            config.auth.runtime.insert(
+                String::from(key),
+                RuntimeForgeConfig {
+                    enabled: true,
+                    secret: PathBuf::from("/etc/cachette/secret"),
+                    ..RuntimeForgeConfig::default()
+                },
+            );
+            let err = validate(&config).expect_err("malformed forge key");
+            assert!(
+                matches!(&err, ConfigError::RuntimeForgeKey { forge } if forge == key),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        let mut config = enabled_runtime();
+        config
+            .auth
+            .runtime
+            .get_mut("https://forge.example.org")
+            .expect("block")
+            .secret = PathBuf::new();
+        let err = validate(&config).expect_err("missing secret");
+        assert!(
+            matches!(err, ConfigError::RuntimeSecretMissing { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        let mut config = enabled_runtime();
+        config
+            .auth
+            .runtime
+            .get_mut("https://forge.example.org")
+            .expect("block")
+            .tenant_claim = String::from("  ");
+        let err = validate(&config).expect_err("empty tenant claim");
+        assert!(
+            matches!(err, ConfigError::RuntimeTenantClaimMissing { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // Disabled: the half-filled block is inert, like a disabled OIDC table.
+        let mut config = Config::default();
+        config.auth.runtime.insert(
+            String::from("https://forge.example.org"),
+            RuntimeForgeConfig::default(),
+        );
+        assert!(validate(&config).is_ok());
+    }
+
+    /// Plane B is tenant-yielding too, so the same boot guard applies.
+    #[test]
+    fn a_runtime_plane_is_tenant_yielding_for_the_boot_guard() {
+        let mut config = enabled_runtime();
+        assert!(validate(&config).is_ok());
+
+        config.auth.mode = AuthMode::Merge;
+        let err = validate(&config).expect_err("merge with Plane B");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "merge"),
+            "unexpected error: {err:?}"
+        );
+
+        config.auth.mode = AuthMode::Bearer;
+        config.cluster.enabled = true;
+        let err = validate(&config).expect_err("cluster with Plane B");
+        assert!(
+            matches!(err, ConfigError::ClusterInMultiTenant),
+            "unexpected error: {err:?}"
+        );
     }
 
     /// A per-issuer `ca_pem` covers that issuer on its own; the global

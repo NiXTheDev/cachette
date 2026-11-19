@@ -153,6 +153,15 @@ require = { "event_name" = "push" }
 leeway_seconds = 30
 ```
 
+A block is inert unless `enabled`. An enabled block is read at boot: the
+secret is a **file path**, trimmed, and an unreadable or empty file is
+boot-fatal (a misconfigured trust root must never serve). Runtime tokens
+are tried before Plane A, so an HS256 token never reaches the RS256
+verifier and never logs an algorithm rejection. Like Plane A, an enabled
+runtime block is tenant-yielding, so the multi-tenant boot guard applies
+(§9): `auth.mode` must be `bearer`, and cluster mode is refused until the
+peer wire carries namespaces (§8).
+
 Trust note, stated plainly: this secret can mint **any** runtime token, so a
 cachette holding it sits inside that forge's trust boundary - exactly like
 the forge's database. That is an acceptable trade for "the cache serves every
@@ -262,7 +271,7 @@ that vouched for the credential:
 | plane | forge | tenant | typical source |
 |---|---|---|---|
 | A (OIDC) | the issuer string | the value of the issuer block's `tenant_claim` (default `repository`) | Forgejo Actions ID token, GitHub OIDC, Keycloak |
-| B (runtime) | the configured forge id | `oidc_extra.repository` | Forgejo / Gitea runners |
+| B (runtime) | the configured forge id | the value at the block's `tenant_claim` (default `oidc_extra.repository`, falling back to `oidc_extra.repository_owner`) | Forgejo / Gitea runners |
 | C (HMAC) | - | - | single-tenant only |
 
 The namespace defaults to `"<forge>|<tenant>"` - isolated per tenant per

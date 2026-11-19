@@ -158,6 +158,11 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
     // v1.0 behavior stays byte-identical. Reloads never swap the verifier.
     auth::oidc::install(&state, &config)?;
+    // Forge runtime-token verification (v1.2 Plane B,
+    // `docs/shared-cache.md` §3): each enabled `[auth.runtime."<forge>"]`
+    // block reads its signing-secret file at boot. An unreadable or empty
+    // secret is boot-fatal; no enabled block is a silent no-op.
+    auth::runtime::install(&state, &config)?;
     // Runner-visible base URL for capability URLs (`/v2/*`); the config
     // resolver always derives it from `listen` when `external_url` is unset.
     state.external_url = config.server.external_url.clone();

@@ -15,6 +15,7 @@ pub mod jwks;
 pub mod jwks_cache;
 pub mod jwt;
 pub mod oidc;
+pub mod runtime;
 pub mod tokens;
 pub mod urls;
 
@@ -131,23 +132,41 @@ pub async fn require_auth(
     let policy = state.auth();
     // The OIDC verifier (v1.1) is a server-level capability installed at
     // boot; a token that fails the static/store/signature checks is
-    // attempted as an RS256 JWT when one is installed (docs/oidc.md).
+    // attempted as an RS256 JWT when one is installed (docs/oidc.md). The
+    // v1.2 runtime verifier (docs/shared-cache.md §3) sits ahead of it, so a
+    // forge HS256 token never reaches the RS256 gate.
     let oidc = state.oidc();
+    let runtime = state.runtime();
     // v1.2 workstream F (docs/shared-cache.md §1/§3): resolve the credential
     // to a namespace the handlers scope storage through. Plane A (OIDC)
-    // yields "<issuer>|<tenant>"; HMAC and the tenant-less bearer paths are
-    // single-tenant and resolve to the legacy namespace. HMAC in a
-    // multi-tenant boot is refused before this layer is ever reached.
+    // yields "<issuer>|<tenant>", Plane B (runtime) "<forge>|<tenant>"; HMAC
+    // and the tenant-less bearer paths are single-tenant and resolve to the
+    // legacy namespace. HMAC in a multi-tenant boot is refused before this
+    // layer is ever reached.
     let namespace = match policy.mode {
         AuthMode::Hmac => hmac::verify(&policy, request.headers()).then(Namespace::legacy),
         AuthMode::Bearer => {
-            bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+            bearer::verify(
+                &policy,
+                &state.tokens,
+                runtime.as_deref(),
+                oidc.as_ref(),
+                request.headers(),
+            )
+            .await
         }
         AuthMode::Merge => {
             if hmac::verify(&policy, request.headers()) {
                 Some(Namespace::legacy())
             } else {
-                bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+                bearer::verify(
+                    &policy,
+                    &state.tokens,
+                    runtime.as_deref(),
+                    oidc.as_ref(),
+                    request.headers(),
+                )
+                .await
             }
         }
     };

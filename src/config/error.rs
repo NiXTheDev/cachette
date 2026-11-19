@@ -130,6 +130,22 @@ pub enum ConfigError {
     )]
     OidcIssuerPlaintext { issuer: String },
 
+    /// An `[auth.runtime]` forge id is empty or contains the namespace
+    /// separator (`"<forge>|<tenant>"` would be ambiguous).
+    #[error(
+        "auth.runtime forge key {forge:?} must be non-empty and must not contain '|' (it is the \
+         forge half of the namespace)"
+    )]
+    RuntimeForgeKey { forge: String },
+
+    /// An enabled runtime block names no secret file.
+    #[error("auth.runtime forge {forge:?} is enabled but secret is not configured")]
+    RuntimeSecretMissing { forge: String },
+
+    /// An enabled runtime block has an empty tenant claim path.
+    #[error("auth.runtime forge {forge:?} has an empty tenant_claim")]
+    RuntimeTenantClaimMissing { forge: String },
+
     /// A tenant-yielding credential plane is enabled (`[auth.oidc]
     /// enabled = true`) together with the HMAC plane. Plane C's repo/run
     /// fields are client-asserted and cannot express a tenant, so an

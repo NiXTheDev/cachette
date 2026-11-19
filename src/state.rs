@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::auth::oidc::OidcVerifier;
+use crate::auth::runtime::{RuntimeVerifier, SharedRuntimeVerifier};
 use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
@@ -117,6 +118,11 @@ pub struct AppState {
     /// verifier behind [`OidcRuntime`]. Reload keeps whatever was installed
     /// and only warns on a changed config (restart required).
     pub oidc: Arc<RwLock<OidcRuntime>>,
+    /// Forge runtime-token verification (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3): the boot-installed verifier, if any.
+    /// Boot-time only, like the OIDC verifier - a SIGHUP reload never swaps
+    /// it. `None` keeps Plane B off.
+    pub runtime: Arc<RwLock<Option<SharedRuntimeVerifier>>>,
     /// Cache capacity + reservation knobs (plan task 19), shared so a SIGHUP
     /// reload (plan task 49) can refresh them live. Readers take a `Copy`
     /// snapshot through [`AppState::cache_limits`].
@@ -167,6 +173,7 @@ impl AppState {
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(RwLock::new(Arc::new(AuthPolicy::default()))),
             oidc: Arc::new(RwLock::new(OidcRuntime::default())),
+            runtime: Arc::new(RwLock::new(None)),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
             namespaces: Arc::new(std::collections::BTreeMap::new()),
             external_url: None,
@@ -221,6 +228,27 @@ impl AppState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .verifier
+            .clone()
+    }
+
+    /// Install the boot-built forge runtime-token verifier (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3). Called once at boot by
+    /// [`crate::auth::runtime::install`]; a SIGHUP reload never re-installs.
+    pub fn install_runtime(&self, verifier: RuntimeVerifier) {
+        *self
+            .runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(verifier));
+    }
+
+    /// The boot-installed runtime-token verifier, if any. `None` when no
+    /// `[auth.runtime]` block was enabled at boot - Plane B is then off.
+    /// Clones the `Arc` (atomic refcount bump, no lock held after).
+    #[must_use]
+    pub fn runtime(&self) -> Option<SharedRuntimeVerifier> {
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 

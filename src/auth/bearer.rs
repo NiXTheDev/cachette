@@ -4,11 +4,12 @@
 //! `[auth] tokens` list, currently registered in the dynamic `TokenStore`,
 //! a self-minted HS256 JWT whose signature verifies against `[auth].secret`
 //! (the `cachette token mint buildx-jwt` shape — the server holds the key it
-//! was signed with, so no registration is needed), or — v1.1, when an OIDC
-//! verifier was installed at boot — a conformant RS256 JWT from a configured
-//! IdP. Acceptance order: static, TokenStore, self-minted JWT, OIDC; the
-//! first hit authorizes. Comparison is constant-time; a database failure
-//! fails closed.
+//! was signed with, so no registration is needed), a forge runtime token
+//! (v1.2 Plane B, HS256 over a configured forge's signing secret), or —
+//! v1.1, when an OIDC verifier was installed at boot — a conformant RS256
+//! JWT from a configured IdP. Acceptance order: static, TokenStore,
+//! self-minted JWT, runtime, OIDC; the first hit authorizes. Comparison is
+//! constant-time; a database failure fails closed.
 
 use std::sync::Arc;
 
@@ -16,22 +17,27 @@ use axum::http::HeaderMap;
 
 use crate::auth::jwt::{JwtError, validate};
 use crate::auth::oidc::{OidcError, OidcVerifier};
+use crate::auth::runtime::{RuntimeError, RuntimeVerifier};
 use crate::auth::{AuthPolicy, Namespace, TokenStore, constant_time_eq, now_secs};
 
 /// Verify the request's bearer token against static tokens, the dynamic
-/// store, the self-minted JWT key, and (when installed) the OIDC verifier.
+/// store, the self-minted JWT key, a configured forge's runtime tokens, and
+/// (when installed) the OIDC verifier.
 ///
 /// Returns the namespace the accepted credential resolves to: an OIDC token
-/// yields `"<issuer>|<tenant>"` (`docs/shared-cache.md` §7), while the
-/// pre-v1.2 acceptance paths (static tokens, the store, cachette's own
-/// minted JWT) carry no tenant and resolve to the legacy namespace.
+/// yields `"<issuer>|<tenant>"` and a runtime token `"<forge>|<tenant>"`
+/// (`docs/shared-cache.md` §3/§7), while the pre-v1.2 acceptance paths
+/// (static tokens, the store, cachette's own minted JWT) carry no tenant and
+/// resolve to the legacy namespace.
 ///
-/// `oidc` is the boot-installed verifier (docs/oidc.md); `None` keeps the
-/// v1.0 acceptance paths minus the JWT step — a JWT-looking token is then
-/// just an unknown bearer and fails silently.
+/// `runtime` is the boot-installed Plane B verifier (`None` = off); `oidc`
+/// is the boot-installed verifier (docs/oidc.md). With both `None` only the
+/// v1.0 acceptance paths remain — a JWT-looking token is then just an
+/// unknown bearer and fails silently.
 pub async fn verify(
     policy: &AuthPolicy,
     tokens: &TokenStore,
+    runtime: Option<&RuntimeVerifier>,
     oidc: Option<&Arc<OidcVerifier>>,
     headers: &HeaderMap,
 ) -> Option<Namespace> {
@@ -67,6 +73,25 @@ pub async fn verify(
             // a client clock. Both are debug lines.
             Err(err) => {
                 tracing::debug!(stage = %err, "bearer token not accepted as a jwt");
+            }
+        }
+    }
+    // Plane B (v1.2, docs/shared-cache.md §3): a forge runtime token is an
+    // HS256 JWT signed with a configured forge's token secret. Tried ahead of
+    // Plane A so an HS256 token never reaches the RS256 verifier (which would
+    // only log an algorithm rejection). `Alg`/`Malformed` are the everyday
+    // "not a runtime token" outcomes (an OIDC RS256 token lands here too) and
+    // stay debug lines; a well-formed rejection is worth one warn.
+    if let Some(runtime) = runtime {
+        match runtime.verify(token, now_secs()) {
+            // The verified token yields its tenant: the namespace is the
+            // forge|tenant pair unless an admin mapping overrides it.
+            Ok(identity) => return Some(Namespace(identity.namespace())),
+            Err(RuntimeError::Alg | RuntimeError::Malformed) => {
+                tracing::debug!("bearer token not accepted as a runtime token");
+            }
+            Err(stage) => {
+                tracing::warn!(stage = %stage, "bearer token rejected by the runtime verifier");
             }
         }
     }

@@ -76,6 +76,12 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 | `v2.jwt_secret` | string | falls back to `auth.secret` | HS256 secret used to validate the Twirp JWT. |
 | `v2.jwt_ttl_seconds` | integer | `300` | TTL for the self-minted Twirp JWT. |
 
+`[auth.oidc."<issuer>"]` (see `docs/oidc.md`) and
+`[auth.runtime."<forge>"]` (see `docs/shared-cache.md` §3) are boot-only
+credential-plane tables. An enabled block of either is **tenant-yielding**,
+so the boot guard requires `auth.mode = "bearer"` and refuses
+`cluster.enabled` until the namespace-bearing peer wire lands.
+
 ### `[cluster]`
 
 | Key | Type | Default | Notes |
@@ -173,7 +179,7 @@ Reloadable at runtime:
   and `[server]` `max_chunk_bytes`.
 - `[log] level` — the active tracing filter is swapped in place.
 
-Boot-only (a reload logs them as ignored; restart to change):
+Boot-only (restart to change):
 
 - `[server]` `listen`, `external_url`, `tls_*`, `drain_grace_seconds` — the
   listener and identity are already bound.
@@ -182,6 +188,9 @@ Boot-only (a reload logs them as ignored; restart to change):
   timeouts and thresholds; the peer table, TLS pins, and mDNS task are live.
 - `[v2]` `jwt_secret` / `jwt_ttl_seconds` and `[v1]` / `[v2]` protocol shape —
   these are wired into the router at boot.
+- `[auth.oidc]` and `[auth.runtime]` — the credential-plane verifiers are
+  built at boot (`docs/oidc.md`, `docs/shared-cache.md` §3); a reloaded table
+  is not swapped in.
 
 A malformed or invalid file is rejected and the previously loaded configuration
 stays in effect (fail-closed); the failure is logged at `warn`.

@@ -186,6 +186,10 @@ pub struct AuthConfig {
     pub hmac_max_age_seconds: u64,
     /// OIDC RS256 bearer acceptance (v1.1); `None` = table absent = disabled.
     pub oidc: Option<OidcConfig>,
+    /// Forge runtime-token acceptance (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3): one block per forge, keyed by the forge
+    /// id. Empty = Plane B off.
+    pub runtime: BTreeMap<String, RuntimeForgeConfig>,
 }
 
 impl Default for AuthConfig {
@@ -196,6 +200,60 @@ impl Default for AuthConfig {
             tokens: Vec::new(),
             hmac_max_age_seconds: 600,
             oidc: None,
+            runtime: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[auth.runtime."<forge>"]` - the forge whose runtime tokens cachette
+/// verifies (v1.2 Plane B, `docs/shared-cache.md` §3). The forge id is the
+/// block key and becomes the forge half of `"<forge>|<tenant>"`.
+///
+/// ```toml
+/// [auth.runtime."https://hangar.nixthedev.ru"]
+/// enabled = true
+/// secret = "/etc/cachette/forgejo-token-secret"
+/// tenant_claim = "oidc_extra.repository"
+/// scopes = ["repo:NiXTheDev/*"]
+/// require = { "event_name" = "push" }
+/// leeway_seconds = 30
+/// ```
+///
+/// The secret is a FILE PATH: holding that key puts this deployment inside
+/// the forge's trust boundary, so it is provisioned like a key, not pasted
+/// into a shareable config.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeForgeConfig {
+    /// Master switch for this forge; a disabled block is inert.
+    pub enabled: bool,
+    /// Path to the forge's general token signing secret (trimmed; must be
+    /// non-empty).
+    pub secret: PathBuf,
+    /// Claim path whose VALUE is the tenant. Default
+    /// `oidc_extra.repository`, falling back to
+    /// `oidc_extra.repository_owner` when that is absent.
+    pub tenant_claim: String,
+    /// Optional `scp` allow-list: the token must carry at least one scope
+    /// entry matching one pattern (`*` matches any run of characters).
+    pub scopes: Vec<String>,
+    /// Optional claim pins, same semantics as the OIDC gate's `require`
+    /// (exact string or array membership). A bare key first matches a
+    /// top-level claim, then falls back into `oidc_extra`.
+    pub require: BTreeMap<String, String>,
+    /// Clock-skew leeway for `exp`/`nbf`.
+    pub leeway_seconds: u64,
+}
+
+impl Default for RuntimeForgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: PathBuf::new(),
+            tenant_claim: String::from("oidc_extra.repository"),
+            scopes: Vec::new(),
+            require: BTreeMap::new(),
+            leeway_seconds: 30,
         }
     }
 }

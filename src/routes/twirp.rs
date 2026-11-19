@@ -752,9 +752,10 @@ fn generate_cache_id(key: &str, version: &str) -> String {
 
 /// Bearer/JWT gate: static tokens first (all modes), then dynamic tokens
 /// (all modes), then the shared bearer chain in `bearer`/`merge` modes only
-/// (cachette's self-minted JWT, then - when installed - OIDC). Returns the
-/// namespace the accepted credential resolves to; twirp has no HMAC arm, so
-/// a request this gate accepts always carries a namespace.
+/// (cachette's self-minted JWT, then the configured forge runtime tokens,
+/// then - when installed - OIDC). Returns the namespace the accepted
+/// credential resolves to; twirp has no HMAC arm, so a request this gate
+/// accepts always carries a namespace.
 async fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Namespace> {
     let token = auth::bearer_token(headers)?;
     let policy = state.auth();
@@ -768,7 +769,14 @@ async fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Namespace> 
     match policy.mode {
         AuthMode::Hmac => None,
         AuthMode::Bearer | AuthMode::Merge => {
-            bearer::verify(&policy, &state.tokens, state.oidc().as_ref(), headers).await
+            bearer::verify(
+                &policy,
+                &state.tokens,
+                state.runtime().as_deref(),
+                state.oidc().as_ref(),
+                headers,
+            )
+            .await
         }
     }
 }
