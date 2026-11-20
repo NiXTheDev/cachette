@@ -18,11 +18,13 @@ pub(crate) use crate::config::validate::split_host_port;
 mod env;
 mod error;
 mod min_free;
+mod quotas;
 mod sections;
 mod validate;
 
 pub use error::ConfigError;
 pub use min_free::MinFree;
+pub use quotas::{Quotas, QuotasConfig};
 pub use sections::*;
 
 /// Name of the config file looked for inside [`default_config_dir`].

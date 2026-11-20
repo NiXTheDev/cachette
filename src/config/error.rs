@@ -93,6 +93,19 @@ pub enum ConfigError {
         "storage.namespaces key {key:?} must have the form \"<forge>|<tenant>\" with both halves non-empty"
     )]
     NamespaceMappingKey { key: String },
+    /// `[storage.quotas]` is present but names no `default` limit.
+    #[error("storage.quotas must define `default` when the table is present")]
+    QuotaDefaultMissing,
+    /// A `[storage.quotas]` limit is not a positive bytesize.
+    #[error(
+        "invalid storage.quotas limit for {key:?}: {value:?} (expected a positive bytesize such as \"20GiB\")"
+    )]
+    QuotaValue { key: String, value: String },
+    /// A `[storage.quotas]` rule key is not a namespace or tenant pattern.
+    #[error(
+        "storage.quotas key {key:?} must be \"<forge>|<tenant-pattern>\" or \"<tenant-pattern>\", both halves non-empty, with `*` only on the tenant side"
+    )]
+    QuotaRuleKey { key: String },
     #[error("auth.oidc is enabled but {field} must be configured")]
     OidcMissingRequired { field: &'static str },
 

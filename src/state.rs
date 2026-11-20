@@ -9,7 +9,7 @@ use crate::auth::runtime::{RuntimeVerifier, SharedRuntimeVerifier};
 use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
-use crate::config::{Config, KeyCase, MinFree, OidcConfig};
+use crate::config::{Config, KeyCase, MinFree, OidcConfig, Quotas};
 use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -132,6 +132,10 @@ pub struct AppState {
     /// Rollout contract: changing tenancy needs a restart); the default is
     /// empty, so every credential keeps its derived namespace.
     pub namespaces: Arc<std::collections::BTreeMap<String, String>>,
+    /// Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
+    /// §5). Boot-time wiring like the namespace mapping; the default has no
+    /// quotas, so every namespace is unlimited.
+    pub quotas: Arc<Quotas>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -176,6 +180,7 @@ impl AppState {
             runtime: Arc::new(RwLock::new(None)),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
             namespaces: Arc::new(std::collections::BTreeMap::new()),
+            quotas: Arc::new(Quotas::default()),
             external_url: None,
             relay: None,
             capacity_total: 0,
@@ -288,6 +293,13 @@ impl AppState {
             .get(&namespace.0)
             .map(|mapped| Namespace(mapped.clone()))
             .unwrap_or(namespace)
+    }
+
+    /// The byte limit of a RESOLVED namespace (v1.2 workstream F,
+    /// `docs/shared-cache.md` §5), or `None` when quotas are off.
+    #[must_use]
+    pub fn quota_for(&self, namespace: &str) -> Option<u64> {
+        self.quotas.limit_for(namespace)
     }
 
     /// Replace the live cache limits (boot + SIGHUP reload).

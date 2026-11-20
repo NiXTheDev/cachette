@@ -232,9 +232,9 @@ fn signed_find_hit(
 /// `POST /_apis/artifactcache/caches` — reserve a new entry.
 ///
 /// 200 `{"cacheId":<n>,"cacheSize":<n>}` where the `cacheId` is a positive
-/// numeric handle (GitHub's v1 contract) and `cacheSize =
-/// max(0, cache.max_size - used_bytes)`; 409 with the GitHub
-/// duplicate body when a finalized entry already holds `(key, version)`.
+/// numeric handle (GitHub's v1 contract) and `cacheSize` is the tenant's
+/// remaining budget: `max(0, cache.max_size - used_bytes)`, narrowed to the
+/// resolved namespace's quota window when `[storage.quotas]` sets one.
 pub async fn reserve(
     State(state): State<AppState>,
     Extension(namespace): Extension<Namespace>,
@@ -280,7 +280,27 @@ pub async fn reserve(
             );
         }
     }
-    let cache_size = limits.max_size.saturating_sub(used);
+    let cache_size = match state.quota_for(&namespace.0) {
+        // v1.2 workstream F (docs/shared-cache.md §5): a quota narrows the
+        // window a tenant sees, but never widens it past the admin's global
+        // max_size budget - the smaller of the two is what is left.
+        Some(quota) => {
+            let ns_used = match storage.namespace_bytes().await {
+                Ok(used) => used,
+                Err(err) => {
+                    tracing::error!(error = %err, "v1 reserve: namespace accounting failed");
+                    return ApiError::Internal.into_response();
+                }
+            };
+            let quota_left = quota.saturating_sub(ns_used);
+            if limits.max_size > 0 {
+                limits.max_size.saturating_sub(used).min(quota_left)
+            } else {
+                quota_left
+            }
+        }
+        None => limits.max_size.saturating_sub(used),
+    };
     // Cluster seam (plan tasks 30/31): when a relay is present (cluster mode),
     // placement picks the owner. A remote owner takes the reservation and the
     // client keeps A's `cacheId`; a self owner (or no peers yet) falls through

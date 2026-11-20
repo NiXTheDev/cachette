@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::min_free::MinFree;
+use crate::config::quotas::QuotasConfig;
 
 /// `[server]` - the main listener runners and clients enter through. It is
 /// plaintext HTTP unless `tls_cert`/`tls_key` are both set; peers have their
@@ -56,6 +57,10 @@ pub struct StorageConfig {
     /// `docs/shared-cache.md` §7): `"<forge>|<tenant>"` -> namespace name.
     /// A tenant not listed keeps its default `"<forge>|<tenant>"` namespace.
     pub namespaces: BTreeMap<String, String>,
+    /// Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
+    /// §5): a `default` plus exact and wildcard overrides. Absent or empty
+    /// means every namespace is unlimited.
+    pub quotas: QuotasConfig,
 }
 
 impl Default for StorageConfig {
@@ -65,6 +70,7 @@ impl Default for StorageConfig {
             fs: FsConfig::default(),
             cdc: CdcConfig::default(),
             namespaces: BTreeMap::new(),
+            quotas: QuotasConfig::default(),
         }
     }
 }

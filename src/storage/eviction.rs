@@ -16,10 +16,14 @@
 //!   entries holding an active [`LeaseSet`] borrow (in-flight downloads)
 //!   are skipped. `[cache] eviction` selects the order: `lru` =
 //!   `accessed_at` asc, `oldest` = `created_at` asc, `none` = never evict
-//!   (reserve-time admission simply refuses below the floor). Sweeps are
-//!   budgeted ([`DEFAULT_SWEEP_BUDGET`], 50ms) so they never block a
-//!   request path for long, and a sweep that cannot make progress
-//!   (everything leased) warns and returns instead of deadlocking.
+//!   (reserve-time admission simply refuses below the floor). With
+//!   `[storage.quotas]` configured, over-quota namespaces are swept first
+//!   (worst excess first, policy order within the namespace), then the
+//!   global floor across all namespaces (v1.2 workstream F,
+//!   `docs/shared-cache.md` §5). Sweeps are budgeted
+//!   ([`DEFAULT_SWEEP_BUDGET`], 50ms) so they never block a request path
+//!   for long, and a sweep that cannot make progress (everything leased)
+//!   warns and returns instead of deadlocking.
 //! - [`Reaper`]: periodic reservation TTL cleanup for the FS backend (plan
 //!   M4): rows with `reservation_expires_at < now` lose their parts and
 //!   row, and files older than [`ORPHAN_BLOB_GRACE`] (1h) are swept —
@@ -31,7 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::config::{Eviction, MinFree};
+use crate::config::{Eviction, MinFree, Quotas};
 
 use super::EntryStat;
 use super::StorageBackend;
@@ -265,6 +269,9 @@ pub enum SweepOutcome {
 pub struct SweepReport {
     /// Keys evicted, in eviction order.
     pub evicted: Vec<String>,
+    /// Bytes freed per namespace by the quota phase (empty when no
+    /// namespace was over its limit).
+    pub quota_freed: Vec<(String, u64)>,
     /// Sum of evicted entry sizes.
     pub bytes_freed: u64,
     /// Why the sweep stopped.
@@ -281,6 +288,9 @@ pub struct EvictionService {
     /// Optional metrics sink (plan task 35): when set, each evicted entry
     /// bumps `evictions_total`.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Optional per-namespace limits (v1.2 workstream F,
+    /// `docs/shared-cache.md` §5); the default enforces none.
+    quotas: Arc<Quotas>,
 }
 
 impl EvictionService {
@@ -293,6 +303,7 @@ impl EvictionService {
             leases,
             budget: DEFAULT_SWEEP_BUDGET,
             metrics: None,
+            quotas: Arc::new(Quotas::default()),
         }
     }
 
@@ -300,6 +311,15 @@ impl EvictionService {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach the per-namespace byte limits: over-quota namespaces are
+    /// swept before the global floor on every sweep (v1.2 workstream F,
+    /// `docs/shared-cache.md` §5).
+    #[must_use]
+    pub fn with_quotas(mut self, quotas: Arc<Quotas>) -> Self {
+        self.quotas = quotas;
         self
     }
 
@@ -317,11 +337,17 @@ impl EvictionService {
         &self.leases
     }
 
-    /// Evict finalized, unleased entries in policy order until `capacity`
-    /// no longer needs eviction (B3: `free >= min_free` and
-    /// `used <= max_size`), the budget runs out, or no candidates remain.
-    /// Never evicts staged or reserved-but-uncommitted rows (backends
-    /// only list finalized entries) nor leased ones.
+    /// Evict finalized, unleased entries until the per-namespace quotas
+    /// (when configured) and `capacity` are satisfied (B3: `free >=
+    /// min_free` and `used <= max_size`), the budget runs out, or no
+    /// candidates remain.
+    ///
+    /// Over-quota namespaces are swept FIRST, in worst-excess order, LRU
+    /// (or the configured policy order) within each namespace
+    /// (`docs/shared-cache.md` §5). The global pass follows, so the
+    /// admin's floor stays absolute and a greedy namespace cannot push the
+    /// disk below it. Never evicts staged or reserved-but-uncommitted rows
+    /// (backends only list finalized entries) nor leased ones.
     pub async fn sweep<S: StorageBackend + ?Sized>(
         &self,
         storage: &S,
@@ -329,9 +355,22 @@ impl EvictionService {
     ) -> std::io::Result<SweepReport> {
         let mut report = SweepReport {
             evicted: Vec::new(),
+            quota_freed: Vec::new(),
             bytes_freed: 0,
             outcome: SweepOutcome::FloorReached,
         };
+        // Quotas need eviction to be enforceable; `none` leaves them as
+        // advisory limits (the admin chose "never delete").
+        if self.policy != Eviction::None && self.quotas.is_configured() {
+            let unmet = self.sweep_quotas(storage, capacity, &mut report).await?;
+            if report.outcome == SweepOutcome::BudgetExhausted {
+                return Ok(report);
+            }
+            if unmet && !capacity.needs_eviction() {
+                report.outcome = SweepOutcome::NoEligibleCandidates;
+                return Ok(report);
+            }
+        }
         if !capacity.needs_eviction() {
             return Ok(report);
         }
@@ -340,13 +379,12 @@ impl EvictionService {
             report.outcome = SweepOutcome::Disabled;
             return Ok(report);
         }
-        let entries = storage.list().await?;
-        let candidates: Vec<&EntryStat> = eviction_order(self.policy, &entries)
-            .into_iter()
-            .filter(|entry| !self.leases.is_leased(&entry.key))
-            .collect();
+        // The global pass spans every namespace: a bare `list()` on the root
+        // view only sees the legacy `""` row set (docs/shared-cache.md §5:
+        // "then the global LRU across namespaces").
+        let candidates = self.global_candidates(storage).await?;
         let started = Instant::now();
-        for entry in candidates {
+        for (namespace, entry) in candidates {
             if !capacity.needs_eviction() {
                 break;
             }
@@ -354,7 +392,8 @@ impl EvictionService {
                 report.outcome = SweepOutcome::BudgetExhausted;
                 return Ok(report);
             }
-            storage.delete(&entry.key).await?;
+            let view = storage.scoped(&namespace);
+            view.delete(&entry.key).await?;
             capacity.note_evicted(entry.size);
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics.inc_evictions();
@@ -376,6 +415,113 @@ impl EvictionService {
             );
         }
         Ok(report)
+    }
+
+    /// The quota fairness pass: evict each over-quota namespace down to its
+    /// limit, worst excess first, before the global floor is considered.
+    /// Returns `true` when a namespace is still over its limit after the
+    /// pass (every candidate leased or missing).
+    async fn sweep_quotas<S: StorageBackend + ?Sized>(
+        &self,
+        storage: &S,
+        capacity: &mut Capacity,
+        report: &mut SweepReport,
+    ) -> std::io::Result<bool> {
+        let started = Instant::now();
+        let mut over: Vec<(String, u64, u64)> = storage
+            .usage_by_namespace()
+            .await?
+            .into_iter()
+            .filter_map(|(namespace, used)| {
+                let limit = self.quotas.limit_for(&namespace)?;
+                (used > limit).then_some((namespace, used, limit))
+            })
+            .collect();
+        if over.is_empty() {
+            return Ok(false);
+        }
+        // Worst excess first; namespace name is the deterministic tie-break.
+        over.sort_by(|a, b| (b.1 - b.2).cmp(&(a.1 - a.2)).then_with(|| a.0.cmp(&b.0)));
+        let mut unmet = false;
+        for (namespace, used, limit) in over {
+            // A scoped view reads and deletes exactly this namespace's
+            // rows; the key alone is not unique across namespaces.
+            let view = storage.scoped(&namespace);
+            let entries = view.list().await?;
+            let candidates: Vec<&EntryStat> = eviction_order(self.policy, &entries)
+                .into_iter()
+                .filter(|entry| !self.leases.is_leased(&entry.key))
+                .collect();
+            let mut remaining = used;
+            let mut freed = 0u64;
+            for entry in candidates {
+                if remaining <= limit {
+                    break;
+                }
+                if started.elapsed() >= self.budget {
+                    report.outcome = SweepOutcome::BudgetExhausted;
+                    return Ok(true);
+                }
+                view.delete(&entry.key).await?;
+                remaining = remaining.saturating_sub(entry.size);
+                freed += entry.size;
+                capacity.note_evicted(entry.size);
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.inc_evictions();
+                }
+                report.bytes_freed += entry.size;
+                report.evicted.push(entry.key.clone());
+            }
+            if freed > 0 {
+                report.quota_freed.push((namespace.clone(), freed));
+                tracing::info!(
+                    namespace = %namespace,
+                    freed,
+                    used = remaining,
+                    limit,
+                    "eviction swept an over-quota namespace"
+                );
+            }
+            if remaining > limit {
+                unmet = true;
+                tracing::warn!(
+                    namespace = %namespace,
+                    used = remaining,
+                    limit,
+                    "namespace quota unmet: every candidate is leased or missing"
+                );
+            }
+        }
+        Ok(unmet)
+    }
+
+    /// Eviction candidates from every namespace, unleased, in policy
+    /// order. The namespace is part of a row's identity, so it is the
+    /// first tie-break before the key.
+    async fn global_candidates<S: StorageBackend + ?Sized>(
+        &self,
+        storage: &S,
+    ) -> std::io::Result<Vec<(String, EntryStat)>> {
+        let mut entries = Vec::new();
+        for (namespace, _) in storage.usage_by_namespace().await? {
+            let view = storage.scoped(&namespace);
+            for entry in view.list().await? {
+                if !self.leases.is_leased(&entry.key) {
+                    entries.push((namespace.clone(), entry));
+                }
+            }
+        }
+        let order = |a: &EntryStat, b: &EntryStat| match self.policy {
+            Eviction::Lru => a.accessed_at.cmp(&b.accessed_at),
+            Eviction::Oldest => a.created_at.cmp(&b.created_at),
+            Eviction::None => std::cmp::Ordering::Equal,
+        };
+        entries.sort_by(|(ns_a, a), (ns_b, b)| {
+            order(a, b)
+                .then_with(|| ns_a.cmp(ns_b))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        Ok(entries)
     }
 
     /// Reserve-time admission (B3): when the request would sit below the
@@ -476,6 +622,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+    use crate::config::QuotasConfig;
     use crate::storage::ByteStream;
     use crate::storage::MemoryStorage;
 
@@ -841,6 +988,130 @@ mod tests {
         assert_eq!(report.evicted, vec!["a", "b"]);
         assert_eq!(capacity.used, 30);
         assert_eq!(report.outcome, SweepOutcome::FloorReached);
+    }
+
+    fn quotas(pairs: &[(&str, &str)]) -> Arc<Quotas> {
+        Arc::new(
+            QuotasConfig(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+            .parse()
+            .expect("valid quotas"),
+        )
+    }
+
+    /// `docs/shared-cache.md` §5: an over-quota namespace is swept down to
+    /// its limit first, policy order within the namespace, even when the
+    /// global floor is satisfied. Other namespaces are untouched.
+    #[tokio::test]
+    async fn sweep_evicts_an_over_quota_namespace_first() {
+        let storage = MemoryStorage::new();
+        let a = storage.scoped("forge|a");
+        let b = storage.scoped("forge|b");
+        for key in ["a1", "a2", "a3", "a4"] {
+            seed(&a, key, &[0_u8; 400]).await;
+        }
+        for key in ["b1", "b2"] {
+            seed(&b, key, &[0_u8; 400]).await;
+        }
+        // All entries share timestamps (same second), so the key tie-break
+        // fixes LRU order within the namespace: a1, then a2.
+        let service = EvictionService::new(Eviction::Lru, leases())
+            .with_quotas(quotas(&[("default", "10KiB"), ("forge|a", "1KiB")]));
+        let mut capacity = Capacity {
+            total: 10_000,
+            used: 2_400,
+            min_free: 0,
+            max_size: 0,
+        };
+        let report = service.sweep(&storage, &mut capacity).await.expect("sweep");
+        assert_eq!(report.evicted, vec!["a1", "a2"]);
+        assert_eq!(report.quota_freed, vec![(String::from("forge|a"), 800)]);
+        assert_eq!(report.bytes_freed, 800);
+        assert_eq!(report.outcome, SweepOutcome::FloorReached);
+        assert_eq!(capacity.used, 1_600);
+        let mut a_keys: Vec<String> = a
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        a_keys.sort();
+        assert_eq!(a_keys, vec!["a3", "a4"]);
+        assert_eq!(b.list().await.expect("list").len(), 2);
+    }
+
+    /// The quota fairness pass runs BEFORE the global floor: a namespace
+    /// over its limit is trimmed first, then the global LRU (across
+    /// namespaces) reclaims the rest.
+    #[tokio::test]
+    async fn quota_phase_runs_before_the_global_floor() {
+        let storage = MemoryStorage::new();
+        let a = storage.scoped("forge|a");
+        let b = storage.scoped("forge|b");
+        for key in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+            seed(&a, key, &[0_u8; 200]).await;
+        }
+        for key in ["b1", "b2"] {
+            seed(&b, key, &[0_u8; 200]).await;
+        }
+        let service = EvictionService::new(Eviction::Lru, leases())
+            .with_quotas(quotas(&[("default", "10KiB"), ("forge|a", "1KiB")]));
+        let mut capacity = Capacity {
+            total: 10_000,
+            used: 1_600,
+            min_free: 0,
+            max_size: 700,
+        };
+        let report = service.sweep(&storage, &mut capacity).await.expect("sweep");
+        // a1 first (quota: 1200 -> 1000), then the global pass takes
+        // a2..a5 (namespace tie-break before the key) until 600 <= 700.
+        assert_eq!(report.evicted, vec!["a1", "a2", "a3", "a4", "a5"]);
+        assert_eq!(report.quota_freed, vec![(String::from("forge|a"), 200)]);
+        assert_eq!(report.bytes_freed, 1_000);
+        assert_eq!(capacity.used, 600);
+        assert_eq!(report.outcome, SweepOutcome::FloorReached);
+        let a_keys: Vec<String> = a
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        assert_eq!(a_keys, vec!["a6"]);
+        assert_eq!(b.list().await.expect("list").len(), 2);
+    }
+
+    /// A lease pins an over-quota namespace's entries: the sweep warns and
+    /// reports no progress instead of deleting in-flight data.
+    #[tokio::test]
+    async fn leased_entries_keep_an_over_quota_namespace_over_its_limit() {
+        let storage = MemoryStorage::new();
+        let a = storage.scoped("forge|a");
+        for key in ["a1", "a2", "a3", "a4"] {
+            seed(&a, key, &[0_u8; 400]).await;
+        }
+        let shared = leases();
+        for key in ["a1", "a2", "a3", "a4"] {
+            shared.acquire(key);
+        }
+        let service = EvictionService::new(Eviction::Lru, shared)
+            .with_quotas(quotas(&[("default", "10KiB"), ("forge|a", "1KiB")]));
+        let mut capacity = Capacity {
+            total: 10_000,
+            used: 1_600,
+            min_free: 0,
+            max_size: 0,
+        };
+        let report = service.sweep(&storage, &mut capacity).await.expect("sweep");
+        assert!(report.evicted.is_empty());
+        assert_eq!(report.outcome, SweepOutcome::NoEligibleCandidates);
+        assert_eq!(capacity.used, 1_600);
+        assert_eq!(a.list().await.expect("list").len(), 4);
     }
 
     #[tokio::test]

@@ -1408,6 +1408,30 @@ impl StorageBackend for FsStorage {
         })
     }
 
+    fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
+        Box::pin(async move {
+            let conn = Arc::clone(&self.conn);
+            blocking(move || {
+                let conn = lock(&conn)?;
+                all_namespace_used_bytes(&conn)
+            })
+            .await
+        })
+    }
+
+    fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>> {
+        Box::pin(async move {
+            let conn = Arc::clone(&self.conn);
+            let namespace = self.namespace.clone();
+            blocking(move || {
+                let conn = lock(&conn)?;
+                let used = namespace_used_bytes(&conn, &namespace)?;
+                Ok(used.max(0) as u64)
+            })
+            .await
+        })
+    }
+
     fn reserve<'a>(
         &'a self,
         cache_id: &'a str,
@@ -2363,6 +2387,26 @@ fn namespace_used_bytes(conn: &Connection, namespace: &str) -> io::Result<i64> {
     .optional()
     .map_err(sql)
     .map(|used| used.unwrap_or(0))
+}
+
+/// The accounted bytes of every namespace, sorted by name (v1.2 workstream
+/// F, `docs/shared-cache.md` §5): the admin-wide usage view quotas and
+/// eviction read.
+fn all_namespace_used_bytes(conn: &Connection) -> io::Result<Vec<(String, u64)>> {
+    let mut stmt = conn
+        .prepare("SELECT namespace, used_bytes FROM accounting ORDER BY namespace")
+        .map_err(sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql)?;
+    let mut usage = Vec::new();
+    for row in rows {
+        let (namespace, used) = row.map_err(sql)?;
+        usage.push((namespace, used.max(0) as u64));
+    }
+    Ok(usage)
 }
 
 /// Set one namespace's accounted bytes, creating its row on demand.

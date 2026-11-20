@@ -14,7 +14,9 @@ use cachette::logging::{self};
 use cachette::routes;
 use cachette::state::{AppState, CacheLimits};
 use cachette::storage::StorageBackend;
-use cachette::storage::eviction::{Capacity, Reaper};
+use cachette::storage::eviction::{
+    Capacity, DEFAULT_BORROW_TTL, EvictionService, LeaseSet, Reaper,
+};
 use cachette::storage::fs::{BackfillStep, FsStorage};
 use cachette::tls::{self, PeerPins};
 use clap::Parser;
@@ -25,6 +27,11 @@ use tower_http::trace::TraceLayer;
 /// instead of pacing at `backfill_delay_ms` (one cheap `COUNT` per idle
 /// poll, not per conversion).
 const BACKFILL_IDLE: Duration = Duration::from_secs(30);
+
+/// Quota/floor eviction cadence (v1.2 workstream F, `docs/shared-cache.md`
+/// §5). Eviction never runs on the request path (B3); this is how often the
+/// background loop enforces the per-namespace limits and the global floor.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -153,6 +160,10 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // into a shared namespace resolves there; every other credential keeps
     // its derived namespace. Boot-time wiring, like the credential planes.
     state.namespaces = Arc::new(config.storage.namespaces.clone());
+    // Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
+    // §5): parsed once at boot, like the namespace mapping; validation has
+    // already proven the table parses, so this cannot fail late.
+    state.quotas = Arc::new(config.storage.quotas.parse()?);
     // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
     // enabled, build the JWKS cache + verifier and hang them on the state.
     // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
@@ -328,6 +339,62 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         }
     });
 
+    // Quota-aware eviction (v1.2 workstream F, `docs/shared-cache.md` §5):
+    // the reaper above reclaims abandoned uploads; this loop is what
+    // actually enforces the per-namespace limits and the global
+    // `min_free`/`max_size` floor - eviction stays off the request path
+    // (B3), where a below-floor reserve is only logged.
+    let eviction = EvictionService::new(
+        config.cache.eviction,
+        Arc::new(LeaseSet::new(DEFAULT_BORROW_TTL)),
+    )
+    .with_metrics(state.metrics.clone())
+    .with_quotas(state.quotas.clone());
+    let eviction_storage = storage.clone();
+    let eviction_metrics = state.metrics.clone();
+    let eviction_storage_ok = state.storage_ok.clone();
+    let eviction_min_free = config.storage.fs.min_free;
+    let eviction_max_size = config.cache.max_size;
+    let eviction_total = state.capacity_total;
+    let eviction_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(EVICTION_INTERVAL);
+        // The first tick is immediate; nothing has accrued between the
+        // startup reap and now, so skip it like the reaper loop does.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let used = match eviction_storage.used_bytes().await {
+                Ok(used) => used,
+                Err(err) => {
+                    eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(error = %err, "periodic eviction: usage accounting failed");
+                    continue;
+                }
+            };
+            let mut capacity =
+                Capacity::resolve(eviction_min_free, eviction_max_size, eviction_total, used);
+            match eviction.sweep(&*eviction_storage, &mut capacity).await {
+                Ok(report) => {
+                    eviction_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eviction_metrics.set_storage_used(capacity.used);
+                    if !report.evicted.is_empty() {
+                        tracing::info!(
+                            evicted = report.evicted.len(),
+                            bytes_freed = report.bytes_freed,
+                            quota_namespaces = report.quota_freed.len(),
+                            outcome = ?report.outcome,
+                            "periodic eviction reclaimed storage"
+                        );
+                    }
+                }
+                Err(err) => {
+                    eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(error = %err, "periodic eviction failed");
+                }
+            }
+        }
+    });
+
     // Whole->chunked backfill (v1.1 workstream B, docs/cdc.md Migration):
     // with `[storage.cdc] enabled = true` and `backfill` on (the default),
     // converge pre-CDC `whole` entries onto the chunked layout in the
@@ -498,6 +565,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // then drop the storage handle. SQLite runs in WAL mode with
     // `synchronous=NORMAL`, so the committed final sweep is durable.
     sweep_task.abort();
+    eviction_task.abort();
     if let Some(handle) = backfill_task {
         handle.abort();
     }

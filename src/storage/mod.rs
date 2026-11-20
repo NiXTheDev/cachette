@@ -305,6 +305,15 @@ pub trait StorageBackend: Send + Sync {
     /// count).
     fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>>;
 
+    /// Accounted bytes per namespace, sorted by namespace name (v1.2
+    /// workstream F, `docs/shared-cache.md` §5): the admin-wide view quota
+    /// eviction sweeps. Independent of the view this is called on.
+    fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>>;
+
+    /// Accounted bytes of THIS view's namespace only (quota math and the v1
+    /// `cacheSize` remaining-budget report).
+    fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>>;
+
     /// Stage an EMPTY reservation named `cache_id` that stays invisible to
     /// [`Self::stat`]/[`Self::list`]/[`Self::get_range`] until it is published
     /// by [`Self::commit_chunks`] (plan task 21), stamped with `expires_at`
@@ -633,13 +642,49 @@ impl StorageBackend for MemoryStorage {
     fn used_bytes<'a>(&'a self) -> BoxFuture<'a, io::Result<u64>> {
         Box::pin(async move {
             let state = self.inner.read().await;
+            // The TOTAL across namespaces, matching the FS backend: this is
+            // the whole-index budget the eviction floor and the storage gauge
+            // read, not one tenant's share.
             let total = state
+                .namespaces
+                .values()
+                .flat_map(|ns| ns.visible.values())
+                .map(|entry| entry.data.len() as u64)
+                .sum();
+            Ok(total)
+        })
+    }
+
+    fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
+        Box::pin(async move {
+            let state = self.inner.read().await;
+            let mut usage: Vec<(String, u64)> = state
+                .namespaces
+                .iter()
+                .map(|(namespace, ns)| {
+                    let bytes = ns
+                        .visible
+                        .values()
+                        .map(|entry| entry.data.len() as u64)
+                        .sum();
+                    (namespace.clone(), bytes)
+                })
+                .collect();
+            usage.sort_by(|(a, _), (b, _)| a.cmp(b));
+            Ok(usage)
+        })
+    }
+
+    fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>> {
+        Box::pin(async move {
+            let state = self.inner.read().await;
+            let bytes = state
                 .ns(&self.namespace)
                 .visible
                 .values()
                 .map(|entry| entry.data.len() as u64)
                 .sum();
-            Ok(total)
+            Ok(bytes)
         })
     }
 

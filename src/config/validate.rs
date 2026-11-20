@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::error::ConfigError;
-use crate::config::{AuthMode, Config, RuntimeForgeConfig};
+use crate::config::{AuthMode, Config, QuotasConfig, RuntimeForgeConfig};
 
 /// Split `host:port` (IPv6 literals bracketed: `[::1]:8080`).
 pub(crate) fn split_host_port(raw: &str) -> Option<(&str, u16)> {
@@ -55,6 +55,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::CertPathCollides);
     }
     validate_namespaces(&config.storage.namespaces)?;
+    validate_quotas(&config.storage.quotas)?;
     validate_oidc(config)?;
     validate_runtime(&config.auth.runtime)?;
     validate_tenancy(config)?;
@@ -76,6 +77,15 @@ fn validate_namespaces(namespaces: &BTreeMap<String, String>) -> Result<(), Conf
         }
     }
     Ok(())
+}
+
+/// `[storage.quotas]` rules (v1.2 workstream F, `docs/shared-cache.md` §5):
+/// a present table needs a positive `default`; every rule key must be a
+/// namespace or tenant-side pattern and every value a positive bytesize.
+/// Parsing is shared with the runtime rule set, so nothing validated here
+/// can fail at boot.
+fn validate_quotas(quotas: &QuotasConfig) -> Result<(), ConfigError> {
+    quotas.parse().map(|_| ())
 }
 
 /// `[auth.oidc]` wiring rules (v1.2 shape; docs/oidc.md §Config surface):
@@ -910,5 +920,61 @@ mod tests {
                 "unexpected error: {err:?}"
             );
         }
+    }
+
+    /// `[storage.quotas]` (`docs/shared-cache.md` §5): the table is off when
+    /// absent, but a present table needs a positive default and well-formed
+    /// rules. Parsing is shared with the runtime set, so the same errors
+    /// surface here.
+    #[test]
+    fn quota_rules_are_validated() {
+        assert!(validate(&Config::default()).is_ok());
+
+        let mut config = Config::default();
+        config.storage.quotas = QuotasConfig(
+            [
+                (String::from("default"), String::from("20GiB")),
+                (String::from("NiXTheDev/*"), String::from("5GiB")),
+                (
+                    String::from("https://github.com|octo-org/*"),
+                    String::from("5GiB"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(validate(&config).is_ok());
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("NiXTheDev/*"), String::from("5GiB"));
+        let err = validate(&config).expect_err("missing default");
+        assert!(matches!(err, ConfigError::QuotaDefaultMissing));
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("default"), String::from("20GiB"));
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("|broken"), String::from("5GiB"));
+        let err = validate(&config).expect_err("malformed rule key");
+        assert!(matches!(err, ConfigError::QuotaRuleKey { .. }));
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("default"), String::from("not-a-size"));
+        let err = validate(&config).expect_err("bad default limit");
+        assert!(matches!(err, ConfigError::QuotaValue { .. }));
     }
 }
