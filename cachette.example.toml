@@ -1,6 +1,8 @@
 # Canonical example configuration for cachette
-# This file documents all configuration options with their defaults.
-# Values shown are the built-in defaults unless otherwise noted.
+#
+# Every knob is listed here with its default. Optional keys are commented
+# out; uncomment and edit only what you need. The only mandatory key to serve
+# is [auth] secret.
 #
 # Default search locations (used when --config is NOT passed):
 #   *nix (Linux/BSD/macOS): /etc/cachette/cachette.toml
@@ -12,7 +14,7 @@
 
 [server]
 # Address and port to listen on (host:port). IPv6 literals: [::1]:8080
-listen = "0.0.0.0:8080"
+# listen = "0.0.0.0:8080"
 
 # Optional external URL advertised to clients (e.g. https://cache.example.com)
 # external_url = "https://cache.example.com"
@@ -21,25 +23,26 @@ listen = "0.0.0.0:8080"
 # listener; with both unset (the default) the listener is plain HTTP and the
 # edge terminates TLS. The cluster port always serves the self-signed identity.
 # tls_cert = "/etc/cachette/tls.crt"
-# tls_key  = "/etc/cachette/tls.key"
+# tls_key = "/etc/cachette/tls.key"
 
 # Largest single upload chunk / Azure block accepted, in bytes. Bounds the
 # memory one upload request can hold. Default 64 MiB (2x the largest chunk the
 # real go-actions-cache client sends).
-max_chunk_bytes = 67108864
+# max_chunk_bytes = 67108864
 
 # Graceful-shutdown drain window in seconds. On SIGTERM/SIGINT the node
 # advertises draining, refuses new uploads with 503 + Retry-After, keeps
 # serving in-flight requests, and exits after at most this long.
-drain_grace_seconds = 30
+# drain_grace_seconds = 30
 
 [storage]
 # Storage backend. Only "fs" is supported in v1.
-backend = "fs"
+# backend = "fs"
 
 [storage.fs]
-# Blob root directory
-path = "/var/lib/cachette"
+# Blob root directory. The SQLite index, dynamic-token store and node identity
+# live here too (v1.2); v1.3 separates them into [server] data_path.
+# path = "/var/lib/cachette"
 
 # Capacity model - read this together with [cache] max_size below:
 #   total    = cache.max_size when > 0, else the filesystem's total bytes
@@ -47,58 +50,106 @@ path = "/var/lib/cachette"
 # Eviction runs while free (= total - used) < min_free, so the usable window
 # is total - min_free. min_free is a RESERVE, not a second size limit.
 # Forms: fraction of total (0.2), percent ("20%"), or bytesize ("2GiB"/
-# "2GB", both 1024-based). Default: 0.2.
-min_free = 0.2
+# "2GB", both 1024-based).
+# min_free = 0.2
+
+# Content-defined chunking (opt-in). Changing `enabled` requires a restart.
+# Bounds: avg_chunk_bytes in [32768, 1048576], backfill_delay_ms > 0.
+# [storage.cdc]
+# enabled = false
+# avg_chunk_bytes = 131072
+# backfill = true
+# backfill_delay_ms = 100
+
+# Admin namespace mapping (boot-only). Exact "<forge>|<tenant>" -> namespace;
+# identities not named here keep the namespace derived from their credential.
+# [storage.namespaces]
+# "https://forge.example.org|owner/repo" = "shared-acme"
+
+# Per-namespace quotas (boot-only). A present table REQUIRES `default`;
+# exact or tenant-side wildcard rules override it. Bytesizes are 1024-based.
+# [storage.quotas]
+# default = "10GiB"
+# "owner/*" = "5GiB"
+# "https://forge.example.org|owner/repo" = "50GiB"
 
 [cache]
 # Hard ceiling for `total` above, in bytes, across all namespaces.
 # 0 = no configured ceiling: `total` comes from the filesystem instead.
 # Per-namespace [storage.quotas] limits can only narrow this window.
-max_size = 0
+# max_size = 0
 
 # Eviction policy: "lru", "oldest", or "none".
 # "none" never deletes; a reservation below the free-space floor is refused.
-eviction = "lru"
+# eviction = "lru"
 
 # Key normalization: "preserve" (GitHub parity - keys are case-sensitive) or
 # "lower" (Forgejo-style case-insensitive fold)
-key_case = "preserve"
+# key_case = "preserve"
 
 # Reservation TTL in seconds (must be > 0)
-reservation_ttl_seconds = 3600
+# reservation_ttl_seconds = 3600
 
 [auth]
 # Auth mode: "hmac", "bearer", or "merge" (both)
-mode = "merge"
+# mode = "merge"
 
-# Shared secret for HMAC/JWT (required to serve; min 16 chars).
-# Set via [auth] secret or CACHETTE__AUTH__SECRET. Unset allowed only for --print-config.
+# MANDATORY to serve: shared secret for HMAC and (by fallback) the Twirp JWT.
+# Minimum 16 characters. Set via [auth] secret or CACHETTE__AUTH__SECRET.
 secret = "CHANGE_ME_MIN_16_CHARS"
 
 # Static bearer tokens (optional). Empty list by default.
-tokens = []
+# tokens = []
 
 # Max age for HMAC signatures in seconds (0 = disabled)
-hmac_max_age_seconds = 600
+# hmac_max_age_seconds = 600
+
+# OIDC credential plane (boot-only). Default off. Each issuer is its own block;
+# an enabled issuer is tenant-yielding, so auth.mode must be "bearer" (NOT
+# "merge"). The v1.1 flat shape (audiences/require on this parent) is rejected.
+# [auth.oidc]
+# enabled = false
+# jwks_refresh_seconds = 1800
+# jwks_max_keys = 32
+# jwks_ca_pem = "/etc/ssl/certs/ca-certificates.crt"
+#
+# [auth.oidc."https://idp.example.org/realms/ci"]
+# audiences = ["cachette"]
+# jwks_url = "https://idp.example.org/realms/ci/protocol/openid-connect/certs"
+# tenant_claim = "repository"
+# require = { "groups" = "ci" }
+# leeway_seconds = 30
+# ca_pem = "/etc/ssl/certs/private-root.pem"
+
+# Forge runtime-token plane (boot-only, HS256). `secret` is a FILE PATH whose
+# trimmed contents are the shared secret; unreadable/empty is boot-fatal.
+# Also tenant-yielding: requires auth.mode = "bearer" when enabled.
+# [auth.runtime."https://forge.example.org"]
+# enabled = false
+# secret = "/etc/cachette/forge-token.secret"
+# tenant_claim = "oidc_extra.repository"
+# scopes = ["repo:owner/*"]
+# require = { "event_name" = "push" }
+# leeway_seconds = 30
 
 [v1]
-# Signed URL TTL for v1 artifactcache in seconds
-signed_url_ttl_seconds = 900
+# Signed URL TTL for v1 artifactcache in seconds (also governs v2 capability URLs)
+# signed_url_ttl_seconds = 900
 
 [v2]
 # JWT secret for Twirp v2 (falls back to [auth] secret if unset)
-jwt_secret = "CHANGE_ME_MIN_16_CHARS"
+# jwt_secret = "CHANGE_ME_MIN_16_CHARS"
 
 # JWT TTL in seconds
-jwt_ttl_seconds = 300
+# jwt_ttl_seconds = 300
 
 [cluster]
 # Enable peer-to-peer clustering (standalone if false)
-enabled = false
+# enabled = false
 
 # Dedicated mTLS listener for peer traffic (host:port). Only bound when
 # `enabled = true`; always TLS with the self-signed node identity cert.
-listen = "0.0.0.0:8081"
+# listen = "0.0.0.0:8081"
 
 # Node ID (optional; generated if unset)
 # node_id = "cache-a"
@@ -107,32 +158,32 @@ listen = "0.0.0.0:8081"
 # advertise_addr = "cache-a:8081"
 
 # Enable mDNS discovery
-mdns = true
+# mdns = true
 
 # Seed peer addresses (host:port)
-seeds = []
+# seeds = []
 
 # Seed peer fingerprints (node_id -> hex fingerprint)
-seed_fingerprints = {}
+# seed_fingerprints = {}
 
 # Tie-breaker when equally least-loaded: "random", "roundrobin", or "progressive"
-tiebreak = "random"
+# tiebreak = "random"
 
 # Path to node identity/cert (defaults to <storage.fs.path>/identity if unset)
 # cert_path = "/var/lib/cachette/identity"
 
 # Heartbeat interval in seconds
-heartbeat_interval_seconds = 5
+# heartbeat_interval_seconds = 5
 
 # Peer timeout in seconds
-peer_timeout_seconds = 15
+# peer_timeout_seconds = 15
 
 [log]
 # Log level: "trace", "debug", "info", "warn", or "error"
-level = "info"
+# level = "info"
 
 # Log format: "text" or "json"
-format = "text"
+# format = "text"
 
 # Optional. When set, cachette writes its own log file here (parent
 # directories are created, the file is appended to) instead of stderr.
