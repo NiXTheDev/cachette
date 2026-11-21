@@ -44,6 +44,7 @@ on the main listener.
 | `storage.backend` | `fs` | `fs` | The filesystem backend is the only one in this release. |
 | `storage.fs.path` | path | `"/var/lib/cachette"` | Blob root. The SQLite index and the default identity directory live here. |
 | `storage.fs.min_free` | fraction / percent / bytesize | `0.2` | Free-space floor before eviction triggers. |
+| `storage.namespaces` | map `"<forge>\|<tenant>"` -> namespace | `{}` | Admin mapping applied when a credential resolves its namespace. An exact match replaces the derived name; other identities keep it. Boot-only. See [shared-cache.md](shared-cache.md#7-many-forges-one-cache). |
 | `storage.quotas` | table of bytesizes | unset | Per-namespace byte limits. Absent means every namespace is unlimited; a present table requires a `default` and accepts exact (`"<forge>\|<tenant>"`) and wildcard (`"<tenant-pattern>"`, `"<forge>\|<tenant-pattern>"`) overrides. See [shared-cache.md](shared-cache.md#5-quotas-and-eviction-fairness). |
 
 `min_free` accepts three forms:
