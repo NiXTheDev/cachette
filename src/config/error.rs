@@ -171,15 +171,6 @@ pub enum ConfigError {
     )]
     HmacInMultiTenant { mode: &'static str },
 
-    /// A tenant-yielding credential plane is enabled with `cluster.enabled`.
-    /// The peer wire does not carry namespaces yet (§8), so a peer would
-    /// relay and store namespaced rows as legacy ones.
-    #[error(
-        "cluster.enabled with a tenant-yielding credential plane ([auth.oidc] enabled) is not \
-         supported yet: the peer wire does not carry namespaces (docs/shared-cache.md §8)"
-    )]
-    ClusterInMultiTenant,
-
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.
     #[error("internal config serialization error: {0}")]

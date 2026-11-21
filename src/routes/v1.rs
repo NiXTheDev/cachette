@@ -155,14 +155,14 @@ pub async fn find(
     let Some(relay) = state.relay.as_deref() else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    let hits = relay.find(&keys, &version).await;
+    let hits = relay.find(&keys, &version, &namespace.0).await;
     match relay::best_hit(&hits, &keys, state.cache_limits().key_case) {
         Some(hit) => {
             let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
             tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
-            // Peer rows are the legacy namespace until the cluster-wire slice
-            // carries namespaces (§8), so their URLs bind nothing.
-            signed_find_hit(&state, &base, &Namespace::legacy(), &hit.key)
+            // The owner answered from the namespace carried on the wire (§8),
+            // so the minted URL binds that same namespace.
+            signed_find_hit(&state, &base, &namespace, &hit.key)
         }
         None => {
             tracing::warn!(
@@ -307,7 +307,10 @@ pub async fn reserve(
     // to the local single-node reservation below.
     if let Some(relay) = state.relay.as_deref() {
         let client_cache_id = generate_cache_id(&key, &request.version);
-        match relay.reserve(client_cache_id, &key, &request.version).await {
+        match relay
+            .reserve(client_cache_id, &namespace.0, &key, &request.version)
+            .await
+        {
             RelayReserve::Local => {
                 state.metrics.observe_relay_hops(0);
             }

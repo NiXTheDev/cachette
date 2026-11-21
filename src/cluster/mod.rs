@@ -30,6 +30,20 @@ use crate::identity::Identity;
 
 pub use seeds::{Seed, parse_seeds};
 
+/// Peer wire protocol version (`docs/shared-cache.md` §8).
+///
+/// Every peer request declares this version in [`PEER_PROTOCOL_HEADER`], and
+/// the receiving node refuses a missing or different version with
+/// `426 Upgrade Required` before touching storage. Version 2 carries the
+/// resolved storage namespace on every key-bearing peer request, so a
+/// mixed-version cluster drains to "no healthy peer" instead of silently
+/// merging one tenant's rows into another's.
+pub const PEER_PROTOCOL_VERSION: u32 = 2;
+
+/// The header every peer request carries: the sender's
+/// [`PEER_PROTOCOL_VERSION`].
+pub const PEER_PROTOCOL_HEADER: &str = "x-cachette-peer-protocol";
+
 /// One cluster peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerRecord {

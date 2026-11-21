@@ -80,8 +80,9 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 `[auth.oidc."<issuer>"]` (see `docs/oidc.md`) and
 `[auth.runtime."<forge>"]` (see `docs/shared-cache.md` §3) are boot-only
 credential-plane tables. An enabled block of either is **tenant-yielding**,
-so the boot guard requires `auth.mode = "bearer"` and refuses
-`cluster.enabled` until the namespace-bearing peer wire lands.
+so the boot guard requires `auth.mode = "bearer"`. Cluster mode is allowed:
+peers carry the namespace on the wire and a mixed protocol version is
+refused (`docs/shared-cache.md` §8).
 
 ### `[cluster]`
 

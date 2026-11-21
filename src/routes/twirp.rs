@@ -256,7 +256,7 @@ async fn create_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]
             Some(owner) if !relay.is_self_node(&owner) => {
                 let cache_id = generate_cache_id(&key, &request.version);
                 return match relay
-                    .v2_reserve(&owner, &cache_id, &key, &request.version)
+                    .v2_reserve(&owner, &cache_id, &key, &request.version, &namespace.0)
                     .await
                 {
                     V2Reserve::Accepted { external_url } => {
@@ -443,7 +443,12 @@ async fn finalize_cache_entry(state: &AppState, namespace: &Namespace, body: &[u
     // the finalize out to the healthy owner(s) (plan task 32).
     if let Some(relay) = state.relay.as_deref() {
         match relay
-            .v2_finalize(&key, request.size_bytes, request.cache_id.as_deref())
+            .v2_finalize(
+                &namespace.0,
+                &key,
+                request.size_bytes,
+                request.cache_id.as_deref(),
+            )
             .await
         {
             V2Finalize::Ok => return Json(json!({"ok": true})).into_response(),
@@ -497,7 +502,7 @@ async fn supersede_cache_entry(state: &AppState, namespace: &Namespace, body: &[
     };
     let key = normalize_key(&request.key, state.cache_limits().key_case);
     if let Some(relay) = state.relay.as_deref() {
-        relay.v2_supersede(&key).await;
+        relay.v2_supersede(&namespace.0, &key).await;
         return Json(json!({"ok": true})).into_response();
     }
     if let Err(err) = storage.delete(&key).await {
@@ -602,7 +607,9 @@ async fn get_cache_entry_download_url(
     // Local miss: fan out to owners (plan task 32). Only queries peers, never
     // proxies the download body.
     if let Some(relay) = state.relay.as_deref() {
-        let hits = relay.find(&lookup_keys, &request.version).await;
+        let hits = relay
+            .find(&lookup_keys, &request.version, &namespace.0)
+            .await;
         if let Some(hit) = relay::best_hit(&hits, &lookup_keys, limits.key_case) {
             let matched_key = hit.key.clone();
             let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
@@ -616,10 +623,9 @@ async fn get_cache_entry_download_url(
                     super::signing_secret(&policy),
                     limits.signed_url_ttl_seconds,
                     auth::now_secs(),
-                    // The owner's rows are the legacy namespace until the
-                    // cluster-wire slice carries namespaces (§8); a URL for a
-                    // peer-held row binds nothing.
-                    "",
+                    // The owner answered from the namespace carried on the
+                    // wire (§8), so bind the URL to that same namespace.
+                    &namespace.0,
                 )
                 .query()
             );
@@ -697,7 +703,9 @@ async fn find_missing_or_stale_cache_entries(
             continue;
         }
         if let Some(relay) = state.relay.as_deref() {
-            let hits = relay.find(std::slice::from_ref(&key), &version).await;
+            let hits = relay
+                .find(std::slice::from_ref(&key), &version, &namespace.0)
+                .await;
             if let Some(hit) = relay::best_hit(&hits, std::slice::from_ref(&key), limits.key_case) {
                 cache_entries.push(json!({
                     "key": hit.key.clone(),

@@ -294,7 +294,8 @@ async fn request(
         .await
         .expect("TLS handshake");
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         x-cachette-peer-protocol: 2\r\nContent-Length: 0\r\n"
     );
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));

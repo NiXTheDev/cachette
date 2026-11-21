@@ -200,15 +200,17 @@ fn validate_runtime(runtime: &BTreeMap<String, RuntimeForgeConfig>) -> Result<()
     Ok(())
 }
 
-/// Multi-tenant boot guard (`docs/shared-cache.md` §2/§9 and §8). A
+/// Multi-tenant boot guard (`docs/shared-cache.md` §2/§9). A
 /// credential plane that yields a tenant makes the deployment
 /// multi-tenant: Plane A (`[auth.oidc] enabled`) and Plane B (any
-/// `[auth.runtime."<forge>"]` block enabled) both do. Then:
-/// - the HMAC plane must be off: its repo/run fields are client-asserted
-///   and cannot express a tenant, so `hmac`/`merge` would silently funnel
-///   every HMAC request into one shared namespace;
-/// - cluster mode must be off until the peer wire carries namespaces (§8):
-///   peers would relay and store namespaced rows as legacy ones.
+/// `[auth.runtime."<forge>"]` block enabled) both do. Then the HMAC plane
+/// must be off: its repo/run fields are client-asserted and cannot express a
+/// tenant, so `hmac`/`merge` would silently funnel every HMAC request into one
+/// shared namespace.
+///
+/// Cluster mode is allowed: the v1.2 peer wire (§8) carries the resolved
+/// namespace on every key-bearing request and refuses a peer of a different
+/// protocol version, so peers store exactly the rows they are told.
 ///
 /// No tenant-yielding plane means v1.1 behavior, which validates unchanged.
 /// Runs after [`validate_oidc`]/[`validate_runtime`] so a structural
@@ -220,14 +222,10 @@ fn validate_tenancy(config: &Config) -> Result<(), ConfigError> {
         return Ok(());
     }
     match config.auth.mode {
-        AuthMode::Bearer => {}
-        AuthMode::Hmac => return Err(ConfigError::HmacInMultiTenant { mode: "hmac" }),
-        AuthMode::Merge => return Err(ConfigError::HmacInMultiTenant { mode: "merge" }),
+        AuthMode::Bearer => Ok(()),
+        AuthMode::Hmac => Err(ConfigError::HmacInMultiTenant { mode: "hmac" }),
+        AuthMode::Merge => Err(ConfigError::HmacInMultiTenant { mode: "merge" }),
     }
-    if config.cluster.enabled {
-        return Err(ConfigError::ClusterInMultiTenant);
-    }
-    Ok(())
 }
 
 fn validate_listen(listen: &str) -> Result<(), ConfigError> {
@@ -613,18 +611,13 @@ mod tests {
         assert!(validate(&config).is_ok());
     }
 
-    /// `docs/shared-cache.md` §8: the peer wire does not carry namespaces
-    /// yet, so a tenant-yielding plane with cluster mode would relay and
-    /// store tenant rows as legacy ones.
+    /// `docs/shared-cache.md` §8: the namespace-bearing peer wire makes a
+    /// tenant-yielding plane with cluster mode a supported deployment.
     #[test]
-    fn tenant_yielding_plane_refuses_cluster_mode() {
+    fn tenant_yielding_plane_allows_cluster_mode() {
         let mut config = enabled_oidc();
         config.cluster.enabled = true;
-        let err = validate(&config).expect_err("cluster with OIDC");
-        assert!(
-            matches!(err, ConfigError::ClusterInMultiTenant),
-            "unexpected error: {err:?}"
-        );
+        assert!(validate(&config).is_ok(), "OIDC + cluster is supported");
 
         // Cluster mode alone (no tenant-yielding plane) is unchanged.
         let mut config = Config::default();
@@ -707,10 +700,9 @@ mod tests {
 
         config.auth.mode = AuthMode::Bearer;
         config.cluster.enabled = true;
-        let err = validate(&config).expect_err("cluster with Plane B");
         assert!(
-            matches!(err, ConfigError::ClusterInMultiTenant),
-            "unexpected error: {err:?}"
+            validate(&config).is_ok(),
+            "Plane B + cluster is a supported deployment"
         );
     }
 

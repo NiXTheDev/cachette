@@ -39,6 +39,12 @@
 //! * [`ClusterRelay::v2_finalize`] / [`ClusterRelay::v2_supersede`] broadcast
 //!   the corresponding v2 call to the healthy owners.
 //!
+//! v1.2 (§8): every peer request carries the RESOLVED namespace alongside the
+//! key, and declares `x-cachette-peer-protocol: 2`. The owner stores exactly
+//! the namespace A tells it — it never re-maps a tenant's rows — and refuses
+//! a missing/different version with `426 Upgrade Required` before the handler
+//! runs (hello/heartbeat included, so an old peer cannot refresh its health).
+//!
 //! **RAM-light (hard requirement):** the relay keeps no authoritative
 //! per-artifact state. Owner resolution is the durable peer fan-out above; the
 //! process-local [`ClusterRelay::owners`] / [`ClusterRelay::sessions`] maps are
@@ -68,6 +74,7 @@ use crate::cluster::PeerRecord;
 use crate::cluster::PeerTable;
 use crate::cluster::placement::Placement;
 use crate::cluster::tls_client;
+use crate::cluster::{PEER_PROTOCOL_HEADER, PEER_PROTOCOL_VERSION};
 use crate::config::{KeyCase, MinFree, split_host_port};
 use crate::storage::normalize_key;
 use crate::tls::PeerPins;
@@ -155,6 +162,10 @@ struct RelaySession {
     owner_cache_id: String,
     key: String,
     version: String,
+    /// Resolved storage namespace A applied for this request
+    /// (`docs/shared-cache.md` §8). B stores exactly this namespace; the
+    /// session carries it so chunks/commit do not need the client to repeat it.
+    namespace: String,
     state: RelayState,
     /// When the session was recorded; bounds its lifetime against
     /// `[cache] reservation_ttl_seconds` (RAM-light).
@@ -174,6 +185,8 @@ pub struct OwnerRecord {
     pub key: String,
     /// Protocol version marker.
     pub version: String,
+    /// Resolved storage namespace the row was published under (§8).
+    pub namespace: String,
     /// Verified blob size.
     pub size: u64,
 }
@@ -313,14 +326,15 @@ impl ClusterRelay {
         })
     }
 
-    /// The recorded owner for an artifact key once a relayed commit completed.
+    /// The recorded owner for a `(namespace, key)` once a relayed commit
+    /// completed.
     ///
     /// **Not load-bearing:** this is a bounded, process-local hint. Owner
     /// resolution on the request path is the durable [`Self::find`] fan-out, so
     /// this map being empty (fresh process) or evicted never hides an entry.
     #[must_use]
-    pub fn owner_for(&self, key: &str) -> Option<OwnerRecord> {
-        lock(&self.owners).get(key).cloned()
+    pub fn owner_for(&self, namespace: &str, key: &str) -> Option<OwnerRecord> {
+        lock(&self.owners).get(&owner_key(namespace, key)).cloned()
     }
 
     /// Whether `peer` is this node (a [`Self::owner_candidate`] outcome).
@@ -337,18 +351,19 @@ impl ClusterRelay {
         self.rank_candidates().into_iter().next()
     }
 
-    /// Fan out a `(keys, version)` lookup to every healthy peer (excluding
-    /// self), concurrently, under one [`FANOUT_TIMEOUT`] budget.
+    /// Fan out a `(keys, version, namespace)` lookup to every healthy peer
+    /// (excluding self), concurrently, under one [`FANOUT_TIMEOUT`] budget.
     ///
     /// Each peer answers with at most its single best match (it runs the same
-    /// exact-then-prefix [`crate::storage::lookup`] A would); a dead peer
-    /// contributes nothing. Callers pick the winner with [`best_hit`]. This is
-    /// the durable owner-resolution path — it needs no process-local state.
-    pub async fn find(&self, keys: &[String], version: &str) -> Vec<FindHit> {
+    /// exact-then-prefix [`crate::storage::lookup`] A would) from the
+    /// namespace A resolved; a dead peer contributes nothing. Callers pick the
+    /// winner with [`best_hit`]. This is the durable owner-resolution path — it
+    /// needs no process-local state.
+    pub async fn find(&self, keys: &[String], version: &str, namespace: &str) -> Vec<FindHit> {
         if keys.is_empty() {
             return Vec::new();
         }
-        let query = find_query(keys, version);
+        let query = find_query(keys, version, namespace);
         let responses = self.fanout("GET", &query, "", &[]).await;
         let mut hits = Vec::new();
         for (peer, outcome) in responses {
@@ -376,20 +391,22 @@ impl ClusterRelay {
         hits
     }
 
-    /// Stage a v2 reservation for `(key, version)` on `owner`, under the entry
-    /// `cache_id` A already minted. The owner's reply carries the base URL A
-    /// mints the capability URLs against.
+    /// Stage a v2 reservation for `(namespace, key, version)` on `owner`, under
+    /// the entry `cache_id` A already minted. The owner's reply carries the base
+    /// URL A mints the capability URLs against.
     pub async fn v2_reserve(
         &self,
         owner: &PeerRecord,
         cache_id: &str,
         key: &str,
         version: &str,
+        namespace: &str,
     ) -> V2Reserve {
         let body = serde_json::json!({
             "cache_id": cache_id,
             "key": key,
             "version": version,
+            "namespace": namespace,
         });
         let body = serde_json::to_vec(&body).expect("v2 reserve JSON is a fixed shape");
         match self
@@ -436,11 +453,13 @@ impl ClusterRelay {
         }
     }
 
-    /// Broadcast a v2 finalize to the healthy peers and collapse the answers:
-    /// any owner that published the entry wins (a dead owner cannot veto a live
-    /// one). A single mismatched size is reported only when nothing published.
+    /// Broadcast a v2 finalize for `(namespace, key)` to the healthy peers and
+    /// collapse the answers: any owner that published the entry wins (a dead
+    /// owner cannot veto a live one). A single mismatched size is reported only
+    /// when nothing published.
     pub async fn v2_finalize(
         &self,
+        namespace: &str,
         key: &str,
         size: Option<u64>,
         cache_id: Option<&str>,
@@ -449,6 +468,7 @@ impl ClusterRelay {
             "key": key,
             "size_bytes": size,
             "cache_id": cache_id,
+            "namespace": namespace,
         });
         let body = serde_json::to_vec(&body).expect("v2 finalize JSON is a fixed shape");
         let responses = self
@@ -477,10 +497,11 @@ impl ClusterRelay {
         }
     }
 
-    /// Broadcast a v2 supersede (delete) to the healthy peers. Best effort:
-    /// deletion is idempotent, so a dead owner is only a warning.
-    pub async fn v2_supersede(&self, key: &str) {
-        let body = serde_json::json!({ "key": key });
+    /// Broadcast a v2 supersede (delete) for `(namespace, key)` to the healthy
+    /// peers. Best effort: deletion is idempotent, so a dead owner is only a
+    /// warning.
+    pub async fn v2_supersede(&self, namespace: &str, key: &str) {
+        let body = serde_json::json!({ "key": key, "namespace": namespace });
         let body = serde_json::to_vec(&body).expect("v2 supersede JSON is a fixed shape");
         for (peer, outcome) in self
             .fanout("POST", V2_SUPERSEDE_PATH, "application/json", &body)
@@ -574,12 +595,19 @@ impl ClusterRelay {
             .collect()
     }
 
-    /// Reserve `(key, version)` on the least-loaded healthy owner.
+    /// Reserve `(namespace, key, version)` on the least-loaded healthy owner.
     ///
     /// `client_cache_id` is the numeric id already issued to the client; on a
-    /// remote accept it becomes the session key. See [`RelayReserve`] for the
-    /// caller's contract.
-    pub async fn reserve(&self, client_cache_id: u64, key: &str, version: &str) -> RelayReserve {
+    /// remote accept it becomes the session key. The resolved namespace rides
+    /// with the session so later chunks/commit never have to re-resolve it.
+    /// See [`RelayReserve`] for the caller's contract.
+    pub async fn reserve(
+        &self,
+        client_cache_id: u64,
+        namespace: &str,
+        key: &str,
+        version: &str,
+    ) -> RelayReserve {
         let candidates = self.rank_candidates();
         if candidates.is_empty() {
             // No peers at all (a lone cluster-enabled node with no heartbeat
@@ -596,7 +624,7 @@ impl ClusterRelay {
                 saw_unreachable = true;
                 continue;
             }
-            match self.remote_reserve(&peer, key, version).await {
+            match self.remote_reserve(&peer, namespace, key, version).await {
                 Ok(RemoteReserve::Accepted { cache_id }) => {
                     let session = RelaySession {
                         owner_node_id: peer.node_id.clone(),
@@ -604,6 +632,7 @@ impl ClusterRelay {
                         owner_cache_id: cache_id,
                         key: key.to_owned(),
                         version: version.to_owned(),
+                        namespace: namespace.to_owned(),
                         state: RelayState::Reserved,
                         created_at: Instant::now(),
                     };
@@ -640,7 +669,8 @@ impl ClusterRelay {
 
     /// Forward one chunk of `client_cache_id` to its owner.
     pub async fn upload(&self, client_cache_id: &str, offset: u64, bytes: &[u8]) -> RelayUpload {
-        let Some((addr, owner_cache_id, state)) = self.session_target(client_cache_id) else {
+        let Some((addr, owner_cache_id, namespace, state)) = self.session_target(client_cache_id)
+        else {
             return RelayUpload::NoSession;
         };
         match state {
@@ -650,7 +680,7 @@ impl ClusterRelay {
             RelayState::Failed => return RelayUpload::Unreachable,
             RelayState::Reserved => {}
         }
-        let path = format!("{UPLOAD_PATH_PREFIX}{owner_cache_id}?offset={offset}");
+        let path = upload_path(&owner_cache_id, offset, &namespace);
         match self
             .exchange(
                 &addr,
@@ -692,7 +722,11 @@ impl ClusterRelay {
             RelayState::Reserved => {}
         }
         let path = format!("{COMMIT_PATH_PREFIX}{}", session.owner_cache_id);
-        let body = serde_json::json!({ "size": size, "key": session.key });
+        let body = serde_json::json!({
+            "size": size,
+            "key": session.key,
+            "namespace": session.namespace,
+        });
         let body = serde_json::to_vec(&body).expect("commit JSON is a fixed shape");
         match self
             .exchange(
@@ -763,9 +797,17 @@ impl ClusterRelay {
         Some(session)
     }
 
-    fn session_target(&self, client_cache_id: &str) -> Option<(String, String, RelayState)> {
+    fn session_target(
+        &self,
+        client_cache_id: &str,
+    ) -> Option<(String, String, String, RelayState)> {
         let session = self.session(client_cache_id)?;
-        Some((session.owner_addr, session.owner_cache_id, session.state))
+        Some((
+            session.owner_addr,
+            session.owner_cache_id,
+            session.namespace,
+            session.state,
+        ))
     }
 
     fn mark_failed(&self, client_cache_id: &str) {
@@ -784,9 +826,10 @@ impl ClusterRelay {
                 cache_id: session.owner_cache_id.clone(),
                 key: session.key.clone(),
                 version: session.version.clone(),
+                namespace: session.namespace.clone(),
                 size,
             };
-            lock(&self.owners).insert(record.key.clone(), record);
+            lock(&self.owners).insert(owner_key(&record.namespace, &record.key), record);
         }
     }
 
@@ -794,10 +837,11 @@ impl ClusterRelay {
     async fn remote_reserve(
         &self,
         peer: &PeerRecord,
+        namespace: &str,
         key: &str,
         version: &str,
     ) -> io::Result<RemoteReserve> {
-        let body = serde_json::json!({ "key": key, "version": version });
+        let body = serde_json::json!({ "key": key, "version": version, "namespace": namespace });
         let body = serde_json::to_vec(&body).expect("reserve JSON is a fixed shape");
         let response = self
             .exchange(
@@ -905,7 +949,12 @@ async fn exchange_with(
             })?;
         // `Content-Type` is omitted when the caller passes an empty one (the
         // GET find fan-out sends no body), so no empty header value is emitted.
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        // Every peer request declares the wire version (§8): the receiving
+        // node refuses a missing/different one with 426 before handling it.
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+             {PEER_PROTOCOL_HEADER}: {PEER_PROTOCOL_VERSION}\r\n"
+        );
         if !content_type.is_empty() {
             head.push_str(&format!("Content-Type: {content_type}\r\n"));
         }
@@ -962,13 +1011,32 @@ impl FindBody {
     }
 }
 
-/// Build the `key=<csv>&version=<v>` query for a find fan-out (percent-encoded,
-/// so keys with reserved characters survive the round trip).
-fn find_query(keys: &[String], version: &str) -> String {
+/// Build the `key=<csv>&version=<v>&namespace=<ns>` query for a find fan-out
+/// (percent-encoded, so keys and namespaces with reserved characters survive
+/// the round trip).
+fn find_query(keys: &[String], version: &str, namespace: &str) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("key", &keys.join(","));
     serializer.append_pair("version", version);
+    serializer.append_pair("namespace", namespace);
     format!("{FIND_PATH}?{}", serializer.finish())
+}
+
+/// Build the upload path with percent-encoded `offset` and `namespace` query
+/// pairs. Kept as a **sync** helper: the form serializer is not `Send`, so it
+/// must never live inside the async relay future (axum's handler bound on the
+/// calling route requires that future to be `Send`).
+fn upload_path(cache_id: &str, offset: u64, namespace: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("offset", &offset.to_string());
+    query.append_pair("namespace", namespace);
+    format!("{UPLOAD_PATH_PREFIX}{cache_id}?{}", query.finish())
+}
+
+/// Process-local owner-hint map key: the namespace is part of the row
+/// identity, so two tenants publishing the same key must never share a hint.
+fn owner_key(namespace: &str, key: &str) -> String {
+    format!("{namespace}\u{1f}{key}")
 }
 
 /// Pick the best peer hit for a `(keys, version)` query, matching the
@@ -1207,17 +1275,29 @@ mod tests {
     }
 
     #[test]
-    fn find_query_percent_encodes_keys_and_version() {
+    fn find_query_percent_encodes_keys_and_namespace() {
         let keys = vec![String::from("linux node"), String::from("a/b")];
-        let query = find_query(&keys, "v1");
+        let query = find_query(&keys, "v1", "forge|tenant/one");
         assert!(query.starts_with(FIND_PATH), "route path: {query}");
         assert!(
             query.contains("key=linux+node%2Ca%2Fb") || query.contains("key=linux%20node%2Ca%2Fb"),
             "reserved characters survive the round trip: {query}"
         );
+        assert!(query.contains("&version=v1"), "version is carried: {query}");
         assert!(
-            query.ends_with("&version=v1"),
-            "version is carried: {query}"
+            query.contains("&namespace=forge%7Ctenant%2Fone"),
+            "namespace is percent-encoded: {query}"
+        );
+    }
+
+    #[test]
+    fn upload_path_percent_encodes_namespace() {
+        let path = upload_path("42", 7, "forge|tenant/x");
+        assert!(path.starts_with(UPLOAD_PATH_PREFIX), "route path: {path}");
+        assert!(path.contains("offset=7"), "offset is carried: {path}");
+        assert!(
+            path.contains("namespace=forge%7Ctenant%2Fx"),
+            "namespace is percent-encoded: {path}"
         );
     }
 

@@ -159,8 +159,8 @@ boot-fatal (a misconfigured trust root must never serve). Runtime tokens
 are tried before Plane A, so an HS256 token never reaches the RS256
 verifier and never logs an algorithm rejection. Like Plane A, an enabled
 runtime block is tenant-yielding, so the multi-tenant boot guard applies
-(§9): `auth.mode` must be `bearer`, and cluster mode is refused until the
-peer wire carries namespaces (§8).
+(§9): `auth.mode` must be `bearer`. Cluster mode is allowed: the peer wire
+carries the namespace (§8).
 
 Trust note, stated plainly: this secret can mint **any** runtime token, so a
 cachette holding it sits inside that forge's trust boundary - exactly like
@@ -316,15 +316,18 @@ because the two halves differ:
 ### 8. The cluster wire
 
 Namespaces travel with the key: the peer protocol's key-bearing requests
-grow a namespace field, and the protocol version is bumped so a mixed
+carry a namespace field, and the protocol version is bumped so a mixed
 cluster fails loudly instead of silently sharing one tenant's rows with
 another's. Peers relay and store the same namespaced rows; the namespace is
 part of the row identity everywhere, so a peer never has to know which
 namespace a request belongs to beyond carrying it.
 
-Until that wire lands, `cluster.enabled` together with a tenant-yielding
-credential plane is a boot error: a peer would relay and store namespaced
-rows as legacy ones, silently merging tenants.
+Every peer request declares the version on the wire
+(`x-cachette-peer-protocol`); a heartbeat, hello, or relay call from a peer
+with a missing or different version is refused with `426 Upgrade Required`
+and never refreshes the peer's health. A mixed cluster therefore drains to
+"no healthy peer" instead of merging namespaces: the old node sees the new
+one as unreachable, and the new node refuses the old one outright.
 
 ### 9. Failure modes
 
@@ -339,10 +342,9 @@ rows as legacy ones, silently merging tenants.
   fallback** - an unauthenticated request is a miss/error, never "the
   default tenant".
 - HMAC enabled together with multi-tenant mode: boot error.
-- Cluster mode enabled together with multi-tenant mode before the peer wire
-  carries namespaces (§8): boot error, same reason.
-- A cluster with peers of different protocol versions: refuse to join (the
-  existing version negotiation).
+- A cluster with peers of different protocol versions: refused per request
+  (`426 Upgrade Required`), so a mixed-version cluster never merges rows
+  (§8).
 
 ## What does NOT change
 
@@ -375,8 +377,9 @@ rows as legacy ones, silently merging tenants.
   the global `min_free` floor holds under a greedy writer.
 - **CDC:** the sweeper never touches another namespace's chunks; refs
   counting is namespace-scoped; a staged conversion is not swept.
-- **Cluster:** a mixed-version cluster refuses to form; a namespace survives a
-  relay hop unchanged.
+- **Cluster:** a mixed-version peer request is refused with `426 Upgrade
+  Required` and never refreshes health; a namespace survives a relay hop
+  unchanged (two tenants can hold the same key on one owner).
 - **Migration:** version 2 -> 3 adds the columns and backfills; a newer
   index refuses to boot; a lying version row is caught; a reboot is a no-op.
 

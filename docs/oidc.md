@@ -178,9 +178,9 @@ namespace. That makes the deployment multi-tenant by definition, so the
 HMAC plane cannot be enabled alongside it - HMAC's repo/run fields are
 client-asserted and cannot express a tenant. `auth.mode = "hmac"` or
 `"merge"` with `[auth.oidc] enabled = true` is therefore a boot-time
-error; use `auth.mode = "bearer"`. So is `cluster.enabled`: the peer wire
-does not carry namespaces yet (`docs/shared-cache.md` §8), so a peer would
-store this tenant's rows as legacy ones.
+error; use `auth.mode = "bearer"`. Cluster mode is allowed alongside it:
+the peer wire carries the namespace and refuses a peer of a different
+protocol version (`docs/shared-cache.md` §8).
 
 ## v1.2 amendments (2026-11-15)
 

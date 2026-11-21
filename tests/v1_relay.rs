@@ -208,6 +208,20 @@ async fn http(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> (u16, String) {
+    http_ex(addr, config, method, path, headers, body, Some("2")).await
+}
+
+/// Same exchange, but lets a test omit or override the wire-version header
+/// (`docs/shared-cache.md` §8) to exercise the 426 gate.
+async fn http_ex(
+    addr: SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    protocol: Option<&str>,
+) -> (u16, String) {
     let tcp = TcpStream::connect(addr).await.expect("tcp connect");
     let server_name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST).into());
     let mut stream: TlsStream<TcpStream> = TlsConnector::from(config)
@@ -220,6 +234,13 @@ async fn http(
     );
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(protocol) = protocol
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-cachette-peer-protocol"))
+    {
+        head.push_str(&format!("x-cachette-peer-protocol: {protocol}\r\n"));
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await.expect("write head");
@@ -346,7 +367,7 @@ async fn relay_reserves_uploads_and_commits_on_remote_owner() {
     assert_eq!(a_storage.used_bytes().await.expect("used"), 0);
 
     // A records the owner for the task-32 find fan-out.
-    let owner = relay.owner_for("relay-key").expect("owner recorded");
+    let owner = relay.owner_for("", "relay-key").expect("owner recorded");
     assert_eq!(owner.node_id, b.fingerprint());
     assert_eq!(owner.addr, b_addr.to_string());
     assert_eq!(owner.size, payload.len() as u64);
@@ -736,4 +757,144 @@ async fn owner_peer_reserve_refuses_below_the_floor_with_503() {
             .expect("reservation check"),
         "a refusal must not stage a reservation"
     );
+}
+
+/// `docs/shared-cache.md` §8: every peer request must declare the wire
+/// version, and the pin gate runs first (an unpinned caller gets 403 and
+/// never learns the version).
+#[tokio::test]
+async fn peer_routes_refuse_missing_or_mismatched_protocol_version() {
+    let root = TestDir::new();
+    let a = mint(root.path(), "a");
+    let rogue = mint(root.path(), "rogue");
+    let b = mint(root.path(), "b");
+
+    let b_storage = Arc::new(MemoryStorage::new());
+    let b_state = state_with(&b, &[&a], &b_storage, 10_000, MinFree::Fraction(0.0));
+    let (b_addr, _b_handle) = serve(b_state, &b).await;
+    let client = client_config(&b, Some(&a));
+
+    for protocol in [None, Some("1"), Some("999")] {
+        let (status, body) = http_ex(
+            b_addr,
+            client.clone(),
+            "POST",
+            "/_internal/peers/reserve",
+            &[("Content-Type", "application/json")],
+            br#"{"key":"proto","version":"v1"}"#,
+            protocol,
+        )
+        .await;
+        assert_eq!(status, 426, "protocol {protocol:?}: {body}");
+        assert!(
+            body.contains("peer protocol version mismatch"),
+            "upgrade body: {body}"
+        );
+    }
+
+    // Pin first, version second: an unpinned peer is refused even without a
+    // version header, so the gate does not advertise the wire version.
+    let unpinned = client_config(&b, Some(&rogue));
+    let (status, body) = http_ex(
+        b_addr,
+        unpinned,
+        "POST",
+        "/_internal/peers/reserve",
+        &[("Content-Type", "application/json")],
+        br#"{"key":"proto","version":"v1"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "pin gate must run first: {body}");
+    assert!(body.contains("peer auth required"), "pin body: {body}");
+}
+
+/// `docs/shared-cache.md` §8: the namespace travels with the key on every
+/// peer call. The owner stores exactly what A tells it, so the same key in
+/// two namespaces is two distinct rows and the legacy namespace stays empty.
+#[tokio::test]
+async fn peer_endpoints_store_the_namespace_carried_on_the_wire() {
+    let root = TestDir::new();
+    let a = mint(root.path(), "a");
+    let b = mint(root.path(), "b");
+
+    let b_storage = Arc::new(MemoryStorage::new());
+    let b_state = state_with(&b, &[&a], &b_storage, 10_000, MinFree::Fraction(0.0));
+    let (b_addr, _b_handle) = serve(b_state, &b).await;
+    let client = client_config(&b, Some(&a));
+
+    for (namespace, encoded, payload) in [
+        ("forge|a", "forge%7Ca", &b"tenant a payload"[..]),
+        ("forge|b", "forge%7Cb", &b"tenant b payload"[..]),
+    ] {
+        let reserve = format!(r#"{{"key":"shared-key","version":"v1","namespace":"{namespace}"}}"#);
+        let (status, body) = http(
+            b_addr,
+            client.clone(),
+            "POST",
+            "/_internal/peers/reserve",
+            &[("Content-Type", "application/json")],
+            reserve.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, 200, "reserve {namespace}: {body}");
+        let cache_id = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("reserve JSON")
+            .get("cacheId")
+            .and_then(serde_json::Value::as_u64)
+            .expect("cacheId is a number");
+
+        let path = format!("/_internal/peers/upload/{cache_id}?offset=0&namespace={encoded}");
+        let (status, body) = http(b_addr, client.clone(), "PUT", &path, &[], payload).await;
+        assert_eq!(status, 204, "upload {namespace}: {body}");
+
+        let commit = format!(
+            r#"{{"size":{},"key":"shared-key","namespace":"{namespace}"}}"#,
+            payload.len()
+        );
+        let (status, body) = http(
+            b_addr,
+            client.clone(),
+            "POST",
+            &format!("/_internal/peers/commit/{cache_id}"),
+            &[("Content-Type", "application/json")],
+            commit.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, 204, "commit {namespace}: {body}");
+    }
+
+    let stat_a = b_storage
+        .scoped("forge|a")
+        .stat("shared-key")
+        .await
+        .expect("stat A")
+        .expect("namespace A holds its own row");
+    let stat_b = b_storage
+        .scoped("forge|b")
+        .stat("shared-key")
+        .await
+        .expect("stat B")
+        .expect("namespace B holds its own row");
+    assert_eq!(stat_a.size, b"tenant a payload".len() as u64);
+    assert_eq!(stat_b.size, b"tenant b payload".len() as u64);
+    assert!(
+        b_storage
+            .stat("shared-key")
+            .await
+            .expect("legacy stat")
+            .is_none(),
+        "the legacy namespace stays empty"
+    );
+
+    // Find is namespaced too: only the matching tenant sees the hit.
+    for (encoded, expected) in [("forge%7Ca", 200), ("forge%7Cb", 200), ("", 204)] {
+        let path = if encoded.is_empty() {
+            String::from("/_internal/peers/find?key=shared-key&version=v1")
+        } else {
+            format!("/_internal/peers/find?key=shared-key&version=v1&namespace={encoded}")
+        };
+        let (status, body) = http(b_addr, client.clone(), "GET", &path, &[], &[]).await;
+        assert_eq!(status, expected, "find {encoded}: {body}");
+    }
 }
