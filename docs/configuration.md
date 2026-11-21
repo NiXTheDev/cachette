@@ -43,7 +43,7 @@ on the main listener.
 |---|---|---|---|
 | `storage.backend` | `fs` | `fs` | The filesystem backend is the only one in this release. |
 | `storage.fs.path` | path | `"/var/lib/cachette"` | Blob root. The SQLite index and the default identity directory live here. |
-| `storage.fs.min_free` | fraction / percent / bytesize | `0.2` | Free-space floor before eviction triggers. |
+| `storage.fs.min_free` | fraction / percent / bytesize | `0.2` | Share of `total` (see `[cache] max_size`) that must stay free; eviction runs while `total - used < min_free`. This is a reserve inside `total`, not a second size limit. |
 | `storage.namespaces` | map `"<forge>\|<tenant>"` -> namespace | `{}` | Admin mapping applied when a credential resolves its namespace. An exact match replaces the derived name; other identities keep it. Boot-only. See [shared-cache.md](shared-cache.md#7-many-forges-one-cache). |
 | `storage.quotas` | table of bytesizes | unset | Per-namespace byte limits. Absent means every namespace is unlimited; a present table requires a `default` and accepts exact (`"<forge>\|<tenant>"`) and wildcard (`"<tenant-pattern>"`, `"<forge>\|<tenant-pattern>"`) overrides. See [shared-cache.md](shared-cache.md#5-quotas-and-eviction-fairness). |
 
@@ -57,11 +57,16 @@ on the main listener.
 A bare word such as `min_free = "abc"` and an out-of-range fraction are
 rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 
+Together the two knobs define one capacity model: `total` is
+`cache.max_size` when set (otherwise the filesystem total), and `min_free`
+reserves part of it; eviction targets `free = total - used >= min_free`. In
+other words, the usable band is `total - min_free`.
+
 ### `[cache]`
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `max_size` | integer | `0` | Maximum cache size in bytes; `0` means unlimited (the disk total is used for capacity). |
+| `cache.max_size` | integer | `0` | Hard ceiling in bytes for `total`, across all namespaces. `0` means no configured ceiling, so the filesystem's total is used instead. Per-namespace `[storage.quotas]` can only narrow the resulting window. |
 | `eviction` | `lru` / `oldest` / `none` | `lru` | `lru` and `oldest` reclaim space down to the free-space floor; `none` refuses a new reservation when below the floor instead. |
 | `key_case` | `lower` / `preserve` | `preserve` | Key normalization before exact and prefix matching. |
 | `reservation_ttl_seconds` | integer | `3600` | Reservation lifetime; must be greater than `0`. Expired reservations and their partial chunk files are reaped. |
