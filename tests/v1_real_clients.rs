@@ -687,7 +687,14 @@ async fn run_scenarios() -> Result<Outcome, String> {
     // server answers 200 the signed URL alone authorizes the download; a 401
     // proves the global `require_auth` layer wrongly gates it.
     let artifact_path = format!("/_apis/artifactcache/artifacts/{TOOLKIT_KEY}");
-    let signed = urls::mint(&artifact_path, TOOLKIT_KEY, FIXTURE_SECRET, 600, now_secs());
+    let signed = urls::mint(
+        &artifact_path,
+        TOOLKIT_KEY,
+        FIXTURE_SECRET,
+        600,
+        now_secs(),
+        "",
+    );
     let unauth_artifact_probe = raw_get(addr, &format!("{artifact_path}{}", signed.query()));
 
     server.abort();

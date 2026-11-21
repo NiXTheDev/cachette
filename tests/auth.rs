@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use axum::routing::get;
+use axum::{Extension, Router};
 use cachette::auth::{self, AuthPolicy, TokenStore};
-use cachette::config::AuthMode;
+use cachette::config::{AuthMode, Config, RuntimeForgeConfig};
 use cachette::routes;
 use cachette::state::AppState;
 use hmac::{Hmac, KeyInit, Mac};
@@ -303,4 +303,108 @@ async fn register_requires_admin_auth() {
     let (status, body) = call(app, "POST", "/_internal/register?token=no-admin", &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
     assert!(body.contains("authentication required"), "body: {body}");
+}
+
+/// Mint an HS256 runtime token (the shape a forge signs with its general
+/// token signing secret).
+fn mint_runtime_token(secret: &str, claims: &str) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+/// v1.2 Plane B (`docs/shared-cache.md` §3): the boot installer reads each
+/// enabled forge's signing-secret file, and a runtime token accepted by the
+/// shared bearer chain resolves — through the real `require_auth` gate — to
+/// `"<forge>|<tenant>"`. A token signed by another key stays unauthorized,
+/// and an enabled block whose secret cannot be read is boot-fatal.
+#[tokio::test]
+async fn runtime_token_yields_its_forge_namespace() {
+    let root = TestDir::new();
+    let secret_path = root.path().join("forge-token-secret");
+    std::fs::write(&secret_path, "forge-signing-secret\n").expect("secret file");
+
+    let mut config = Config::default();
+    config.auth.mode = AuthMode::Bearer;
+    config.auth.runtime.insert(
+        String::from("https://forge.example.org"),
+        RuntimeForgeConfig {
+            enabled: true,
+            secret: secret_path,
+            ..RuntimeForgeConfig::default()
+        },
+    );
+
+    let state = AppState::new();
+    state.set_auth(AuthPolicy::from_config(&config));
+    cachette::auth::runtime::install(&state, &config).expect("runtime installs");
+    assert!(
+        state.runtime().is_some(),
+        "boot install hangs the verifier on the state"
+    );
+
+    // Echo the namespace the gate inserted: the middleware path is the one
+    // production requests take.
+    let app = Router::new()
+        .route(
+            "/_apis/artifactcache/cache",
+            get(|Extension(namespace): Extension<auth::Namespace>| async move { namespace.0 }),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .with_state(state);
+
+    let now = now_secs();
+    let claims = format!(
+        r#"{{"exp":{},"nbf":{},"scp":"repo:owner/cachette write:actions","oidc_extra":{{"repository":"owner/cachette"}}}}"#,
+        now + 600,
+        now - 10
+    );
+    let token = mint_runtime_token("forge-signing-secret", &claims);
+    let bearer = bearer_header(token);
+    let (status, body) = call(
+        app.clone(),
+        "GET",
+        "/_apis/artifactcache/cache",
+        &[("authorization", bearer.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, "https://forge.example.org|owner/cachette");
+
+    // Same claims, foreign key: not this forge's credential.
+    let foreign = bearer_header(mint_runtime_token("some-other-secret", &claims));
+    let (status, body) = call(
+        app,
+        "GET",
+        "/_apis/artifactcache/cache",
+        &[("authorization", foreign.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+
+    // Enabled block with an unreadable secret file: boot-fatal.
+    let mut broken = config;
+    broken
+        .auth
+        .runtime
+        .get_mut("https://forge.example.org")
+        .expect("runtime block")
+        .secret = root.path().join("absent-secret");
+    let state = AppState::new();
+    assert!(
+        cachette::auth::runtime::install(&state, &broken).is_err(),
+        "an unreadable signing secret must fail the boot"
+    );
 }

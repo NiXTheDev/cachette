@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::min_free::MinFree;
+use crate::config::quotas::QuotasConfig;
 
 /// `[server]` - the main listener runners and clients enter through. It is
 /// plaintext HTTP unless `tls_cert`/`tls_key` are both set; peers have their
@@ -52,6 +53,14 @@ pub struct StorageConfig {
     /// Finalize-time content-defined chunking (v1.1); `[storage.cdc]` may
     /// be absent entirely - everything defaults off.
     pub cdc: CdcConfig,
+    /// Admin namespace mappings (v1.2 workstream F,
+    /// `docs/shared-cache.md` §7): `"<forge>|<tenant>"` -> namespace name.
+    /// A tenant not listed keeps its default `"<forge>|<tenant>"` namespace.
+    pub namespaces: BTreeMap<String, String>,
+    /// Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
+    /// §5): a `default` plus exact and wildcard overrides. Absent or empty
+    /// means every namespace is unlimited.
+    pub quotas: QuotasConfig,
 }
 
 impl Default for StorageConfig {
@@ -60,6 +69,8 @@ impl Default for StorageConfig {
             backend: Backend::Fs,
             fs: FsConfig::default(),
             cdc: CdcConfig::default(),
+            namespaces: BTreeMap::new(),
+            quotas: QuotasConfig::default(),
         }
     }
 }
@@ -181,6 +192,10 @@ pub struct AuthConfig {
     pub hmac_max_age_seconds: u64,
     /// OIDC RS256 bearer acceptance (v1.1); `None` = table absent = disabled.
     pub oidc: Option<OidcConfig>,
+    /// Forge runtime-token acceptance (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3): one block per forge, keyed by the forge
+    /// id. Empty = Plane B off.
+    pub runtime: BTreeMap<String, RuntimeForgeConfig>,
 }
 
 impl Default for AuthConfig {
@@ -191,6 +206,60 @@ impl Default for AuthConfig {
             tokens: Vec::new(),
             hmac_max_age_seconds: 600,
             oidc: None,
+            runtime: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[auth.runtime."<forge>"]` - the forge whose runtime tokens cachette
+/// verifies (v1.2 Plane B, `docs/shared-cache.md` §3). The forge id is the
+/// block key and becomes the forge half of `"<forge>|<tenant>"`.
+///
+/// ```toml
+/// [auth.runtime."https://hangar.nixthedev.ru"]
+/// enabled = true
+/// secret = "/etc/cachette/forgejo-token-secret"
+/// tenant_claim = "oidc_extra.repository"
+/// scopes = ["repo:NiXTheDev/*"]
+/// require = { "event_name" = "push" }
+/// leeway_seconds = 30
+/// ```
+///
+/// The secret is a FILE PATH: holding that key puts this deployment inside
+/// the forge's trust boundary, so it is provisioned like a key, not pasted
+/// into a shareable config.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeForgeConfig {
+    /// Master switch for this forge; a disabled block is inert.
+    pub enabled: bool,
+    /// Path to the forge's general token signing secret (trimmed; must be
+    /// non-empty).
+    pub secret: PathBuf,
+    /// Claim path whose VALUE is the tenant. Default
+    /// `oidc_extra.repository`, falling back to
+    /// `oidc_extra.repository_owner` when that is absent.
+    pub tenant_claim: String,
+    /// Optional `scp` allow-list: the token must carry at least one scope
+    /// entry matching one pattern (`*` matches any run of characters).
+    pub scopes: Vec<String>,
+    /// Optional claim pins, same semantics as the OIDC gate's `require`
+    /// (exact string or array membership). A bare key first matches a
+    /// top-level claim, then falls back into `oidc_extra`.
+    pub require: BTreeMap<String, String>,
+    /// Clock-skew leeway for `exp`/`nbf`.
+    pub leeway_seconds: u64,
+}
+
+impl Default for RuntimeForgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: PathBuf::new(),
+            tenant_claim: String::from("oidc_extra.repository"),
+            scopes: Vec::new(),
+            require: BTreeMap::new(),
+            leeway_seconds: 30,
         }
     }
 }
@@ -207,44 +276,133 @@ pub enum AuthMode {
 /// `[auth.oidc]` - OIDC RS256 bearer acceptance (v1.1 workstream A;
 /// docs/oidc.md is the contract). Entirely default-off: omitting the table
 /// (or leaving `enabled = false`) leaves v1.0 behavior byte-identical.
+///
+/// v1.2 shape: the parent table carries the global knobs, and each
+/// **issuer** is its own block:
+///
+/// ```toml
+/// [auth.oidc]
+/// enabled = true
+/// jwks_refresh_seconds = 1800
+/// jwks_max_keys = 32
+/// jwks_ca_pem = "/etc/ssl/certs/ca-certificates.crt"
+///
+/// [auth.oidc."https://idp.example.org/realms/ci"]
+/// audiences = ["cachette"]
+/// jwks_url = "https://idp.example.org/realms/ci/protocol/openid-connect/certs"
+/// tenant_claim = "repository"
+/// require = { "groups" = "ci" }
+/// leeway_seconds = 30
+/// ca_pem = "/etc/ssl/certs/private-root.pem"
+/// ```
+///
+/// The v1.1 flat shape (`issuers` / `audiences` / `jwks_urls` / `require`
+/// on the parent) is gone: audiences and claim pins are per-issuer, because
+/// one deployment routinely trusts several IdPs whose audiences and pins
+/// have nothing to do with each other.
+///
+/// `#[serde(flatten)]` cannot be combined with `deny_unknown_fields`
+/// (serde rejects the combination), so the parent drops that attribute -
+/// but a mistyped *global* key still fails loudly: it lands in the issuer
+/// map and cannot deserialize as an issuer block. The per-issuer struct
+/// keeps `deny_unknown_fields`, so an unknown key *inside* a block is
+/// rejected too.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct OidcConfig {
+    /// Master switch; the whole table is inert when false.
     pub enabled: bool,
-    /// IdPs whose tokens are accepted; required when `enabled`.
-    pub issuers: Vec<String>,
-    /// `aud` values a token may state (any of); required when `enabled`.
-    pub audiences: Vec<String>,
-    /// `issuer -> explicit JWKS URL` override; the default endpoint is
-    /// `{issuer}/.well-known/jwks.json` (docs/oidc.md §JWKS handling).
-    pub jwks_urls: BTreeMap<String, String>,
-    /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
-    /// Array-valued claims authorize when they contain the value.
-    pub require: BTreeMap<String, String>,
-    /// Clock skew tolerated on `exp`/`nbf` (seconds).
-    pub leeway_seconds: u64,
     /// Periodic JWKS re-fetch interval (lazy unknown-kid refresh happens
     /// regardless); 0 is rejected by `config::validate`.
     pub jwks_refresh_seconds: u64,
     /// Hard cap on cached keys server-wide (rotation-flooding guard).
     pub jwks_max_keys: usize,
-    /// PEM bundle serving as the JWKS fetcher's trust roots (self-hosted
-    /// IdPs commonly need it); required when `enabled`.
+    /// Default trust roots for the JWKS fetch (a per-issuer `ca_pem`
+    /// overrides this for a private-CA issuer).
     pub jwks_ca_pem: Option<PathBuf>,
+    /// Per-issuer blocks, keyed by the issuer string (the exact `iss`
+    /// claim the tokens carry). Last field on purpose: with `flatten` the
+    /// map's tables must be emitted after the parent's own values (TOML
+    /// requires values before tables).
+    #[serde(flatten)]
+    pub issuers: BTreeMap<String, OidcIssuerConfig>,
+
+    // ---- the v1.1 flat shape, accepted ONLY to fail precisely ----
+    //
+    // v1.2 moved `issuers` / `audiences` / `jwks_urls` / `require` /
+    // `leeway_seconds` into per-issuer blocks. Without these fields a
+    // v1.1 config would fail with a serde type error ("invalid type:
+    // sequence, expected struct OidcIssuerConfig") that says nothing about
+    // the new form; with them the validation layer can name it. They are
+    // never read for anything else and never serialized back.
+    #[serde(rename = "issuers", default, skip_serializing)]
+    pub legacy_issuers: Option<Vec<String>>,
+    #[serde(rename = "audiences", default, skip_serializing)]
+    pub legacy_audiences: Option<Vec<String>>,
+    #[serde(rename = "jwks_urls", default, skip_serializing)]
+    pub legacy_jwks_urls: Option<BTreeMap<String, String>>,
+    #[serde(rename = "require", default, skip_serializing)]
+    pub legacy_require: Option<BTreeMap<String, String>>,
+    #[serde(rename = "leeway_seconds", default, skip_serializing)]
+    pub legacy_leeway_seconds: Option<u64>,
+}
+
+/// One configured OIDC issuer (v1.2 shape: `[auth.oidc."<issuer>"]`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcIssuerConfig {
+    /// `aud` values a token may state (any of); required.
+    pub audiences: Vec<String>,
+    /// Explicit JWKS URL; the default endpoint is derived as
+    /// `{issuer}/.well-known/jwks.json` (docs/oidc.md §JWKS handling).
+    pub jwks_url: Option<String>,
+    /// Claim whose VALUE is the tenant of this issuer's tokens
+    /// (`docs/shared-cache.md` §7): the namespace becomes
+    /// `"<issuer>|<tenant>"` unless an admin mapping overrides it. Defaults
+    /// to `repository`; a token without this claim is rejected in
+    /// multi-tenant use, never defaulted.
+    #[serde(default = "default_tenant_claim")]
+    pub tenant_claim: String,
+    /// Optional claim -> exact-value pin (`repository = "owner/repo"`).
+    /// Array-valued claims authorize when they contain the value.
+    pub require: BTreeMap<String, String>,
+    /// Clock skew tolerated on `exp`/`nbf` (seconds) for this issuer.
+    pub leeway_seconds: u64,
+    /// Trust roots for this issuer's JWKS fetch; overrides
+    /// `[auth.oidc] jwks_ca_pem`.
+    pub ca_pem: Option<PathBuf>,
+}
+
+fn default_tenant_claim() -> String {
+    String::from("repository")
+}
+
+impl Default for OidcIssuerConfig {
+    fn default() -> Self {
+        Self {
+            audiences: Vec::new(),
+            jwks_url: None,
+            tenant_claim: default_tenant_claim(),
+            require: BTreeMap::new(),
+            leeway_seconds: 30,
+            ca_pem: None,
+        }
+    }
 }
 
 impl Default for OidcConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            issuers: Vec::new(),
-            audiences: Vec::new(),
-            jwks_urls: BTreeMap::new(),
-            require: BTreeMap::new(),
-            leeway_seconds: 30,
             jwks_refresh_seconds: 1800,
             jwks_max_keys: 32,
             jwks_ca_pem: None,
+            issuers: BTreeMap::new(),
+            legacy_issuers: None,
+            legacy_audiences: None,
+            legacy_jwks_urls: None,
+            legacy_require: None,
+            legacy_leeway_seconds: None,
         }
     }
 }

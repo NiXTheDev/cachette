@@ -49,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 
-use crate::auth::{self, urls};
+use crate::auth::{self, Namespace, urls};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::{ByteStream, StorageBackend};
@@ -71,23 +71,36 @@ pub async fn upload(
     Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
-        return ApiError::Unavailable(String::from("storage backend not configured"))
-            .into_response();
-    };
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
+    //
+    // The namespace rides in the capability data, not in a credential: this
+    // path is authorized by the signed URL alone (task 24), so the credential
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    //
     // The MAC binds the exact resource path task 24 minted, reconstructed from
     // the route param (so it can never be spoofed by a traversal-style path).
     let path = format!("/v2/upload/{entry_id}");
     let policy = state.auth();
     let secret = super::signing_secret(&policy);
-    if let Err(err) = urls::validate(&query, &path, secret, auth::now_secs()) {
-        return ApiError::from(err).into_response();
-    }
+    let namespace = match urls::validate(&query, &path, secret, auth::now_secs()) {
+        Ok(resolved) => resolved,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     let max_bytes = usize::try_from(state.cache_limits().max_chunk_bytes).unwrap_or(usize::MAX);
     match query.get("comp").map(String::as_str) {
-        Some("block") => stage_block(storage, &entry_id, &query, body, max_bytes).await,
-        Some("blocklist") => commit_block_list(&state, &entry_id, &query, body, max_bytes).await,
-        None => put_blob(&state, &entry_id, body, max_bytes).await,
+        Some("block") => stage_block(storage.as_ref(), &entry_id, &query, body, max_bytes).await,
+        Some("blocklist") => {
+            commit_block_list(&state, &namespace, &entry_id, &query, body, max_bytes).await
+        }
+        None => put_blob(&state, &namespace, &entry_id, body, max_bytes).await,
         Some(_) => unsupported_comp(body, max_bytes).await,
     }
 }
@@ -132,12 +145,13 @@ async fn stage_block(
 /// shape the real Azure SDK / go-actions-cache v2 client sends.
 async fn commit_block_list(
     state: &AppState,
+    namespace: &Namespace,
     entry_id: &str,
     query: &HashMap<String, String>,
     body: Body,
     max_bytes: usize,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -184,8 +198,14 @@ async fn commit_block_list(
 /// The body is staged under a synthetic block token and immediately assembled,
 /// so it publishes under the artifact key exactly like the block-list path.
 /// A bodiless request stays the historical 201 no-op.
-async fn put_blob(state: &AppState, entry_id: &str, body: Body, max_bytes: usize) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+async fn put_blob(
+    state: &AppState,
+    namespace: &Namespace,
+    entry_id: &str,
+    body: Body,
+    max_bytes: usize,
+) -> Response {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };

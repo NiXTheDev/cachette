@@ -1,8 +1,9 @@
 name: rustup mirror ladder
 description: >
-  Pick the first reachable rust distribution mirror and export
-  RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT, so the toolchain fetch stops
-  depending on the runners' flaky path to static.rust-lang.org.
+  Race the rust distribution mirrors in parallel, export the fastest one
+  that answered as RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT, so the
+  toolchain fetch stops depending on the runners' flaky path to
+  static.rust-lang.org.
 
 # WHY THIS EXISTS
 #
@@ -21,60 +22,99 @@ description: >
 #
 # Both are the fleet's egress wall hitting static.rust-lang.org - the same
 # wall the zig fetch already documented in release.yml (PR #7): connections
-# die at the TLS layer, and which mirror is fast varies by host and hour.
+# die at the TLS layer, and WHICH mirror is fast varies by host and minute.
 # The rustup-init download in particular has NO retry of its own (the
 # rustup-init.sh bootstrapper calls curl once), so a single dropped
 # connection kills the job.
 #
 # WHAT IT DOES
 #
-# Probes a mirror ladder and exports the two env vars rustup honours:
+# Probes the mirror ladder and exports the two env vars rustup honours:
 #
 #   RUSTUP_DIST_SERVER  - root that mirrors static.rust-lang.org/
 #                         (the channel manifests and toolchain archives)
 #   RUSTUP_UPDATE_ROOT  - root that mirrors static.rust-lang.org/rustup/
 #                         (where rustup-init itself lives)
 #
+# The ladder is a RACE, not a sequence: every mirror's probe runs in a
+# background probe at once, and the FIRST one to return HTTP 200 for the
+# stable channel manifest wins - i.e. the fastest non-errored mirror, not
+# merely the first in some fixed order. The stragglers are killed as soon
+# as a winner exists, so the wall-clock cost is the fastest healthy
+# mirror's latency (a few seconds), never the sum of four connect
+# timeouts (the old sequential version paid each dead mirror's
+# 20s connect-timeout x2 retries x3s delay before even considering the
+# next one). The probe itself carries no --retry: the other three racers
+# ARE the retry - if one mirror TLS-EOFs instantly, the race continues
+# without it.
+#
 # Nothing else changes: the dtolnay/rust-toolchain composite still installs
 # rustup and the pinned toolchain, but both fetches now go through the
-# mirror that actually answered. The composite does not define either var,
-# so the exported values reach its steps untouched.
+# mirror that actually won. The composite does not define either var, so
+# the exported values reach its steps untouched.
 #
-# The probe fetches a channel manifest (a few hundred bytes), never a
-# toolchain archive, so the ladder costs nothing when the first mirror
-# answers.
+# The probe fetches a channel manifest for the PINNED toolchain (a few
+# hundred bytes), never a toolchain archive, so the ladder costs nothing but
+# one round-trip per mirror per job. Probing `stable` is not enough: a mirror
+# can mirror the stable channel but 404 on `channel-rust-1.100.toml.sha256`,
+# win the race, and then fail the actual 1.100 install (the v1.2 push runs
+# 632/634 died exactly there). Asking for the pinned manifest keeps those
+# half-mirrors out of the race.
 #
-# The ladder tries every mirror before falling back to the upstream, and
-# when NOTHING answers it leaves the defaults in place and warns - the
-# composite's own retries then apply, exactly as before this action.
+# When NOTHING answers inside the deadline it leaves the defaults in
+# place and warns - the composite's own retries then apply, exactly as
+# before this action.
 
 runs:
   using: composite
   steps:
-    - name: Probe the rust mirror ladder
+    - name: Race the rust mirror ladder
       shell: sh
       run: |
         set -eu
-        picked=0
+        # Hard-link trick for atomic first-wins: each probe gets a
+        # pre-written candidate file; `ln` into the winner slot fails with
+        # EEXIST for every probe but the first to succeed, so two probes
+        # finishing in the same instant cannot interleave their writes.
+        race="${TMPDIR:-/tmp}/rustup-mirror-race"
+        rm -rf "$race"
+        mkdir -p "$race"
+        pids=""
+        i=0
         while IFS='|' read -r dist update; do
           [ -n "${dist:-}" ] || continue
-          echo "::group::rust mirror probe: $dist"
-          if curl -fsSL --retry 2 --retry-delay 3 --retry-all-errors \
-                    --connect-timeout 20 --max-time 60 \
-                    -o /dev/null "$dist/dist/channel-rust-stable.toml.sha256"; then
-            echo "picked mirror: dist=$dist update=$update"
-            echo "RUSTUP_DIST_SERVER=$dist" >> "$GITHUB_ENV"
-            echo "RUSTUP_UPDATE_ROOT=$update" >> "$GITHUB_ENV"
-            picked=1
-            break
-          fi
-          echo "::warning::rust mirror unreachable: $dist"
+          i=$((i + 1))
+          printf '%s|%s\n' "$dist" "$update" > "$race/cand.$i"
+          (
+            if curl -fsSL --connect-timeout 15 --max-time 45 \
+                      -o /dev/null "$dist/dist/channel-rust-1.100.toml.sha256"; then
+              ln "$race/cand.$i" "$race/winner" 2>/dev/null || true
+              echo "rust mirror probe answered: $dist"
+            else
+              echo "::warning::rust mirror unreachable: $dist"
+            fi
+          ) &
+          pids="$pids $!"
         done <<'MIRRORS'
         https://rsproxy.cn|https://rsproxy.cn/rustup
         https://mirrors.ustc.edu.cn/rust-static|https://mirrors.ustc.edu.cn/rust-static/rustup
         https://mirrors.tuna.tsinghua.edu.cn/rustup|https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
         https://static.rust-lang.org|https://static.rust-lang.org/rustup
         MIRRORS
-        if [ "$picked" -eq 0 ]; then
+        # First successful completion wins. Poll a deadline (covers the
+        # case where every probe is still fighting the egress wall), then
+        # kill the stragglers so nothing outlives the step.
+        deadline=$(( $(date +%s) + 60 ))
+        while [ ! -e "$race/winner" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+          sleep 1
+        done
+        kill $pids 2>/dev/null || true
+        wait || true
+        if [ -e "$race/winner" ]; then
+          IFS='|' read -r dist update < "$race/winner"
+          echo "picked mirror (first to answer): dist=$dist update=$update"
+          echo "RUSTUP_DIST_SERVER=$dist" >> "$GITHUB_ENV"
+          echo "RUSTUP_UPDATE_ROOT=$update" >> "$GITHUB_ENV"
+        else
           echo "::warning::no rust mirror answered - keeping the upstream defaults"
         fi

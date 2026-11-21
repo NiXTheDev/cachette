@@ -27,12 +27,13 @@ use axum::Json;
 use axum::Router;
 use axum::body::HttpBody;
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::{HeaderValue, Method, Uri, header, request::Parts};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 
 use crate::auth;
+use crate::cluster::{PEER_PROTOCOL_HEADER, PEER_PROTOCOL_VERSION};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::tls::{PeerCert, PeerPins};
@@ -61,6 +62,9 @@ pub fn router(state: AppState) -> Router {
             "/_internal/peers/v2/supersede",
             post(peer_relay::v2_supersede),
         )
+        // Version check INSIDE the pin gate: pin first, then version, so an
+        // unpinned caller still gets 403 and never learns the wire version.
+        .route_layer(middleware::from_fn(require_peer_protocol))
         .route_layer(middleware::from_fn_with_state(
             state.peers.clone(),
             require_pinned_peer,
@@ -272,6 +276,13 @@ async fn peer_hello(State(state): State<AppState>, request: Request) -> Response
             }
         }
     };
+    // Defense in depth on top of the header gate: a body that echoes a
+    // different wire version is refused even if the header claimed ours.
+    if let Some(version) = hello.as_ref().and_then(|hello| hello.protocol_version)
+        && version != PEER_PROTOCOL_VERSION
+    {
+        return protocol_mismatch_response();
+    }
     let fingerprint = hello
         .as_ref()
         .and_then(|hello| hello.fingerprint.clone())
@@ -324,6 +335,12 @@ async fn peer_heartbeat(State(state): State<AppState>, request: Request) -> Resp
             return ApiError::BadRequest(String::from("invalid heartbeat body")).into_response();
         }
     };
+    // Defense in depth on top of the header gate (see `peer_hello`).
+    if let Some(version) = beat.protocol_version
+        && version != PEER_PROTOCOL_VERSION
+    {
+        return protocol_mismatch_response();
+    }
     let now = auth::now_secs();
     let node_id = beat.node_id.unwrap_or_else(|| fingerprint.clone());
     // Wrapping arithmetic so a pathological `ts` (i64::MIN/MAX) cannot
@@ -375,6 +392,10 @@ struct HelloBody {
     node_id: Option<String>,
     fingerprint: Option<String>,
     addr: Option<String>,
+    /// Wire version echo (`docs/shared-cache.md` §8); the header is
+    /// authoritative, this is defense in depth.
+    #[serde(default)]
+    protocol_version: Option<u32>,
 }
 
 /// Heartbeat body: the sender's identity plus its live B3 stats and a Unix
@@ -388,6 +409,10 @@ struct HeartbeatBody {
     total_bytes: u64,
     #[serde(default)]
     draining: bool,
+    /// Wire version echo (`docs/shared-cache.md` §8); the header is
+    /// authoritative, this is defense in depth.
+    #[serde(default)]
+    protocol_version: Option<u32>,
     ts: i64,
 }
 
@@ -516,6 +541,35 @@ async fn require_pinned_peer(
         Some(fingerprint) if pins.authorize(&fingerprint) => next.run(request).await,
         _ => ApiError::Forbidden(String::from("peer auth required")).into_response(),
     }
+}
+
+/// Peer wire version gate for `/_internal/peers/*` (`docs/shared-cache.md` §8),
+/// layered INSIDE [`require_pinned_peer`] so pinning is decided first.
+///
+/// Every peer request must declare `x-cachette-peer-protocol: 2`. A missing or
+/// different version is refused with `426 Upgrade Required` before the handler
+/// runs — hello/heartbeat included, so a mixed-version cluster drains to "no
+/// healthy peer" instead of silently merging one tenant's rows with another's.
+async fn require_peer_protocol(request: Request, next: Next) -> Response {
+    let version = request
+        .headers()
+        .get(PEER_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if version != Some(PEER_PROTOCOL_VERSION) {
+        return protocol_mismatch_response();
+    }
+    next.run(request).await
+}
+
+/// The one `426 Upgrade Required` body both the version gate and the
+/// hello/heartbeat body checks return.
+fn protocol_mismatch_response() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({"error": "peer protocol version mismatch"})),
+    )
+        .into_response()
 }
 
 /// 404 fallback: `{"error":"not found"}` on plain/v1 paths, Twirp envelope

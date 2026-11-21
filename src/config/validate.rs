@@ -2,8 +2,10 @@
 //! cannot express. Closed sets (eviction, key_case, tiebreak, mode, backend,
 //! log level/format) are enforced by their serde enums at parse time.
 
-use crate::config::Config;
+use std::collections::BTreeMap;
+
 use crate::config::error::ConfigError;
+use crate::config::{AuthMode, Config, QuotasConfig, RuntimeForgeConfig};
 
 /// Split `host:port` (IPv6 literals bracketed: `[::1]:8080`).
 pub(crate) fn split_host_port(raw: &str) -> Option<(&str, u16)> {
@@ -52,14 +54,47 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::CertPathCollides);
     }
+    validate_namespaces(&config.storage.namespaces)?;
+    validate_quotas(&config.storage.quotas)?;
     validate_oidc(config)?;
+    validate_runtime(&config.auth.runtime)?;
+    validate_tenancy(config)?;
     Ok(())
 }
 
-/// `[auth.oidc]` wiring rules (v1.1; docs/oidc.md §Config surface):
-/// `enabled` implies the issuer/audience lists, the CA bundle, a positive
-/// refresh interval and key cap; `jwks_urls` may only name configured
-/// issuers with `https` endpoints. A disabled/absent table is always fine.
+/// `[storage.namespaces]` mapping keys are credential identities
+/// (`docs/shared-cache.md` §7): `"<forge>|<tenant>"`, both halves present.
+/// The tenant half is dynamic (only the admin knows which repos exist), so
+/// this is a shape check - a mistyped tenant simply keeps its own default
+/// namespace rather than joining the intended shared one.
+fn validate_namespaces(namespaces: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    for key in namespaces.keys() {
+        let well_formed = key
+            .split_once('|')
+            .is_some_and(|(forge, tenant)| !forge.trim().is_empty() && !tenant.trim().is_empty());
+        if !well_formed {
+            return Err(ConfigError::NamespaceMappingKey { key: key.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// `[storage.quotas]` rules (v1.2 workstream F, `docs/shared-cache.md` §5):
+/// a present table needs a positive `default`; every rule key must be a
+/// namespace or tenant-side pattern and every value a positive bytesize.
+/// Parsing is shared with the runtime rule set, so nothing validated here
+/// can fail at boot.
+fn validate_quotas(quotas: &QuotasConfig) -> Result<(), ConfigError> {
+    quotas.parse().map(|_| ())
+}
+
+/// `[auth.oidc]` wiring rules (v1.2 shape; docs/oidc.md §Config surface):
+/// the parent table carries the global knobs, every issuer is its own block
+/// (`[auth.oidc."<issuer>"]`) with its own audiences, pins, roots and clock
+/// skew. `enabled` implies at least one issuer block, a positive refresh
+/// interval and key cap, and usable trust roots for every issuer. The v1.1
+/// flat shape is rejected with a precise error. A disabled/absent table is
+/// always fine.
 fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     let Some(oidc) = config.auth.oidc.as_ref() else {
         return Ok(());
@@ -67,19 +102,22 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     if !oidc.enabled {
         return Ok(());
     }
+    // The v1.1 flat shape is a configuration error, not a silent fallback:
+    // name the key that carries it and the shape that replaced it.
+    for (key, present) in [
+        ("issuers", oidc.legacy_issuers.is_some()),
+        ("audiences", oidc.legacy_audiences.is_some()),
+        ("jwks_urls", oidc.legacy_jwks_urls.is_some()),
+        ("require", oidc.legacy_require.is_some()),
+        ("leeway_seconds", oidc.legacy_leeway_seconds.is_some()),
+    ] {
+        if present {
+            return Err(ConfigError::OidcLegacyShape { key });
+        }
+    }
     if oidc.issuers.is_empty() {
         return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.issuers",
-        });
-    }
-    if oidc.audiences.is_empty() {
-        return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.audiences",
-        });
-    }
-    if oidc.jwks_ca_pem.is_none() {
-        return Err(ConfigError::OidcMissingRequired {
-            field: "auth.oidc.jwks_ca_pem",
+            field: "at least one [auth.oidc.\"<issuer>\"] block",
         });
     }
     if oidc.jwks_refresh_seconds == 0 {
@@ -88,34 +126,106 @@ fn validate_oidc(config: &Config) -> Result<(), ConfigError> {
     if oidc.jwks_max_keys == 0 {
         return Err(ConfigError::OidcZeroMaxKeys);
     }
-    // Every issuer must itself be an https URL: the default JWKS endpoint is
-    // derived as `{issuer}/.well-known/jwks.json`, so a plaintext issuer
-    // would mean a plaintext fetch. Explicit overrides cannot rescue it —
-    // verification binds tokens to the issuer string whatever URL serves
-    // keys, and the fetch layer is https-only as depth defense.
-    for issuer in &oidc.issuers {
-        let scheme = url::Url::parse(issuer).is_ok_and(|url| url.scheme() == "https");
-        if !scheme {
+    for (issuer, block) in &oidc.issuers {
+        // Every issuer must itself be an https URL: the default JWKS endpoint
+        // is derived as `{issuer}/.well-known/jwks.json`, so a plaintext
+        // issuer would mean a plaintext fetch. An explicit override cannot
+        // rescue it - verification binds tokens to the issuer string whatever
+        // URL serves keys, and the fetch layer is https-only as depth
+        // defense.
+        if !url::Url::parse(issuer).is_ok_and(|url| url.scheme() == "https") {
             return Err(ConfigError::OidcIssuerPlaintext {
                 issuer: issuer.clone(),
             });
         }
-    }
-    for (issuer, url) in &oidc.jwks_urls {
-        if !oidc.issuers.contains(issuer) {
-            return Err(ConfigError::OidcJwksIssuerUnknown {
+        if block.audiences.is_empty() {
+            return Err(ConfigError::OidcIssuerMissing {
                 issuer: issuer.clone(),
+                field: "audiences",
             });
         }
-        let scheme = url::Url::parse(url).is_ok_and(|u| u.scheme() == "https");
-        if !scheme {
+        // The tenant namespace's second half comes from this claim's value;
+        // an empty name would silently address a claim no token carries.
+        if block.tenant_claim.trim().is_empty() {
+            return Err(ConfigError::OidcIssuerMissing {
+                issuer: issuer.clone(),
+                field: "tenant_claim",
+            });
+        }
+        if let Some(url) = &block.jwks_url
+            && !url::Url::parse(url).is_ok_and(|u| u.scheme() == "https")
+        {
             return Err(ConfigError::OidcJwksPlaintext {
                 issuer: issuer.clone(),
                 url: url.clone(),
             });
         }
+        // Trust roots: the issuer's own bundle, or the global default.
+        if block.ca_pem.is_none() && oidc.jwks_ca_pem.is_none() {
+            return Err(ConfigError::OidcIssuerMissing {
+                issuer: issuer.clone(),
+                field: "ca_pem (or the global auth.oidc.jwks_ca_pem)",
+            });
+        }
     }
     Ok(())
+}
+
+/// `[auth.runtime]` wiring rules (v1.2 Plane B, `docs/shared-cache.md` §3).
+/// A forge id is the forge half of `"<forge>|<tenant>"`, so it must be
+/// non-empty and cannot contain `|`. An enabled block needs a secret file
+/// path and a tenant claim path; a disabled block is inert and may be
+/// half-filled.
+fn validate_runtime(runtime: &BTreeMap<String, RuntimeForgeConfig>) -> Result<(), ConfigError> {
+    for (forge, block) in runtime {
+        if forge.trim().is_empty() || forge.contains('|') {
+            return Err(ConfigError::RuntimeForgeKey {
+                forge: forge.clone(),
+            });
+        }
+        if !block.enabled {
+            continue;
+        }
+        if block.secret.as_os_str().is_empty() {
+            return Err(ConfigError::RuntimeSecretMissing {
+                forge: forge.clone(),
+            });
+        }
+        if block.tenant_claim.trim().is_empty() {
+            return Err(ConfigError::RuntimeTenantClaimMissing {
+                forge: forge.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Multi-tenant boot guard (`docs/shared-cache.md` §2/§9). A
+/// credential plane that yields a tenant makes the deployment
+/// multi-tenant: Plane A (`[auth.oidc] enabled`) and Plane B (any
+/// `[auth.runtime."<forge>"]` block enabled) both do. Then the HMAC plane
+/// must be off: its repo/run fields are client-asserted and cannot express a
+/// tenant, so `hmac`/`merge` would silently funnel every HMAC request into one
+/// shared namespace.
+///
+/// Cluster mode is allowed: the v1.2 peer wire (§8) carries the resolved
+/// namespace on every key-bearing request and refuses a peer of a different
+/// protocol version, so peers store exactly the rows they are told.
+///
+/// No tenant-yielding plane means v1.1 behavior, which validates unchanged.
+/// Runs after [`validate_oidc`]/[`validate_runtime`] so a structural
+/// credential-plane error takes precedence.
+fn validate_tenancy(config: &Config) -> Result<(), ConfigError> {
+    let oidc_enabled = config.auth.oidc.as_ref().is_some_and(|oidc| oidc.enabled);
+    let runtime_enabled = config.auth.runtime.values().any(|block| block.enabled);
+    if !oidc_enabled && !runtime_enabled {
+        return Ok(());
+    }
+    match config.auth.mode {
+        AuthMode::Bearer => Ok(()),
+        AuthMode::Hmac => Err(ConfigError::HmacInMultiTenant { mode: "hmac" }),
+        AuthMode::Merge => Err(ConfigError::HmacInMultiTenant { mode: "merge" }),
+    }
 }
 
 fn validate_listen(listen: &str) -> Result<(), ConfigError> {
@@ -150,11 +260,32 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::OidcConfig;
+    use std::collections::BTreeMap;
 
-    /// A `Config` with `[auth.oidc]` built from the default surface.
+    use crate::config::{AuthMode, OidcConfig, OidcIssuerConfig, RuntimeForgeConfig};
+
+    /// Enabled Plane B surface. Validation only checks the block's shape -
+    /// the secret file is read by `auth::runtime::install` at boot.
+    fn enabled_runtime() -> Config {
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::Bearer;
+        config.auth.runtime.insert(
+            String::from("https://forge.example.org"),
+            RuntimeForgeConfig {
+                enabled: true,
+                secret: PathBuf::from("/etc/cachette/forgejo-token-secret"),
+                ..RuntimeForgeConfig::default()
+            },
+        );
+        config
+    }
+
+    /// A `Config` with `[auth.oidc]` built from the default surface. An
+    /// enabled OIDC table is tenant-yielding, so the HMAC plane must be off
+    /// (`validate_tenancy`); every OIDC fixture therefore serves bearer-only.
     fn oidc_config(fields: impl FnOnce(&mut OidcConfig)) -> Config {
         let mut config = Config::default();
+        config.auth.mode = AuthMode::Bearer;
         let mut oidc = OidcConfig::default();
         fields(&mut oidc);
         config.auth.oidc = Some(oidc);
@@ -165,9 +296,14 @@ mod tests {
     fn enabled_oidc() -> Config {
         oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-            oidc.audiences = vec![String::from("cachette")];
             oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                String::from("https://idp.example.org/realms/ci"),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            );
         })
     }
 
@@ -175,9 +311,16 @@ mod tests {
     fn enabled_oidc_with_issuers(issuers: Vec<String>) -> Config {
         oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = issuers;
-            oidc.audiences = vec![String::from("cachette")];
             oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            for issuer in issuers {
+                oidc.issuers.insert(
+                    issuer,
+                    OidcIssuerConfig {
+                        audiences: vec![String::from("cachette")],
+                        ..OidcIssuerConfig::default()
+                    },
+                );
+            }
         })
     }
 
@@ -378,52 +521,58 @@ mod tests {
         assert!(
             validate(&oidc_config(|oidc| {
                 oidc.enabled = false;
-                oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
+                oidc.issuers.insert(
+                    String::from("https://idp.example.org/realms/ci"),
+                    OidcIssuerConfig::default(),
+                );
             }))
             .is_ok()
         );
     }
 
     #[test]
-    fn enabled_oidc_requires_issuers_audiences_and_ca_pem() {
-        let err = validate(&oidc_config(|oidc| oidc.enabled = true)).expect_err("no lists, no pem");
+    fn enabled_oidc_requires_an_issuer_block_audiences_and_roots() {
+        let err = validate(&oidc_config(|oidc| oidc.enabled = true)).expect_err("no issuer block");
         assert!(
             matches!(
                 err,
                 ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.issuers"
+                    field: "at least one [auth.oidc.\"<issuer>\"] block"
                 }
             ),
             "unexpected error: {err:?}"
         );
 
+        let issuer = String::from("https://idp.example.org/realms/ci");
         let err = validate(&oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
+            oidc.issuers
+                .insert(issuer.clone(), OidcIssuerConfig::default());
         }))
         .expect_err("no audiences");
         assert!(
             matches!(
-                err,
-                ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.audiences"
-                }
+                &err,
+                ConfigError::OidcIssuerMissing { issuer: got, field: "audiences" } if got == &issuer
             ),
             "unexpected error: {err:?}"
         );
 
         let err = validate(&oidc_config(|oidc| {
             oidc.enabled = true;
-            oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-            oidc.audiences = vec![String::from("cachette")];
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            );
         }))
         .expect_err("no CA bundle");
         assert!(
             matches!(
-                err,
-                ConfigError::OidcMissingRequired {
-                    field: "auth.oidc.jwks_ca_pem"
-                }
+                &err,
+                ConfigError::OidcIssuerMissing { issuer: got, .. } if got == &issuer
             ),
             "unexpected error: {err:?}"
         );
@@ -431,13 +580,192 @@ mod tests {
         assert!(validate(&enabled_oidc()).is_ok());
     }
 
+    /// `docs/shared-cache.md` §2/§9: the HMAC plane cannot express a
+    /// tenant, so a tenant-yielding plane (enabled OIDC) refuses `hmac` and
+    /// `merge` with a precise error naming the mode.
+    #[test]
+    fn tenant_yielding_plane_refuses_the_hmac_plane() {
+        let mut config = enabled_oidc();
+        assert!(
+            validate(&config).is_ok(),
+            "bearer + OIDC is the supported shape"
+        );
+
+        config.auth.mode = AuthMode::Hmac;
+        let err = validate(&config).expect_err("hmac with OIDC");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "hmac"),
+            "unexpected error: {err:?}"
+        );
+
+        config.auth.mode = AuthMode::Merge;
+        let err = validate(&config).expect_err("merge with OIDC");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "merge"),
+            "unexpected error: {err:?}"
+        );
+
+        // No tenant-yielding plane: HMAC keeps its v1.1 behavior.
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::Hmac;
+        assert!(validate(&config).is_ok());
+    }
+
+    /// `docs/shared-cache.md` §8: the namespace-bearing peer wire makes a
+    /// tenant-yielding plane with cluster mode a supported deployment.
+    #[test]
+    fn tenant_yielding_plane_allows_cluster_mode() {
+        let mut config = enabled_oidc();
+        config.cluster.enabled = true;
+        assert!(validate(&config).is_ok(), "OIDC + cluster is supported");
+
+        // Cluster mode alone (no tenant-yielding plane) is unchanged.
+        let mut config = Config::default();
+        config.cluster.enabled = true;
+        config.auth.mode = AuthMode::Hmac;
+        assert!(validate(&config).is_ok());
+    }
+
+    /// `docs/shared-cache.md` §3: an enabled runtime block needs a secret
+    /// file and a tenant path; forge keys are namespace halves. A disabled
+    /// block is inert and may be half-filled.
+    #[test]
+    fn runtime_blocks_are_validated_per_forge() {
+        assert!(validate(&enabled_runtime()).is_ok());
+
+        for key in ["", "  ", "https://forge|other"] {
+            let mut config = Config::default();
+            config.auth.runtime.insert(
+                String::from(key),
+                RuntimeForgeConfig {
+                    enabled: true,
+                    secret: PathBuf::from("/etc/cachette/secret"),
+                    ..RuntimeForgeConfig::default()
+                },
+            );
+            let err = validate(&config).expect_err("malformed forge key");
+            assert!(
+                matches!(&err, ConfigError::RuntimeForgeKey { forge } if forge == key),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        let mut config = enabled_runtime();
+        config
+            .auth
+            .runtime
+            .get_mut("https://forge.example.org")
+            .expect("block")
+            .secret = PathBuf::new();
+        let err = validate(&config).expect_err("missing secret");
+        assert!(
+            matches!(err, ConfigError::RuntimeSecretMissing { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        let mut config = enabled_runtime();
+        config
+            .auth
+            .runtime
+            .get_mut("https://forge.example.org")
+            .expect("block")
+            .tenant_claim = String::from("  ");
+        let err = validate(&config).expect_err("empty tenant claim");
+        assert!(
+            matches!(err, ConfigError::RuntimeTenantClaimMissing { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // Disabled: the half-filled block is inert, like a disabled OIDC table.
+        let mut config = Config::default();
+        config.auth.runtime.insert(
+            String::from("https://forge.example.org"),
+            RuntimeForgeConfig::default(),
+        );
+        assert!(validate(&config).is_ok());
+    }
+
+    /// Plane B is tenant-yielding too, so the same boot guard applies.
+    #[test]
+    fn a_runtime_plane_is_tenant_yielding_for_the_boot_guard() {
+        let mut config = enabled_runtime();
+        assert!(validate(&config).is_ok());
+
+        config.auth.mode = AuthMode::Merge;
+        let err = validate(&config).expect_err("merge with Plane B");
+        assert!(
+            matches!(&err, ConfigError::HmacInMultiTenant { mode } if *mode == "merge"),
+            "unexpected error: {err:?}"
+        );
+
+        config.auth.mode = AuthMode::Bearer;
+        config.cluster.enabled = true;
+        assert!(
+            validate(&config).is_ok(),
+            "Plane B + cluster is a supported deployment"
+        );
+    }
+
+    /// A per-issuer `ca_pem` covers that issuer on its own; the global
+    /// `jwks_ca_pem` is the fallback for issuers that name none.
+    #[test]
+    fn per_issuer_ca_pem_covers_its_issuer() {
+        let issuer = String::from("https://idp.example.org/realms/ci");
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ca_pem: Some(PathBuf::from("/etc/cachette/other-ca.pem")),
+                    ..OidcIssuerConfig::default()
+                },
+            );
+        });
+        assert!(validate(&config).is_ok());
+    }
+
+    /// The v1.1 flat shape is a configuration error, not a silent fallback:
+    /// the error names the key and the shape that replaced it.
+    #[test]
+    fn the_v11_flat_shape_is_rejected_with_a_precise_error() {
+        for (key, set) in [
+            ("issuers", 0),
+            ("audiences", 1),
+            ("jwks_urls", 2),
+            ("require", 3),
+            ("leeway_seconds", 4),
+        ] {
+            let err = validate(&oidc_config(|oidc| {
+                oidc.enabled = true;
+                match set {
+                    0 => oidc.legacy_issuers = Some(vec![String::from("https://idp.example.org")]),
+                    1 => oidc.legacy_audiences = Some(vec![String::from("cachette")]),
+                    2 => oidc.legacy_jwks_urls = Some(BTreeMap::new()),
+                    3 => oidc.legacy_require = Some(BTreeMap::new()),
+                    _ => oidc.legacy_leeway_seconds = Some(30),
+                }
+            }))
+            .expect_err("v1.1 flat shape");
+            assert!(
+                matches!(&err, ConfigError::OidcLegacyShape { key: got } if *got == key),
+                "unexpected error for {key}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn zero_oidc_refresh_and_key_cap_are_rejected() {
         let surface = crate::config::OidcConfig {
             enabled: true,
-            issuers: vec![String::from("https://idp.example.org/realms/ci")],
-            audiences: vec![String::from("cachette")],
             jwks_ca_pem: Some(PathBuf::from("/etc/cachette/idp-ca.pem")),
+            issuers: BTreeMap::from([(
+                String::from("https://idp.example.org/realms/ci"),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    ..OidcIssuerConfig::default()
+                },
+            )]),
             ..crate::config::OidcConfig::default()
         };
         let mut config = Config::default();
@@ -463,36 +791,20 @@ mod tests {
         );
     }
 
+    /// A per-issuer `jwks_url` is an outbound fetch target: https only.
     #[test]
-    fn jwks_urls_must_target_configured_https_issuers() {
-        fn enabled(base: impl FnOnce(&mut OidcConfig)) -> Config {
-            oidc_config(|oidc| {
-                oidc.enabled = true;
-                oidc.issuers = vec![String::from("https://idp.example.org/realms/ci")];
-                oidc.audiences = vec![String::from("cachette")];
-                oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
-                base(oidc);
-            })
-        }
-
-        let mut config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://other.example.org"),
-                String::from("https://other.example.org/jwks.json"),
-            );
-        });
-        let err = validate(&config).expect_err("url for an unlisted issuer");
-        match &err {
-            ConfigError::OidcJwksIssuerUnknown { issuer } => {
-                assert_eq!(issuer, "https://other.example.org");
-            }
-            other => panic!("expected OidcJwksIssuerUnknown, got {other:?}"),
-        }
-
-        config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://idp.example.org/realms/ci"),
-                String::from("http://idp.example.org/jwks.json"),
+    fn jwks_url_must_be_https() {
+        let issuer = String::from("https://idp.example.org/realms/ci");
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    jwks_url: Some(String::from("http://idp.example.org/jwks.json")),
+                    ..OidcIssuerConfig::default()
+                },
             );
         });
         let err = validate(&config).expect_err("plaintext url");
@@ -501,10 +813,16 @@ mod tests {
             "unexpected error: {err:?}"
         );
 
-        config = enabled(|oidc| {
-            oidc.jwks_urls.insert(
-                String::from("https://idp.example.org/realms/ci"),
-                String::from("https://idp.example.org/jwks.json"),
+        let config = oidc_config(|oidc| {
+            oidc.enabled = true;
+            oidc.jwks_ca_pem = Some(PathBuf::from("/etc/cachette/idp-ca.pem"));
+            oidc.issuers.insert(
+                issuer.clone(),
+                OidcIssuerConfig {
+                    audiences: vec![String::from("cachette")],
+                    jwks_url: Some(String::from("https://idp.example.org/jwks.json")),
+                    ..OidcIssuerConfig::default()
+                },
             );
         });
         assert!(validate(&config).is_ok());
@@ -560,5 +878,95 @@ mod tests {
             }
             other => panic!("expected OidcIssuerPlaintext, got {other:?}"),
         }
+    }
+
+    /// `[storage.namespaces]` keys are credential identities
+    /// (`docs/shared-cache.md` §7): both halves must be present. A target
+    /// may be any name (including `""`, the legacy opt-in).
+    #[test]
+    fn namespace_mappings_require_forge_and_tenant_halves() {
+        let mut config = Config::default();
+        config.storage.namespaces.insert(
+            String::from("https://hangar.nixthedev.ru|NiXTheDev/cachette"),
+            String::from("nixthedev"),
+        );
+        config.storage.namespaces.insert(
+            String::from("https://github.com|octo-org/api"),
+            String::new(),
+        );
+        assert!(validate(&config).is_ok());
+
+        for key in [
+            "NiXTheDev/cachette",
+            "|NiXTheDev/cachette",
+            "https://forge|",
+        ] {
+            let mut config = Config::default();
+            config
+                .storage
+                .namespaces
+                .insert(String::from(key), String::from("shared"));
+            let err = validate(&config).expect_err("malformed mapping key");
+            assert!(
+                matches!(&err, ConfigError::NamespaceMappingKey { key: got } if got == key),
+                "unexpected error: {err:?}"
+            );
+        }
+    }
+
+    /// `[storage.quotas]` (`docs/shared-cache.md` §5): the table is off when
+    /// absent, but a present table needs a positive default and well-formed
+    /// rules. Parsing is shared with the runtime set, so the same errors
+    /// surface here.
+    #[test]
+    fn quota_rules_are_validated() {
+        assert!(validate(&Config::default()).is_ok());
+
+        let mut config = Config::default();
+        config.storage.quotas = QuotasConfig(
+            [
+                (String::from("default"), String::from("20GiB")),
+                (String::from("NiXTheDev/*"), String::from("5GiB")),
+                (
+                    String::from("https://github.com|octo-org/*"),
+                    String::from("5GiB"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(validate(&config).is_ok());
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("NiXTheDev/*"), String::from("5GiB"));
+        let err = validate(&config).expect_err("missing default");
+        assert!(matches!(err, ConfigError::QuotaDefaultMissing));
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("default"), String::from("20GiB"));
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("|broken"), String::from("5GiB"));
+        let err = validate(&config).expect_err("malformed rule key");
+        assert!(matches!(err, ConfigError::QuotaRuleKey { .. }));
+
+        let mut config = Config::default();
+        config
+            .storage
+            .quotas
+            .0
+            .insert(String::from("default"), String::from("not-a-size"));
+        let err = validate(&config).expect_err("bad default limit");
+        assert!(matches!(err, ConfigError::QuotaValue { .. }));
     }
 }

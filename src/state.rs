@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::auth::oidc::OidcVerifier;
-use crate::auth::{AuthPolicy, TokenStore};
+use crate::auth::runtime::{RuntimeVerifier, SharedRuntimeVerifier};
+use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
-use crate::config::{Config, KeyCase, MinFree, OidcConfig};
+use crate::config::{Config, KeyCase, MinFree, OidcConfig, Quotas};
 use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -117,10 +118,24 @@ pub struct AppState {
     /// verifier behind [`OidcRuntime`]. Reload keeps whatever was installed
     /// and only warns on a changed config (restart required).
     pub oidc: Arc<RwLock<OidcRuntime>>,
+    /// Forge runtime-token verification (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3): the boot-installed verifier, if any.
+    /// Boot-time only, like the OIDC verifier - a SIGHUP reload never swaps
+    /// it. `None` keeps Plane B off.
+    pub runtime: Arc<RwLock<Option<SharedRuntimeVerifier>>>,
     /// Cache capacity + reservation knobs (plan task 19), shared so a SIGHUP
     /// reload (plan task 49) can refresh them live. Readers take a `Copy`
     /// snapshot through [`AppState::cache_limits`].
     pub cache: Arc<RwLock<CacheLimits>>,
+    /// Admin namespace mappings (v1.2 workstream F, `docs/shared-cache.md`
+    /// §7): `"<forge>|<tenant>"` -> namespace name. Boot-time wiring (the
+    /// Rollout contract: changing tenancy needs a restart); the default is
+    /// empty, so every credential keeps its derived namespace.
+    pub namespaces: Arc<std::collections::BTreeMap<String, String>>,
+    /// Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
+    /// §5). Boot-time wiring like the namespace mapping; the default has no
+    /// quotas, so every namespace is unlimited.
+    pub quotas: Arc<Quotas>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -162,7 +177,10 @@ impl AppState {
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
             auth: Arc::new(RwLock::new(Arc::new(AuthPolicy::default()))),
             oidc: Arc::new(RwLock::new(OidcRuntime::default())),
+            runtime: Arc::new(RwLock::new(None)),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
+            namespaces: Arc::new(std::collections::BTreeMap::new()),
+            quotas: Arc::new(Quotas::default()),
             external_url: None,
             relay: None,
             capacity_total: 0,
@@ -218,6 +236,27 @@ impl AppState {
             .clone()
     }
 
+    /// Install the boot-built forge runtime-token verifier (v1.2 Plane B,
+    /// `docs/shared-cache.md` §3). Called once at boot by
+    /// [`crate::auth::runtime::install`]; a SIGHUP reload never re-installs.
+    pub fn install_runtime(&self, verifier: RuntimeVerifier) {
+        *self
+            .runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(verifier));
+    }
+
+    /// The boot-installed runtime-token verifier, if any. `None` when no
+    /// `[auth.runtime]` block was enabled at boot - Plane B is then off.
+    /// Clones the `Arc` (atomic refcount bump, no lock held after).
+    #[must_use]
+    pub fn runtime(&self) -> Option<SharedRuntimeVerifier> {
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// A `Copy` snapshot of the live cache limits (no lock held afterwards).
     #[must_use]
     pub fn cache_limits(&self) -> CacheLimits {
@@ -225,6 +264,42 @@ impl AppState {
             .cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A view of the storage backend restricted to `namespace` (v1.2
+    /// workstream F, `docs/shared-cache.md` §1/§4).
+    ///
+    /// The namespace is part of a row's identity: the view only ever observes
+    /// and mutates rows of its own namespace, so two tenants never share a
+    /// row even with identical keys and versions. The legacy `""` namespace
+    /// is the single-tenant row set — what the unscoped backend operates on —
+    /// so single-tenant deployments are unchanged. Creating a view is cheap
+    /// (shared connection/gate/locks, no re-open), which is what makes
+    /// per-request namespace resolution viable.
+    #[must_use]
+    pub fn storage_scoped(&self, namespace: &str) -> Option<Arc<dyn StorageBackend>> {
+        self.storage
+            .as_ref()
+            .map(|backend| backend.scoped(namespace))
+    }
+
+    /// Apply the admin namespace mapping (v1.2 workstream F,
+    /// `docs/shared-cache.md` §7): an exact `"<forge>|<tenant>"` match
+    /// replaces the derived namespace; every other identity keeps it. The
+    /// mapping is boot-time wiring - tenancy changes need a restart.
+    #[must_use]
+    pub fn resolve_namespace(&self, namespace: Namespace) -> Namespace {
+        self.namespaces
+            .get(&namespace.0)
+            .map(|mapped| Namespace(mapped.clone()))
+            .unwrap_or(namespace)
+    }
+
+    /// The byte limit of a RESOLVED namespace (v1.2 workstream F,
+    /// `docs/shared-cache.md` §5), or `None` when quotas are off.
+    #[must_use]
+    pub fn quota_for(&self, namespace: &str) -> Option<u64> {
+        self.quotas.limit_for(namespace)
     }
 
     /// Replace the live cache limits (boot + SIGHUP reload).
@@ -311,6 +386,8 @@ fn default_node_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Plan task 3 acceptance: unit-test the version parse - the crate's
     /// own version is semver: exactly three numeric components. (The
     /// literal [1, 0, 0] this once pinned died with the 1.1.0 cut: a
@@ -323,5 +400,32 @@ mod tests {
             .map(|part| part.parse::<u64>().expect("version component is numeric"))
             .collect();
         assert_eq!(components.len(), 3, "unexpected version: {raw}");
+    }
+
+    /// `docs/shared-cache.md` §7: an exact `"<forge>|<tenant>"` mapping
+    /// replaces the derived namespace; every other identity keeps it.
+    #[test]
+    fn resolve_namespace_applies_the_admin_mapping() {
+        let mut state = AppState::new();
+        state.namespaces = Arc::new(std::collections::BTreeMap::from([(
+            String::from("https://forge.example.org|octo-org/api"),
+            String::from("acme-shared"),
+        )]));
+        assert_eq!(
+            state.resolve_namespace(Namespace(String::from(
+                "https://forge.example.org|octo-org/api"
+            ))),
+            Namespace(String::from("acme-shared"))
+        );
+        assert_eq!(
+            state.resolve_namespace(Namespace(String::from(
+                "https://forge.example.org|octo-org/other"
+            ))),
+            Namespace(String::from("https://forge.example.org|octo-org/other"))
+        );
+        assert_eq!(
+            state.resolve_namespace(Namespace::legacy()),
+            Namespace::legacy()
+        );
     }
 }

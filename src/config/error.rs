@@ -88,9 +88,39 @@ pub enum ConfigError {
     #[error("auth.secret must be at least 16 characters (got {len})")]
     ShortSecret { len: usize },
 
-    /// `[auth.oidc]` enabled without a required list, pin or CA bundle.
+    /// `[auth.oidc] enabled without a required list, pin or CA bundle.
+    #[error(
+        "storage.namespaces key {key:?} must have the form \"<forge>|<tenant>\" with both halves non-empty"
+    )]
+    NamespaceMappingKey { key: String },
+    /// `[storage.quotas]` is present but names no `default` limit.
+    #[error("storage.quotas must define `default` when the table is present")]
+    QuotaDefaultMissing,
+    /// A `[storage.quotas]` limit is not a positive bytesize.
+    #[error(
+        "invalid storage.quotas limit for {key:?}: {value:?} (expected a positive bytesize such as \"20GiB\")"
+    )]
+    QuotaValue { key: String, value: String },
+    /// A `[storage.quotas]` rule key is not a namespace or tenant pattern.
+    #[error(
+        "storage.quotas key {key:?} must be \"<forge>|<tenant-pattern>\" or \"<tenant-pattern>\", both halves non-empty, with `*` only on the tenant side"
+    )]
+    QuotaRuleKey { key: String },
     #[error("auth.oidc is enabled but {field} must be configured")]
     OidcMissingRequired { field: &'static str },
+
+    /// A per-issuer OIDC block is missing something it needs.
+    #[error("auth.oidc block for issuer {issuer:?} is missing {field}")]
+    OidcIssuerMissing { issuer: String, field: &'static str },
+
+    /// The v1.1 flat `[auth.oidc]` shape, which v1.2 replaced with
+    /// per-issuer blocks.
+    #[error(
+        "auth.oidc.{key} is the v1.1 flat shape; v1.2 configures one block per issuer: \
+         [auth.oidc.\"<issuer>\"] with audiences = [...] (and require / jwks_url / ca_pem / \
+         leeway_seconds inside that block)"
+    )]
+    OidcLegacyShape { key: &'static str },
 
     /// `[auth.oidc] jwks_refresh_seconds` is zero.
     #[error("auth.oidc.jwks_refresh_seconds must be greater than 0")]
@@ -99,10 +129,6 @@ pub enum ConfigError {
     /// `[auth.oidc] jwks_max_keys` is zero.
     #[error("auth.oidc.jwks_max_keys must be greater than 0")]
     OidcZeroMaxKeys,
-
-    /// `auth.oidc.jwks_urls` names an issuer missing from `issuers`.
-    #[error("auth.oidc.jwks_urls key {issuer:?} is not listed in auth.oidc.issuers")]
-    OidcJwksIssuerUnknown { issuer: String },
 
     /// A `jwks_urls` endpoint (or a default derivation target) is not HTTPS.
     #[error("auth.oidc JWKS endpoint for {issuer:?} must be https (got {url})")]
@@ -116,6 +142,34 @@ pub enum ConfigError {
         "auth.oidc issuer {issuer:?} must be an https URL (default JWKS endpoints derive from it)"
     )]
     OidcIssuerPlaintext { issuer: String },
+
+    /// An `[auth.runtime]` forge id is empty or contains the namespace
+    /// separator (`"<forge>|<tenant>"` would be ambiguous).
+    #[error(
+        "auth.runtime forge key {forge:?} must be non-empty and must not contain '|' (it is the \
+         forge half of the namespace)"
+    )]
+    RuntimeForgeKey { forge: String },
+
+    /// An enabled runtime block names no secret file.
+    #[error("auth.runtime forge {forge:?} is enabled but secret is not configured")]
+    RuntimeSecretMissing { forge: String },
+
+    /// An enabled runtime block has an empty tenant claim path.
+    #[error("auth.runtime forge {forge:?} has an empty tenant_claim")]
+    RuntimeTenantClaimMissing { forge: String },
+
+    /// A tenant-yielding credential plane is enabled (`[auth.oidc]
+    /// enabled = true`) together with the HMAC plane. Plane C's repo/run
+    /// fields are client-asserted and cannot express a tenant, so an
+    /// `hmac`/`merge` mode would funnel every HMAC request into one shared
+    /// namespace (`docs/shared-cache.md` §2/§9).
+    #[error(
+        "auth.mode = \"{mode}\" with a tenant-yielding credential plane ([auth.oidc] enabled) \
+         is a multi-tenant deployment, but HMAC cannot express a tenant - set \
+         auth.mode = \"bearer\""
+    )]
+    HmacInMultiTenant { mode: &'static str },
 
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.

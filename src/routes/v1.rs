@@ -43,14 +43,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use super::body_io::{BodyReader, LimitedReader};
-use crate::auth::{self, urls};
+use crate::auth::{self, Namespace, urls};
 use crate::cluster::relay::{self, RelayCommit, RelayReserve, RelayUpload};
 use crate::config::{AuthMode, KeyCase};
 use crate::error::ApiError;
@@ -112,8 +112,12 @@ pub struct CommitRequest {
 /// its runner-visible base, A mints the signed `archiveLocation` against B's
 /// host (shared secret per M12) and returns it — A never proxies the body. A
 /// dead owner degrades to a plain 204 miss inside the fan-out's ≤1s budget.
-pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+pub async fn find(
+    State(state): State<AppState>,
+    Extension(namespace): Extension<Namespace>,
+    Query(query): Query<FindQuery>,
+) -> Response {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -129,10 +133,17 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
         return StatusCode::NO_CONTENT.into_response();
     }
     let version = query.version.unwrap_or_default();
-    match lookup_local(storage, &keys, &version, state.cache_limits().key_case).await {
+    match lookup_local(
+        storage.as_ref(),
+        &keys,
+        &version,
+        state.cache_limits().key_case,
+    )
+    .await
+    {
         Ok(Some(entry)) => {
             let base = state.external_url.as_deref().unwrap_or_default();
-            return signed_find_hit(&state, base, &entry.key);
+            return signed_find_hit(&state, base, &namespace, &entry.key);
         }
         Ok(None) => {}
         Err(err) => {
@@ -144,12 +155,14 @@ pub async fn find(State(state): State<AppState>, Query(query): Query<FindQuery>)
     let Some(relay) = state.relay.as_deref() else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    let hits = relay.find(&keys, &version).await;
+    let hits = relay.find(&keys, &version, &namespace.0).await;
     match relay::best_hit(&hits, &keys, state.cache_limits().key_case) {
         Some(hit) => {
             let base = super::owner_base_url(hit.external_url.as_deref(), &hit.addr);
             tracing::debug!(owner = %hit.node_id, key = %hit.key, "v1 find: owner hit");
-            signed_find_hit(&state, &base, &hit.key)
+            // The owner answered from the namespace carried on the wire (§8),
+            // so the minted URL binds that same namespace.
+            signed_find_hit(&state, &base, &namespace, &hit.key)
         }
         None => {
             tracing::warn!(
@@ -188,8 +201,15 @@ pub(crate) async fn lookup_local(
 }
 
 /// Mint the signed `archiveLocation` hit body against `base` (the host that
-/// actually holds the blob — self or a remote owner).
-fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
+/// actually holds the blob — self or a remote owner). The minting namespace
+/// is MAC-bound into the URL (`docs/shared-cache.md` §4); a peer owner's rows
+/// are still the legacy namespace until the cluster-wire slice (§8).
+fn signed_find_hit(
+    state: &AppState,
+    base: &str,
+    namespace: &Namespace,
+    cache_key: &str,
+) -> Response {
     let policy = state.auth();
     let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
     let path = format!("{ARTIFACT_PATH_PREFIX}{cache_key}");
@@ -199,6 +219,7 @@ fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
         secret,
         SIGNED_URL_TTL_SECONDS,
         auth::now_secs(),
+        &namespace.0,
     );
     Json(json!({
         "result": "hit",
@@ -211,14 +232,15 @@ fn signed_find_hit(state: &AppState, base: &str, cache_key: &str) -> Response {
 /// `POST /_apis/artifactcache/caches` — reserve a new entry.
 ///
 /// 200 `{"cacheId":<n>,"cacheSize":<n>}` where the `cacheId` is a positive
-/// numeric handle (GitHub's v1 contract) and `cacheSize =
-/// max(0, cache.max_size - used_bytes)`; 409 with the GitHub
-/// duplicate body when a finalized entry already holds `(key, version)`.
+/// numeric handle (GitHub's v1 contract) and `cacheSize` is the tenant's
+/// remaining budget: `max(0, cache.max_size - used_bytes)`, narrowed to the
+/// resolved namespace's quota window when `[storage.quotas]` sets one.
 pub async fn reserve(
     State(state): State<AppState>,
+    Extension(namespace): Extension<Namespace>,
     Json(request): Json<ReserveRequest>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -258,14 +280,37 @@ pub async fn reserve(
             );
         }
     }
-    let cache_size = limits.max_size.saturating_sub(used);
+    let cache_size = match state.quota_for(&namespace.0) {
+        // v1.2 workstream F (docs/shared-cache.md §5): a quota narrows the
+        // window a tenant sees, but never widens it past the admin's global
+        // max_size budget - the smaller of the two is what is left.
+        Some(quota) => {
+            let ns_used = match storage.namespace_bytes().await {
+                Ok(used) => used,
+                Err(err) => {
+                    tracing::error!(error = %err, "v1 reserve: namespace accounting failed");
+                    return ApiError::Internal.into_response();
+                }
+            };
+            let quota_left = quota.saturating_sub(ns_used);
+            if limits.max_size > 0 {
+                limits.max_size.saturating_sub(used).min(quota_left)
+            } else {
+                quota_left
+            }
+        }
+        None => limits.max_size.saturating_sub(used),
+    };
     // Cluster seam (plan tasks 30/31): when a relay is present (cluster mode),
     // placement picks the owner. A remote owner takes the reservation and the
     // client keeps A's `cacheId`; a self owner (or no peers yet) falls through
     // to the local single-node reservation below.
     if let Some(relay) = state.relay.as_deref() {
         let client_cache_id = generate_cache_id(&key, &request.version);
-        match relay.reserve(client_cache_id, &key, &request.version).await {
+        match relay
+            .reserve(client_cache_id, &namespace.0, &key, &request.version)
+            .await
+        {
             RelayReserve::Local => {
                 state.metrics.observe_relay_hops(0);
             }
@@ -313,11 +358,12 @@ pub async fn reserve(
 /// unknown/expired reservation; 409 when the entry is already complete.
 pub async fn patch_chunk(
     State(state): State<AppState>,
+    Extension(namespace): Extension<Namespace>,
     Path(cache_id): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -358,7 +404,10 @@ pub async fn patch_chunk(
                     range,
                     body: Box::pin(std::io::Cursor::new(bytes)),
                 };
-                return match LocalRelay.stream_to_owner(storage, &cache_id, chunk).await {
+                return match LocalRelay
+                    .stream_to_owner(storage.as_ref(), &cache_id, chunk)
+                    .await
+                {
                     Ok(()) => StatusCode::NO_CONTENT.into_response(),
                     Err(err) => chunk_error(err),
                 };
@@ -383,7 +432,10 @@ pub async fn patch_chunk(
         body: stream,
     };
     let relay = LocalRelay;
-    match relay.stream_to_owner(storage, &cache_id, chunk).await {
+    match relay
+        .stream_to_owner(storage.as_ref(), &cache_id, chunk)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => chunk_error(err),
     }
@@ -398,10 +450,11 @@ pub async fn patch_chunk(
 /// reservation; 400 for `cacheId=0`.
 pub async fn commit(
     State(state): State<AppState>,
+    Extension(namespace): Extension<Namespace>,
     Path(cache_id): Path<String>,
     Json(request): Json<CommitRequest>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -456,14 +509,23 @@ pub async fn download(
 ) -> Response {
     // Authorize before touching storage so a bad/missing signature is a
     // fail-closed 403 even when the backend is misconfigured.
+    //
+    // The namespace rides in the capability data, not in a credential: this
+    // path is authorized by the signed URL alone (M2/M3), so the credential
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    let mut namespace = Namespace::legacy();
     if requires_signed_url(&state) {
         let policy = state.auth();
         let secret = policy.secret.as_deref().unwrap_or(FALLBACK_SECRET);
-        if let Err(err) = urls::validate(&query, uri.path(), secret, auth::now_secs()) {
-            return ApiError::from(err).into_response();
+        match urls::validate(&query, uri.path(), secret, auth::now_secs()) {
+            Ok(resolved) => namespace = resolved,
+            Err(err) => return ApiError::from(err).into_response(),
         }
     }
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -479,7 +541,7 @@ pub async fn download(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
     match range {
-        None => match read_range(storage, &cache_id, 0..size).await {
+        None => match read_range(storage.as_ref(), &cache_id, 0..size).await {
             Some(bytes) => (
                 StatusCode::OK,
                 [(header::ACCEPT_RANGES, String::from("bytes"))],
@@ -492,7 +554,7 @@ pub async fn download(
             let Some((start, end)) = parse_range(raw, size) else {
                 return range_not_satisfiable(size);
             };
-            let Some(bytes) = read_range(storage, &cache_id, start..end + 1).await else {
+            let Some(bytes) = read_range(storage.as_ref(), &cache_id, start..end + 1).await else {
                 return range_not_satisfiable(size);
             };
             (

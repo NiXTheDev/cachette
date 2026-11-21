@@ -294,7 +294,8 @@ async fn request(
         .await
         .expect("TLS handshake");
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         x-cachette-peer-protocol: 2\r\nContent-Length: 0\r\n"
     );
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -491,7 +492,7 @@ async fn signed_url_primitive_over_tls() {
     let addr = start_server(root.path(), AuthMode::Merge, &pki, no_pins()).await;
     let path = "/_apis/artifactcache/artifacts/42";
     let now = now_secs();
-    let signed = auth::urls::mint(path, "42", SECRET, 900, now);
+    let signed = auth::urls::mint(path, "42", SECRET, 900, now, "");
 
     // The minted query really travels the loopback TLS connection. The
     // artifact path is authorized by its signed URL alone (task 22), so a valid
@@ -519,7 +520,7 @@ async fn signed_url_primitive_over_tls() {
     ]);
     assert_eq!(
         auth::urls::validate(&params, path, SECRET, now),
-        Ok(()),
+        Ok(auth::Namespace::legacy()),
         "C16 minted URL validates"
     );
 

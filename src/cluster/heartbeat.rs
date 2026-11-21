@@ -29,6 +29,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::auth;
 use crate::cluster::PeerTable;
+use crate::cluster::{PEER_PROTOCOL_HEADER, PEER_PROTOCOL_VERSION};
 use crate::config::{MinFree, split_host_port};
 use crate::storage::StorageBackend;
 use crate::storage::eviction::Capacity;
@@ -204,6 +205,7 @@ async fn send_all(
         "used_bytes": used,
         "total_bytes": total,
         "draining": config.draining.load(Ordering::Relaxed),
+        "protocol_version": PEER_PROTOCOL_VERSION,
         "ts": now,
     });
     let body = serde_json::to_string(&payload).expect("heartbeat JSON is a fixed shape");
@@ -267,6 +269,7 @@ async fn exchange(
         })?;
     let request = format!(
         "POST {HEARTBEAT_PATH} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         {PEER_PROTOCOL_HEADER}: {PEER_PROTOCOL_VERSION}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );

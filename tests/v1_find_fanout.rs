@@ -217,6 +217,7 @@ async fn http(
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
+    head.push_str("x-cachette-peer-protocol: 2\r\n");
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");

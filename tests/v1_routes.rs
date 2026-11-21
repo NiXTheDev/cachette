@@ -62,7 +62,7 @@ fn now_secs() -> i64 {
 
 fn signed_url(key: &str) -> String {
     let path = format!("/_apis/artifactcache/artifacts/{key}");
-    let signed = urls::mint(&path, key, SECRET, 900, now_secs());
+    let signed = urls::mint(&path, key, SECRET, 900, now_secs(), "");
     format!("{path}{}", signed.query())
 }
 
@@ -920,6 +920,45 @@ async fn commit_then_find_and_download_round_trip() {
     assert_eq!(ranged.body, vec![0xAA, 0xBB, 0xBB, 0xBB]);
 }
 
+/// The route-layer namespace seam (v1.2 workstream F, `docs/shared-cache.md`
+/// §1/§4): every client-facing handler addresses storage through
+/// `AppState::storage_scoped`, and the credential gate resolves the request's
+/// namespace into the extensions. With no tenant-yielding credential plane
+/// configured every request resolves to the legacy namespace — so the flow's
+/// rows are exactly the ones an unscoped backend sees (single-tenant
+/// unchanged, §What does NOT change), and a view of another namespace sees
+/// nothing (the isolation guarantee, exercised end to end through the HTTP
+/// layer rather than the storage tests).
+#[tokio::test]
+async fn route_handlers_scope_storage_to_the_legacy_namespace() {
+    let (state, storage) = sized_state(0).await;
+    let app = routes::router(state);
+    let cache_id = reserve_key(&app).await;
+    assert_eq!(
+        patch(&app, &cache_id, 0, 4, 5, 0xAA).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        commit(&app, &cache_id, 5).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    // The unscoped backend IS the legacy ("") namespace view: the flow's
+    // row lands there, byte-for-byte the pre-namespaces behavior.
+    let stat = storage
+        .stat("chunked-key")
+        .await
+        .expect("stat")
+        .expect("legacy row");
+    assert_eq!(stat.size, 5);
+
+    // ...and a view of another namespace sees nothing: the scoped seam
+    // cannot leak rows across namespaces even though the backend is shared.
+    let other = storage.scoped("https://forge.example|other/tenant");
+    assert!(other.stat("chunked-key").await.expect("stat").is_none());
+    assert!(other.list().await.expect("list").is_empty());
+}
+
 #[tokio::test]
 async fn commit_wrong_size_returns_400_and_reaps_reservation() {
     let (state, storage, _dir) = fs_state_with_fs().await;
@@ -1114,7 +1153,7 @@ async fn find_returns_absolute_archive_location_when_external_url_configured() {
 async fn download_rejects_tampered_signed_url() {
     let app = routes::router(fixture_state().await);
     let path = format!("/_apis/artifactcache/artifacts/{FIXTURE_KEY}");
-    let signed = urls::mint(&path, FIXTURE_KEY, SECRET, 900, now_secs());
+    let signed = urls::mint(&path, FIXTURE_KEY, SECRET, 900, now_secs(), "");
     let mut mac = signed.mac.into_bytes();
     mac[0] = if mac[0] == b'0' { b'1' } else { b'0' };
     let damaged = format!(

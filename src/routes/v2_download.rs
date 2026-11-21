@@ -41,22 +41,33 @@ pub async fn download(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
-        return ApiError::Unavailable(String::from("storage backend not configured"))
-            .into_response();
-    };
+    // Authorize before touching storage so a bad/missing signature is a
+    // fail-closed 403 even when the backend is misconfigured.
+    //
+    // The namespace rides in the capability data, not in a credential: this
+    // path is authorized by the signed URL alone (task 26), so the credential
+    // gate never inserts an extension here. The minting namespace is MAC-bound
+    // into the URL (`docs/shared-cache.md` §4); a URL minted before namespaces
+    // (no `ns`) resolves to the legacy namespace, so a rolling upgrade keeps
+    // serving URLs minted before the restart.
+    //
     // The MAC binds the exact resource path, reconstructed from the route param
     // (so a traversal-style path can never spoof it).
     let path = format!("/v2/artifacts/{entry_id}");
     let policy = state.auth();
-    if let Err(err) = urls::validate(
+    let namespace = match urls::validate(
         &query,
         &path,
         super::signing_secret(&policy),
         auth::now_secs(),
     ) {
-        return ApiError::from(err).into_response();
-    }
+        Ok(resolved) => resolved,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
+        return ApiError::Unavailable(String::from("storage backend not configured"))
+            .into_response();
+    };
     if policy.cluster_enabled {
         tracing::debug!(
             entry_id = %entry_id,
@@ -78,7 +89,7 @@ pub async fn download(
         .or_else(|| headers.get(header::RANGE))
         .and_then(|value| value.to_str().ok());
     match range {
-        None => match read_range(storage, &entry_id, 0..size).await {
+        None => match read_range(storage.as_ref(), &entry_id, 0..size).await {
             Some(bytes) => (
                 StatusCode::OK,
                 [(header::ACCEPT_RANGES, String::from("bytes"))],
@@ -91,7 +102,7 @@ pub async fn download(
             let Some((start, end)) = parse_range(raw, size) else {
                 return range_not_satisfiable(size);
             };
-            let Some(bytes) = read_range(storage, &entry_id, start..end + 1).await else {
+            let Some(bytes) = read_range(storage.as_ref(), &entry_id, start..end + 1).await else {
                 return range_not_satisfiable(size);
             };
             (

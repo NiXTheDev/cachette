@@ -100,7 +100,7 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
           components: rustfmt
       # The component fetch is its own network leg and rustup carries no
       # ladder of its own (run 5's fmt died in 14s when the toolchain host
@@ -127,13 +127,13 @@ jobs:
           exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-1.100-${{ runner.arch }}
       # No cargo cache here on purpose: `cargo fmt` builds nothing, so a
       # registry/target cache would churn bytes for nothing (cache rationale
       # lives in the NOTE (Actions cache) block of release.yml's header).
@@ -150,34 +150,40 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header. Job-scoped key (check/clippy/test
-        # keep separate targets like rust-cache's default isolation), pinned
-        # on dtolnay's rust `cachekey` + the Cargo.lock hash, with a
-        # restore-keys fallback for lockfile drift.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
 
@@ -195,7 +201,7 @@ jobs:
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
           components: clippy
       # Same component-fetch ladder as the fmt job (docs above).
       - name: Ensure the components landed (retry ladder)
@@ -214,24 +220,33 @@ jobs:
           exit 1
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       - name: clippy -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -246,50 +261,62 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-1.100-${{ runner.arch }}
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
-      # tests fail, not skip, when a toolchain is missing).
-      - name: Install Node.js
-        uses: https://hangar.nixthedev.ru/actions/setup-node@v4
+      # tests fail, not skip, when a toolchain is missing). node/npm ship in
+      # the runner images themselves (act-runner's ubuntu-latest image on
+      # amd64, node:24-trixie on arm64), so there is nothing to install -
+      # the assert below fails loudly if that ever stops being true. The
+      # npm tarball caching that setup-node used to provide moves to plain
+      # actions/cache: same key shape (lock hash), same ~/.npm path.
+      - name: Cache npm tarballs
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
-          node-version: "20"
-          # Built-in restore-at-start/store-at-end of the npm tarballs via the
-          # toolkit; the fixture's `npm ci` then makes no registry fetches.
-          cache: "npm"
-          cache-dependency-path: tests/fixtures/package-lock.json
+          path: ~/.npm
+          key: npm-${{ hashFiles('tests/fixtures/package-lock.json') }}-${{ runner.arch }}
+      # go is NOT in the arm64 image (node:24-trixie), so the pin stays
+      # explicit here on all arches. setup-go caches ~/.cache/go-build +
+      # ~/go/pkg/mod natively (restore-at-start / store-at-end), so the
+      # vendored fixture builds below don't refetch/recompile from zero
+      # each run.
       - name: Install Go
         uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
           go-version: "1.25"
-      # Both setup steps above cache through the toolkit natively
-      # (restore-at-start / store-at-end): node caches the npm tarballs, go caches
-      # ~/.cache/go-build + ~/go/pkg/mod by default - so the vendored fixture
-      # builds below don't refetch/recompile from zero each run.
-      - name: Cache cargo registry/build
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
       - name: Assert real-client toolchains are present
@@ -315,31 +342,40 @@ jobs:
       # .forgejo/actions/rustup-mirror (see its header for the why).
       - name: Bootstrap rustup through the mirror ladder
         uses: ./.forgejo/actions/rustup-mirror
-      - name: Install pinned Rust (1.99)
+      - name: Install pinned Rust (1.100)
         id: toolchain
         uses: https://hangar.nixthedev.ru/dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.99
+          toolchain: 1.100
       # Restore the rustup toolchains dir (the ~20-25 min download on these
       # runners); dtolnay's `cachekey` output pins the exact toolchain
-      # version (pinned: 1.99, the version the battery + docker base
+      # version (pinned: 1.100, the version the battery + docker base
       # validate), so the next bump retargets the cache by itself.
       - name: Cache rustup toolchains
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       # The embedded example must resolve end to end (env + file + derived
       # defaults validated); --print-config masks secrets and exits non-zero on
       # any invalid key.
@@ -440,10 +476,12 @@ jobs:
           echo "::error::could not install the docker CLI after 3 attempts"
           exit 1
 
-      - name: Set up QEMU
-        uses: https://hangar.nixthedev.ru/docker/setup-qemu-action@v3.7.0
-        with:
-          platforms: linux/amd64,linux/arm64
+      # NO QEMU: the Dockerfile's builder stage is forced to $BUILDPLATFORM
+      # and cross-compiles BOTH musl binaries natively (rustc cross + zig cc
+      # for the foreign target's C) - no foreign-arch code is ever executed.
+      # This also takes gcc-15.2.0-under-QEMU OFF the amd64 build path (it
+      # deterministically ICE'd on the bundled sqlite3.c: runs 502/558 at
+      # -O3, runs 125-129 at -O2 with libsqlite3-sys 0.39.1).
 
       # The builder base is the one thing the docker jobs still haul through
       # EXTERNAL hosts: docker.io's blob CDN (production.cloudfront.docker.com)
@@ -458,7 +496,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="rust:1.98-alpine"
+          base="rust:1.100-alpine"
           digest="sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f"
           ok=0
           for attempt in 1 2 3 4 5 6 7 8; do
@@ -540,7 +578,7 @@ jobs:
       #   the truncations as -dev (the mutable aliases track dev heads until
       #   the next release push re-points them).
       # `tags` (newline-separated) is the published tag list (feeds
-      # build-push-action and the rung-2 imagetools merge). Per-entry
+      # build-push-action and the attempt-2 imagetools merge). Per-entry
       # metadata-action tagging was considered and dropped: its tag
       # expressions can only see the github context, not the Cargo.toml
       # version, so the version family cannot live inside type=raw entries.
@@ -588,25 +626,26 @@ jobs:
       # THE multi-arch push (linux/amd64 + linux/arm64) - every branch push
       # publishes with its ref's tag scheme, tried on the socket's native
       # builder FIRST (proven locally on Docker Desktop: native driver built
-      # the full dual-arch manifest list, binfmt handled arm64, cargo
-      # cache-mounts held the compile in the ~30s class):
-      #   rung 1: ONE build-push-action invocation, multi-platform --push
+      # the full dual-arch manifest list; the Dockerfile's builder stage is
+      # forced to $BUILDPLATFORM, so the compile itself is native on either
+      # host and cargo cache-mounts held the compile in the ~30s class):
+      #   attempt 1: ONE build-push-action invocation, multi-platform --push
       #           (containerd-store daemons do this outright).
-      #   rung 2: classic-store-safe route - per-arch build-push-action
+      #   attempt 2: classic-store-safe route - per-arch build-push-action
       #           pushes to scratch :ci-<arch> tags, then a tiny
       #           buildx imagetools merge composes each published tag
       #           (registry-side, no DOCKER_CLI_EXPERIMENTAL needed).
-      #   rung 3: only-if-1-and-2-failed - setup-buildx-action brings up the
+      #   attempt 3: only-if-1-and-2-failed - setup-buildx-action brings up the
       #           buildkit container builder (pinned buildx) as the last
       #           resort for a stubborn publish.
-      # Each rung is gated on the previous rung's failure; every build
+      # Each attempt is gated on the previous attempt's failure; every build
       # carries the same gha cache-from/cache-to pair - the flags that used
       # to live in the CACHE_FROM/CACHE_ARGS env blobs: mode=max both ways,
       # ignore-error=true covers cache outages DURING the build, and a
       # missing/malformed/expired token is RED at exporter configure time
       # BEFORE the build starts (seen live: "invalid number of segments").
-      - name: Publish multi-arch manifest (rung 1 - native builder)
-        id: rung1
+      - name: Publish multi-arch manifest (attempt 1 - native builder)
+        id: attempt1
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -618,9 +657,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Publish amd64 scratch tag (rung 2)
-        id: rung2_amd
-        if: steps.rung1.outcome == 'failure'
+      - name: Publish amd64 scratch tag (attempt 2)
+        id: attempt2_amd
+        if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -632,9 +671,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Publish arm64 scratch tag (rung 2)
-        id: rung2_arm
-        if: steps.rung1.outcome == 'failure'
+      - name: Publish arm64 scratch tag (attempt 2)
+        id: attempt2_arm
+        if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -646,9 +685,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Merge into manifest lists (rung 2)
-        id: rung2_merge
-        if: steps.rung2_amd.outcome == 'success' && steps.rung2_arm.outcome == 'success'
+      - name: Merge into manifest lists (attempt 2)
+        id: attempt2_merge
+        if: steps.attempt2_amd.outcome == 'success' && steps.attempt2_arm.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -663,18 +702,26 @@ jobs:
       # Rung 3: the setup-buildx contract via setup-buildx-action -
       # docker-container driver (its default), pinned buildx version,
       # cache-binary on (its default). No continue-on-error here: if the
-      # container builder cannot even start after rungs 1-2 failed, the job
+      # container builder cannot even start after attempts 1-2 failed, the job
       # is genuinely red.
-      - name: Set up the buildkit container builder (rung 3)
-        id: rung3_builder
-        if: steps.rung1.outcome == 'failure' && (steps.rung2_merge.outcome == 'failure' || steps.rung2_merge.outcome == 'skipped')
+      # The builder itself is PINNED: one generic name (ci),
+      # shared by any workflow on this host that pins the same name - an
+      # existing builder is adopted instead of spawning a fresh
+      # docker-buildx-<random> container per run, and cleanup=false leaves
+      # it standing (warm buildkit state included) on the runner host
+      # instead of piling temp builders into its storage.
+      - name: Set up the buildkit container builder (attempt 3)
+        id: attempt3_builder
+        if: steps.attempt1.outcome == 'failure' && (steps.attempt2_merge.outcome == 'failure' || steps.attempt2_merge.outcome == 'skipped')
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3.12.0
         with:
           version: v0.38.1
+          name: ci
+          cleanup: false
 
-      - name: Publish multi-arch manifest (rung 3 - container builder)
-        id: rung3
-        if: steps.rung3_builder.outcome == 'success'
+      - name: Publish multi-arch manifest (attempt 3 - container builder)
+        id: attempt3
+        if: steps.attempt3_builder.outcome == 'success'
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
           context: .
@@ -682,7 +729,7 @@ jobs:
           push: true
           provenance: false
           tags: ${{ steps.tags.outputs.tags }}
-          builder: ${{ steps.rung3_builder.outputs.name }}
+          builder: ${{ steps.attempt3_builder.outputs.name }}
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 

@@ -10,10 +10,13 @@ the runner-facing endpoints, the other serves the clustering needs (see
 - Blobs live on the local filesystem under a directory you choose; metadata and
   usage accounting live in a SQLite file beside them - schema-versioned, with
   verified migrations and a refuse-newer-than-binary check on upgrade.
-- Auth is a shared secret: Forgejo HMAC headers, bearer tokens, or both - with
-  optional OIDC bearer verification against your own IdP.
+- Auth comes from the CREDENTIAL, not the request: Forgejo HMAC headers,
+  bearer tokens, optional OIDC bearer JWTs and forge runtime tokens. Opt in to
+  multi-tenancy and one cachette serves many forges, each tenant isolated in
+  its own storage namespace with its own quota.
 - Optional peer-to-peer clustering discovers nodes, tracks capacity, and places
-  a cache write on the least-loaded healthy owner.
+  a cache write on the least-loaded healthy owner. The peer wire carries the
+  tenant namespace and refuses a mixed protocol version.
 
 > **Dogfooded.** cachette serves cachette: this project's own CI uses a live
 > deployment as the `docker buildx` layer cache and the `actions/cache`
@@ -43,7 +46,29 @@ the runner-facing endpoints, the other serves the clustering needs (see
   walker converges existing whole-blob entries when you flip it on.
 - **OIDC bearer auth.** `[auth.oidc]` verifies RS256 bearer JWTs against your
   IdP's JWKS: kid routing, periodic prefetch + lazy singleflight on unknown
-  kids, per-issuer HTTPS, structural rejections fail closed.
+  kids, per-issuer HTTPS, structural rejections fail closed. Each issuer is
+  its own block (`[auth.oidc."<issuer>"]`) with its own audiences, claim
+  pins, trust roots and clock skew - one deployment can trust many IdPs.
+- **Multi-tenant namespaces (opt-in).** An accepted OIDC or forge-runtime
+  token's tenant selects a storage namespace; the same key in two namespaces
+  is two isolated entries. Admin mappings in `[storage.namespaces]` can fold
+  several identities into one shared namespace. Capability URLs MAC-bind the
+  namespace, so a URL minted for one tenant cannot be replayed into another.
+  Single-tenant deployments are byte-identical: every credential resolves to
+  the legacy namespace until a tenant-yielding plane is enabled.
+- **Per-namespace quotas.** `[storage.quotas]` limits each namespace
+  independently, with exact or tenant-side wildcard rules and a required
+  `default`. An over-quota namespace is evicted first (worst excess first,
+  LRU within it), before the global `min_free` floor reclaims anything.
+- **Forge runtime tokens.** `[auth.runtime."<forge>"]` verifies HS256 tokens
+  signed by a forge's general token secret (a file path, read at boot), with
+  an optional scope allow-list and claim pins. Runtime tokens are tried before
+  OIDC; a tenant-yielding plane requires `auth.mode = "bearer"`.
+- **Namespace-aware cluster wire.** Every key-bearing peer request carries the
+  resolved namespace and `x-cachette-peer-protocol: 2`; a missing or different
+  version is refused with `426 Upgrade Required` before hello/heartbeat can
+  refresh health. Multi-tenant clusters are supported; a mixed cluster drains
+  to "no healthy peer" rather than merging tenants' rows.
 
 ## Quickstart
 
@@ -91,7 +116,7 @@ the runner-facing endpoints, the other serves the clustering needs (see
 
    ```bash
    curl http://127.0.0.1:8080/health
-   # {"version":"1.1.0","node_id":"<64-hex fingerprint>"}
+   # {"version":"1.2.0","node_id":"<64-hex fingerprint>"}
    ```
 
    `GET /metrics` on the same listener returns the Prometheus text-format
@@ -151,6 +176,8 @@ reference, valid-value notes, and examples.
 | `storage.cdc` | `avg_chunk_bytes` | target average chunk size, capped `[32768, 1048576]` | `131072` |
 | `storage.cdc` | `backfill` | converge existing whole-blob entries when enabled | `true` |
 | `storage.cdc` | `backfill_delay_ms` | pause between conversions, must be `> 0` | `100` |
+| `storage.namespaces` | `"<forge>\|<tenant>"` | mapped namespace name (boot-only) | `{}` |
+| `storage.quotas` | `default` + rule keys | bytesizes; exact or tenant-side wildcard (boot-only) | unset (unlimited) |
 | `cache` | `max_size` | bytes, `0` = unlimited | `0` |
 | `cache` | `eviction` | `lru`, `oldest`, `none` | `lru` |
 | `cache` | `key_case` | `lower`, `preserve` | `preserve` |
@@ -160,11 +187,17 @@ reference, valid-value notes, and examples.
 | `auth` | `tokens` | list of static bearer tokens | `[]` |
 | `auth` | `hmac_max_age_seconds` | seconds, `0` = disabled | `600` |
 | `auth.oidc` | `enabled` | boolean | `false` |
-| `auth.oidc` | `issuers` | list of HTTPS issuer URLs | unset |
-| `auth.oidc` | `audiences` | list of accepted `aud` values (any overlap) | unset |
-| `auth.oidc` | `jwks_urls` | map of issuer to JWKS endpoint | derived per issuer |
-| `auth.oidc` | `require` | map of claim to required value(s) | `{}` |
 | `auth.oidc` | `jwks_refresh_seconds` | periodic JWKS prefetch interval, `> 0` | `1800` |
+| `auth.oidc` | `jwks_max_keys` | server-wide cached-key cap | `32` |
+| `auth.oidc` | `jwks_ca_pem` | default JWKS trust roots (PEM path) | unset |
+| `auth.oidc."<issuer>"` | `audiences` | list of accepted `aud` values (any overlap) | required |
+| `auth.oidc."<issuer>"` | `jwks_url` | JWKS endpoint | `{issuer}/.well-known/jwks.json` |
+| `auth.oidc."<issuer>"` | `require` | map of claim to required value(s) | `{}` |
+| `auth.oidc."<issuer>"` | `leeway_seconds` | clock skew tolerated on `exp`/`nbf` | `30` |
+| `auth.oidc."<issuer>"` | `ca_pem` | trust roots for this issuer (overrides the default) | unset |
+| `auth.runtime."<forge>"` | `enabled`, `secret` | forge HS256 token plane (secret is a PEM/file path, boot-only) | disabled |
+| `auth.runtime."<forge>"` | `tenant_claim` | claim path whose value is the tenant | `oidc_extra.repository` |
+| `auth.runtime."<forge>"` | `scopes`, `require`, `leeway_seconds` | scope allow-list, claim pins, clock skew | `[]`, `{}`, `30` |
 | `v1` | `signed_url_ttl_seconds` | seconds (governs v1 and v2 capability URLs) | `900` |
 | `v2` | `jwt_secret` | HS256 secret (falls back to `auth.secret`) | unset |
 | `v2` | `jwt_ttl_seconds` | seconds (governs the Twirp JWT) | `300` |
@@ -217,8 +250,9 @@ connections. Reloadable: `[auth]` (`mode`, `secret`, `tokens`,
 numbers (`max_size`, `min_free`, `reservation_ttl_seconds`, `key_case`,
 `signed_url_ttl_seconds`, `max_chunk_bytes`), and `[log] level`. Boot-only
 (listener, storage backend and data directory, cluster wiring, `[v2]` JWT
-secret, `[auth.oidc]` — reload keeps the boot OIDC verifier) — restart to
-change. A malformed file is rejected and the previous
+secret, `[auth.oidc]`, `[auth.runtime]`, `[storage.namespaces]` and
+`[storage.quotas]` — reload keeps the boot verifiers, mappings and quotas) —
+restart to change. A malformed file is rejected and the previous
 config stays in effect. See
 [docs/configuration.md](docs/configuration.md#live-reload).
 
@@ -280,7 +314,7 @@ Options:
 - `verify`, `cache`, and `gc` take an exclusive lock on the data directory and
   refuse with a clear message while a server (or another ops command) holds it.
   `doctor` and `token mint` never touch the data directory and do not lock.
-- `cachette --version` prints `cachette 1.1.0`.
+- `cachette --version` prints `cachette 1.2.0`.
 - A configuration error exits with status `2`.
 
 ## Authentication
@@ -308,8 +342,17 @@ Notes:
 - **OIDC** (when `[auth.oidc]` is set): a bearer JWT from a configured issuer
   is accepted after RS256 verification against that issuer's JWKS, with
   audience overlap required; `alg`/`kid`/issuer mismatches fail closed. The
-  v1 gate's chain is static -> dynamic -> self-minted JWT -> OIDC. See
-  [docs/oidc.md](docs/oidc.md).
+  v1 gate's chain is static -> dynamic -> self-minted JWT -> runtime token ->
+  OIDC. See [docs/oidc.md](docs/oidc.md).
+- **Forge runtime tokens** (when `[auth.runtime."<forge>"]` is enabled) are
+  HS256 tokens signed by that forge's general token secret. They are verified
+  before OIDC so an HS256 token never reaches the RS256 verifier; a missing
+  tenant claim is a structural rejection, never a default tenant. See
+  [docs/shared-cache.md](docs/shared-cache.md).
+- **Multi-tenant boots** require `auth.mode = "bearer"` when OIDC or a runtime
+  plane is enabled: HMAC's repo/run fields are client-asserted and cannot
+  express a tenant. Cluster mode is allowed — peers carry the namespace (see
+  [docs/shared-cache.md](docs/shared-cache.md#8-the-cluster-wire)).
 - The v2 capability URLs (`/v2/upload/{id}`, `/v2/artifacts/{id}`) are
   authorized **only** by their signed URL, never by a bearer token.
 - Artifact **downloads** on v1 are likewise authorized by the signed
@@ -318,9 +361,12 @@ Notes:
 ### Capability URL security
 
 A signed URL carries `?id=<id>&exp=<unix>&mac=<hex>`, where
-`mac = HMAC-SHA256(auth.secret, "{path}|{id}|{exp}")`. The resource path is
-bound into the MAC, so any change to the path, id, or expiry fails with
-`403 {"error":"invalid or expired url"}`.
+`mac = HMAC-SHA256(auth.secret, "{path}|{id}|{exp}")` (with `|{ns}` appended
+when a tenant namespace is bound). The resource path is bound into the MAC,
+so any change to the path, id, or expiry fails with
+`403 {"error":"invalid or expired url"}`. The optional `ns` parameter is
+MAC-bound too: stripping or swapping it is a mismatch, while URLs minted
+before namespaces (no `ns`) still resolve to the legacy namespace.
 
 - Two TTL knobs govern validity: `v1.signed_url_ttl_seconds` (default `900`)
   covers both the v1 `archiveLocation` and the v2 capability URLs;
@@ -376,6 +422,9 @@ no usable multicast interface). See [docs/cluster.md](docs/cluster.md).
   backfill migration, GC, and rollout.
 - [docs/oidc.md](docs/oidc.md) - OIDC bearer auth: issuers, audiences, JWKS
   wiring, and the acceptance chain.
+- [docs/shared-cache.md](docs/shared-cache.md) - multi-tenant design:
+  credential planes, namespaces, quotas/eviction, admin mappings and the
+  peer wire.
 - [docs/image-stitching.md](docs/image-stitching.md) - assembling multi-arch
   images with the cache in the loop.
 
@@ -388,7 +437,7 @@ tests including the v1 + v2 real-client round-trips (`node`/`npm`/`go` must be
 present or the job fails), the example-config/compose lint, and the multi-node
 cluster suites - followed by the docker job: a registry-published multi-arch
 image (`linux/amd64` + `linux/arm64`) on EVERY branch push - `release` carries
-the bare-semver tags `1.1.0`/`1.1`/`1` + `latest` + `release` read from
+the bare-semver tags `1.2.0`/`1.2`/`1` + `latest` + `release` read from
 `Cargo.toml`, other branches carry the regexY-style dev scheme
 (`dev`/`latest`/`<version>-dev` + truncations, with `latest` tracking dev
 between releases), and PR runs publish a flyweight `pr-<number>` tag. Both

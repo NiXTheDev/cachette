@@ -208,7 +208,8 @@ async fn request(
         .await
         .expect("TLS handshake");
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         x-cachette-peer-protocol: 2\r\nContent-Length: 0\r\n\r\n"
     );
     stream
         .write_all(head.as_bytes())

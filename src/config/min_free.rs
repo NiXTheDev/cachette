@@ -76,20 +76,27 @@ impl MinFree {
 
     /// Parse a bytesize: `<digits><suffix>` with a 1024-based suffix.
     fn parse_bytes(raw: &str) -> Option<Self> {
-        let index = raw.find(|c: char| !c.is_ascii_digit())?;
-        if index == 0 {
-            return None;
-        }
-        let multiplier = match raw[index..].to_ascii_lowercase().as_str() {
-            "kb" | "kib" => 1024u64,
-            "mb" | "mib" => 1024 * 1024,
-            "gb" | "gib" => 1024 * 1024 * 1024,
-            "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
-            _ => return None,
-        };
-        let value: u64 = raw[..index].parse().ok()?;
-        Some(Self::Bytes(value.checked_mul(multiplier)?))
+        parse_byte_size(raw).map(Self::Bytes)
     }
+}
+
+/// Parse `<digits><suffix>` with the 1024-based suffix forms (`"2GB"` and
+/// `"2GiB"` both mean `2 * 1024^3`). Shared with `[storage.quotas]`, whose
+/// limits use the same syntax as `min_free` (docs/shared-cache.md §5).
+pub(crate) fn parse_byte_size(raw: &str) -> Option<u64> {
+    let index = raw.find(|c: char| !c.is_ascii_digit())?;
+    if index == 0 {
+        return None;
+    }
+    let multiplier = match raw[index..].to_ascii_lowercase().as_str() {
+        "kb" | "kib" => 1024u64,
+        "mb" | "mib" => 1024 * 1024,
+        "gb" | "gib" => 1024 * 1024 * 1024,
+        "tb" | "tib" => 1024 * 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    let value: u64 = raw[..index].parse().ok()?;
+    value.checked_mul(multiplier)
 }
 
 impl FromStr for MinFree {

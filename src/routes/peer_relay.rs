@@ -18,6 +18,11 @@
 //!   the entry. Idempotent: a repeat whose reservation B already published (the
 //!   finalize deleted the reservation) succeeds when a size-matched finalized
 //!   entry for `key` exists.
+//!
+//! v1.2 (§8): every key-bearing body/query carries the resolved namespace;
+//! handlers address `state.storage_scoped(&namespace)`, so B stores exactly
+//! what A sends. The pin gate runs first, then the peer protocol-version
+//! gate (`x-cachette-peer-protocol: 2`, else `426 Upgrade Required`).
 
 use std::io::Cursor;
 
@@ -38,6 +43,10 @@ use crate::storage::{Chunk, ChunkRange, normalize_key};
 pub(crate) struct ReserveBody {
     key: String,
     version: String,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
     /// Declared size when known; v1 reserve omits it, so admission falls back
     /// to the `min_free` floor.
     #[serde(default)]
@@ -53,7 +62,7 @@ pub(crate) async fn reserve(
     State(state): State<AppState>,
     Json(body): Json<ReserveBody>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&body.namespace) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -85,6 +94,27 @@ pub(crate) async fn reserve(
         );
         return ApiError::Unavailable(String::from("insufficient capacity")).into_response();
     }
+    // v1.2 workstream F (`docs/shared-cache.md` §5/§8): the peer mirror of the
+    // v1 reserve clamp — a tenant sees its namespace quota remaining, never
+    // widened past the global `max_size` window.
+    let cache_size = match state.quota_for(&body.namespace) {
+        Some(quota) => {
+            let ns_used = match storage.namespace_bytes().await {
+                Ok(used) => used,
+                Err(err) => {
+                    tracing::error!(error = %err, "peer reserve: namespace accounting failed");
+                    return ApiError::Internal.into_response();
+                }
+            };
+            let quota_left = quota.saturating_sub(ns_used);
+            if limits.max_size > 0 {
+                limits.max_size.saturating_sub(used).min(quota_left)
+            } else {
+                quota_left
+            }
+        }
+        None => limits.max_size.saturating_sub(used),
+    };
     let cache_id = super::v1::generate_cache_id(&key, &body.version);
     let cache_id_key = cache_id.to_string();
     let expires_at = u64::try_from(crate::auth::now_secs())
@@ -98,7 +128,6 @@ pub(crate) async fn reserve(
         return ApiError::Internal.into_response();
     }
     state.metrics.add_reservations(1);
-    let cache_size = limits.max_size.saturating_sub(used);
     Json(json!({"cacheId": cache_id, "cacheSize": cache_size})).into_response()
 }
 
@@ -106,6 +135,10 @@ pub(crate) async fn reserve(
 #[derive(serde::Deserialize)]
 pub(crate) struct UploadParams {
     offset: u64,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
 }
 
 /// `PUT /_internal/peers/upload/{cacheId}?offset=<start>` — stage one forwarded
@@ -117,7 +150,7 @@ pub(crate) async fn upload(
     Query(params): Query<UploadParams>,
     body: Body,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&params.namespace) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -157,6 +190,10 @@ pub(crate) struct CommitBody {
     /// entry after the reservation row was removed by the first commit.
     #[serde(default)]
     key: Option<String>,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
 }
 
 /// `POST /_internal/peers/commit/{cacheId}` — verify + publish a forwarded
@@ -167,7 +204,7 @@ pub(crate) async fn commit(
     Path(cache_id): Path<String>,
     Json(body): Json<CommitBody>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&body.namespace) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -208,6 +245,10 @@ pub(crate) struct FindParams {
     keys: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
 }
 
 /// `GET /_internal/peers/find?key=<csv>&version=<v>` — owner lookup for a
@@ -219,7 +260,7 @@ pub(crate) async fn find(
     State(state): State<AppState>,
     Query(params): Query<FindParams>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&params.namespace) else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let raw = params
@@ -237,7 +278,14 @@ pub(crate) async fn find(
         return StatusCode::NO_CONTENT.into_response();
     }
     let version = params.version.as_deref().unwrap_or("");
-    match super::v1::lookup_local(storage, &keys, version, state.cache_limits().key_case).await {
+    match super::v1::lookup_local(
+        storage.as_ref(),
+        &keys,
+        version,
+        state.cache_limits().key_case,
+    )
+    .await
+    {
         Ok(Some(entry)) => Json(json!({
             "hit": true,
             "cacheId": entry.key,
@@ -261,6 +309,10 @@ pub(crate) struct V2ReserveBody {
     cache_id: String,
     key: String,
     version: String,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
     /// Declared size when known; omitted on the v2 create path, so admission
     /// falls back to the `min_free` floor.
     #[serde(default)]
@@ -275,7 +327,7 @@ pub(crate) async fn v2_reserve(
     State(state): State<AppState>,
     Json(body): Json<V2ReserveBody>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&body.namespace) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_response();
     };
@@ -334,6 +386,10 @@ pub(crate) struct V2FinalizeBody {
     size_bytes: Option<u64>,
     #[serde(default, alias = "cacheId")]
     cache_id: Option<String>,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
 }
 
 /// `POST /_internal/peers/v2/finalize` — verify a v2 entry the runner uploaded
@@ -343,7 +399,7 @@ pub(crate) async fn v2_finalize(
     State(state): State<AppState>,
     Json(body): Json<V2FinalizeBody>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&body.namespace) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false, "message": "storage backend not configured"})),
@@ -351,7 +407,7 @@ pub(crate) async fn v2_finalize(
             .into_response();
     };
     let key = normalize_key(&body.key, state.cache_limits().key_case);
-    match super::twirp::stat_key_or_id(storage, &key, body.cache_id.as_deref()).await {
+    match super::twirp::stat_key_or_id(storage.as_ref(), &key, body.cache_id.as_deref()).await {
         Ok(Some(stat)) => {
             if let Some(size) = body.size_bytes
                 && size != stat.size
@@ -376,6 +432,10 @@ pub(crate) async fn v2_finalize(
 #[derive(serde::Deserialize)]
 pub(crate) struct V2SupersedeBody {
     key: String,
+    /// Resolved storage namespace A applied (`docs/shared-cache.md` §8);
+    /// absent means the legacy `""` namespace.
+    #[serde(default)]
+    namespace: String,
 }
 
 /// `POST /_internal/peers/v2/supersede` — delete B's entry by key (idempotent).
@@ -383,7 +443,7 @@ pub(crate) async fn v2_supersede(
     State(state): State<AppState>,
     Json(body): Json<V2SupersedeBody>,
 ) -> Response {
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&body.namespace) else {
         return Json(json!({"ok": true})).into_response();
     };
     let key = normalize_key(&body.key, state.cache_limits().key_case);

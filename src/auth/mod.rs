@@ -15,9 +15,11 @@ pub mod jwks;
 pub mod jwks_cache;
 pub mod jwt;
 pub mod oidc;
+pub mod runtime;
 pub mod tokens;
 pub mod urls;
 
+use axum::Extension;
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
@@ -33,6 +35,38 @@ pub use urls::{SignedUrl, UrlError};
 
 /// Path prefix guarded by [`require_auth`]; plan task 18 owns the handlers.
 pub const ARTIFACTCACHE_PREFIX: &str = "/_apis/artifactcache";
+
+/// The namespace a request's credential resolved to (v1.2 workstream F,
+/// `docs/shared-cache.md` §1/§3).
+///
+/// [`require_auth`] resolves the credential to `(forge, tenant)` and inserts
+/// the namespace into the request extensions; handlers scope storage through
+/// [`crate::state::AppState::storage_scoped`] so a view only ever touches its
+/// own namespace's rows. The composite identity is plane-specific: Plane A
+/// (OIDC) yields `"<issuer>|<tenant>"` from the issuer block's `tenant_claim`,
+/// Plane B (runtime tokens) the configured forge id and the tenant claim,
+/// Plane C (HMAC) is single-tenant by definition. Static bearer tokens and
+/// cachette's own minted JWTs carry no tenant and stay on the legacy
+/// namespace — byte-identical behavior (§Rollout: default off).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Namespace(pub String);
+
+impl Namespace {
+    /// The legacy single-tenant namespace: the schema v3 `''` default every
+    /// pre-namespaces row carries. What an absent extension (an ungated path)
+    /// and — for now — every gated credential resolve to.
+    #[must_use]
+    pub fn legacy() -> Self {
+        Self(String::new())
+    }
+
+    /// The namespace of an optional `Extension` extraction, defaulting to the
+    /// legacy namespace when the gate did not insert one (ungated paths).
+    #[must_use]
+    pub fn from_extension(ext: Option<Extension<Self>>) -> Self {
+        ext.map(|Extension(ns)| ns).unwrap_or_else(Self::legacy)
+    }
+}
 
 /// Artifact **downloads** are authorized by their signed URL alone: the GitHub
 /// contract calls `archiveLocation` "already authenticated", and both real
@@ -86,7 +120,11 @@ impl Default for AuthPolicy {
 /// axum's `route_layer` panics on an empty router, so the gate is applied as
 /// a path-scoped layer instead: requests outside the prefix pass through
 /// untouched, everything under it must authenticate.
-pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
     if !path.starts_with(ARTIFACTCACHE_PREFIX) || path.starts_with(ARTIFACT_DOWNLOAD_PREFIX) {
         return next.run(request).await;
@@ -94,22 +132,53 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
     let policy = state.auth();
     // The OIDC verifier (v1.1) is a server-level capability installed at
     // boot; a token that fails the static/store/signature checks is
-    // attempted as an RS256 JWT when one is installed (docs/oidc.md).
+    // attempted as an RS256 JWT when one is installed (docs/oidc.md). The
+    // v1.2 runtime verifier (docs/shared-cache.md §3) sits ahead of it, so a
+    // forge HS256 token never reaches the RS256 gate.
     let oidc = state.oidc();
-    let authorized = match policy.mode {
-        AuthMode::Hmac => hmac::verify(&policy, request.headers()),
+    let runtime = state.runtime();
+    // v1.2 workstream F (docs/shared-cache.md §1/§3): resolve the credential
+    // to a namespace the handlers scope storage through. Plane A (OIDC)
+    // yields "<issuer>|<tenant>", Plane B (runtime) "<forge>|<tenant>"; HMAC
+    // and the tenant-less bearer paths are single-tenant and resolve to the
+    // legacy namespace. HMAC in a multi-tenant boot is refused before this
+    // layer is ever reached.
+    let namespace = match policy.mode {
+        AuthMode::Hmac => hmac::verify(&policy, request.headers()).then(Namespace::legacy),
         AuthMode::Bearer => {
-            bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+            bearer::verify(
+                &policy,
+                &state.tokens,
+                runtime.as_deref(),
+                oidc.as_ref(),
+                request.headers(),
+            )
+            .await
         }
         AuthMode::Merge => {
-            hmac::verify(&policy, request.headers())
-                || bearer::verify(&policy, &state.tokens, oidc.as_ref(), request.headers()).await
+            if hmac::verify(&policy, request.headers()) {
+                Some(Namespace::legacy())
+            } else {
+                bearer::verify(
+                    &policy,
+                    &state.tokens,
+                    runtime.as_deref(),
+                    oidc.as_ref(),
+                    request.headers(),
+                )
+                .await
+            }
         }
     };
-    if authorized {
-        next.run(request).await
-    } else {
-        ApiError::Unauthorized(String::from("authentication required")).into_response()
+    match namespace {
+        Some(namespace) => {
+            // The admin may map this identity into a shared namespace
+            // (docs/shared-cache.md §7); handlers only see the resolved one.
+            let namespace = state.resolve_namespace(namespace);
+            request.extensions_mut().insert(namespace);
+            next.run(request).await
+        }
+        None => ApiError::Unauthorized(String::from("authentication required")).into_response(),
     }
 }
 

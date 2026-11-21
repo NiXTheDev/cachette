@@ -43,7 +43,9 @@ on the main listener.
 |---|---|---|---|
 | `storage.backend` | `fs` | `fs` | The filesystem backend is the only one in this release. |
 | `storage.fs.path` | path | `"/var/lib/cachette"` | Blob root. The SQLite index and the default identity directory live here. |
-| `storage.fs.min_free` | fraction / percent / bytesize | `0.2` | Free-space floor before eviction triggers. |
+| `storage.fs.min_free` | fraction / percent / bytesize | `0.2` | Share of `total` (see `[cache] max_size`) that must stay free; eviction runs while `total - used < min_free`. This is a reserve inside `total`, not a second size limit. |
+| `storage.namespaces` | map `"<forge>\|<tenant>"` -> namespace | `{}` | Admin mapping applied when a credential resolves its namespace. An exact match replaces the derived name; other identities keep it. Boot-only. See [shared-cache.md](shared-cache.md#7-many-forges-one-cache). |
+| `storage.quotas` | table of bytesizes | unset | Per-namespace byte limits. Absent means every namespace is unlimited; a present table requires a `default` and accepts exact (`"<forge>\|<tenant>"`) and wildcard (`"<tenant-pattern>"`, `"<forge>\|<tenant-pattern>"`) overrides. See [shared-cache.md](shared-cache.md#5-quotas-and-eviction-fairness). |
 
 `min_free` accepts three forms:
 
@@ -55,11 +57,16 @@ on the main listener.
 A bare word such as `min_free = "abc"` and an out-of-range fraction are
 rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 
+Together the two knobs define one capacity model: `total` is
+`cache.max_size` when set (otherwise the filesystem total), and `min_free`
+reserves part of it; eviction targets `free = total - used >= min_free`. In
+other words, the usable band is `total - min_free`.
+
 ### `[cache]`
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `max_size` | integer | `0` | Maximum cache size in bytes; `0` means unlimited (the disk total is used for capacity). |
+| `cache.max_size` | integer | `0` | Hard ceiling in bytes for `total`, across all namespaces. `0` means no configured ceiling, so the filesystem's total is used instead. Per-namespace `[storage.quotas]` can only narrow the resulting window. |
 | `eviction` | `lru` / `oldest` / `none` | `lru` | `lru` and `oldest` reclaim space down to the free-space floor; `none` refuses a new reservation when below the floor instead. |
 | `key_case` | `lower` / `preserve` | `preserve` | Key normalization before exact and prefix matching. |
 | `reservation_ttl_seconds` | integer | `3600` | Reservation lifetime; must be greater than `0`. Expired reservations and their partial chunk files are reaped. |
@@ -75,6 +82,13 @@ rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 | `v1.signed_url_ttl_seconds` | integer | `900` | TTL for v1 `archiveLocation` tokens **and** v2 capability URLs. |
 | `v2.jwt_secret` | string | falls back to `auth.secret` | HS256 secret used to validate the Twirp JWT. |
 | `v2.jwt_ttl_seconds` | integer | `300` | TTL for the self-minted Twirp JWT. |
+
+`[auth.oidc."<issuer>"]` (see `docs/oidc.md`) and
+`[auth.runtime."<forge>"]` (see `docs/shared-cache.md` §3) are boot-only
+credential-plane tables. An enabled block of either is **tenant-yielding**,
+so the boot guard requires `auth.mode = "bearer"`. Cluster mode is allowed:
+peers carry the namespace on the wire and a mixed protocol version is
+refused (`docs/shared-cache.md` §8).
 
 ### `[cluster]`
 
@@ -173,7 +187,7 @@ Reloadable at runtime:
   and `[server]` `max_chunk_bytes`.
 - `[log] level` — the active tracing filter is swapped in place.
 
-Boot-only (a reload logs them as ignored; restart to change):
+Boot-only (restart to change):
 
 - `[server]` `listen`, `external_url`, `tls_*`, `drain_grace_seconds` — the
   listener and identity are already bound.
@@ -182,6 +196,9 @@ Boot-only (a reload logs them as ignored; restart to change):
   timeouts and thresholds; the peer table, TLS pins, and mDNS task are live.
 - `[v2]` `jwt_secret` / `jwt_ttl_seconds` and `[v1]` / `[v2]` protocol shape —
   these are wired into the router at boot.
+- `[auth.oidc]` and `[auth.runtime]` — the credential-plane verifiers are
+  built at boot (`docs/oidc.md`, `docs/shared-cache.md` §3); a reloaded table
+  is not swapped in.
 
 A malformed or invalid file is rejected and the previously loaded configuration
 stays in effect (fail-closed); the failure is logged at `warn`.

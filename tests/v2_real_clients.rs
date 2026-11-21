@@ -369,7 +369,14 @@ async fn run_scenarios() -> Result<Outcome, String> {
     // with `x-ms-range: bytes=1000-1099` (what `blockblob.DownloadStream` sends
     // for a non-zero offset) must return 206 + the exact slice.
     let artifact_path = format!("/v2/artifacts/{LARGE_KEY}");
-    let signed = urls::mint(&artifact_path, LARGE_KEY, FIXTURE_SECRET, 600, now_secs());
+    let signed = urls::mint(
+        &artifact_path,
+        LARGE_KEY,
+        FIXTURE_SECRET,
+        600,
+        now_secs(),
+        "",
+    );
     let ranged_probe = raw_get(
         addr,
         &format!("{artifact_path}{}", signed.query()),

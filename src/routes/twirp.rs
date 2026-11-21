@@ -29,7 +29,9 @@
 //! Auth policy on `/twirp/*` (mirrors the v1 handler matrix):
 //! * static tokens (`[auth] tokens` + the dynamic `TokenStore`) are accepted in
 //!   **every** mode;
-//! * a self-minted JWT is accepted only in `bearer`/`merge` modes;
+//! * a self-minted JWT is accepted only in `bearer`/`merge` modes, and an
+//!   OIDC JWT is attempted after it in the same modes (the shared bearer
+//!   chain `require_auth` uses);
 //! * in `hmac` mode a JWT is **never** accepted (Forgejo HMAC headers do not
 //!   authenticate v2 either);
 //! * missing/invalid credentials → `401 {"code":"unauthenticated",...}`.
@@ -44,7 +46,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::auth::{self, jwt, urls};
+use crate::auth::{self, Namespace, bearer, urls};
 use crate::cluster::relay::{self, V2Finalize, V2Reserve};
 use crate::config::AuthMode;
 use crate::error::ApiError;
@@ -92,10 +94,17 @@ pub async fn dispatch(
     let Some(known) = Method::from_path(&method) else {
         return bad_route(&method);
     };
-    if !authorized(&state, &headers).await {
+    // v1.2 workstream F (docs/shared-cache.md §1/§3): the credential resolves
+    // to a namespace the handlers scope storage through. The twirp gate is
+    // this module's own `authorized` (it never runs under `require_auth`),
+    // so its resolution point is here; Plane A (OIDC) yields
+    // "<issuer>|<tenant>", tenant-less bearer paths and static tokens the
+    // legacy namespace. The admin mapping applies last (§7).
+    let Some(namespace) = authorized(&state, &headers).await else {
         return ApiError::Unauthorized(String::from("authentication required"))
             .into_twirp_response();
-    }
+    };
+    let namespace = state.resolve_namespace(namespace);
     if !accepts_json(&headers) {
         return ApiError::BadRequest(String::from(
             "unsupported content type; use application/json",
@@ -107,12 +116,14 @@ pub async fn dispatch(
             .into_twirp_response();
     }
     match known {
-        Method::CreateCacheEntry => create_cache_entry(&state, &body).await,
-        Method::FinalizeCacheEntryUpload => finalize_cache_entry(&state, &body).await,
-        Method::SupersedeCacheEntry => supersede_cache_entry(&state, &body).await,
-        Method::GetCacheEntryDownloadURL => get_cache_entry_download_url(&state, &body).await,
+        Method::CreateCacheEntry => create_cache_entry(&state, &namespace, &body).await,
+        Method::FinalizeCacheEntryUpload => finalize_cache_entry(&state, &namespace, &body).await,
+        Method::SupersedeCacheEntry => supersede_cache_entry(&state, &namespace, &body).await,
+        Method::GetCacheEntryDownloadURL => {
+            get_cache_entry_download_url(&state, &namespace, &body).await
+        }
         Method::FindMissingOrStaleCacheEntries => {
-            find_missing_or_stale_cache_entries(&state, &body).await
+            find_missing_or_stale_cache_entries(&state, &namespace, &body).await
         }
     }
 }
@@ -213,7 +224,7 @@ struct CacheMetadata {
 /// floor (logged, not rejected — the eviction service is off the request
 /// path). Single-node: the owner is this node, so the URLs point at our own
 /// external host (`server.external_url`).
-async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn create_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: CreateCacheEntryRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -221,7 +232,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
                 .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
@@ -245,7 +256,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
             Some(owner) if !relay.is_self_node(&owner) => {
                 let cache_id = generate_cache_id(&key, &request.version);
                 return match relay
-                    .v2_reserve(&owner, &cache_id, &key, &request.version)
+                    .v2_reserve(&owner, &cache_id, &key, &request.version, &namespace.0)
                     .await
                 {
                     V2Reserve::Accepted { external_url } => {
@@ -255,7 +266,7 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
                             owner = %owner.node_id, addr = %owner.addr, cache_id = %cache_id,
                             "v2 create: reserved on remote owner"
                         );
-                        mint_create_response(state, &base, &cache_id)
+                        mint_create_response(state, &base, namespace, true, &cache_id)
                     }
                     V2Reserve::Duplicate => duplicate_entry_response(),
                     V2Reserve::NoCapacity => {
@@ -340,28 +351,39 @@ async fn create_cache_entry(state: &AppState, body: &[u8]) -> Response {
         tracing::debug!(cache_id = %cache_id, "v2 create: cluster mode (self-owned entry)");
     }
     let base = state.external_url.as_deref().unwrap_or_default();
-    mint_create_response(state, base, &cache_id)
+    mint_create_response(state, base, namespace, false, &cache_id)
 }
 
 /// Mint the `CreateCacheEntry` capability URLs against `base` (the host that
 /// owns the entry: self on the single-node/self-owner path, a remote owner B on
 /// the cluster path). The MAC key is the shared secret (M12), so B validates
 /// URLs A minted, and the paths match the `/v2/upload` + `/v2/artifacts`
-/// handlers.
-fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Response {
+/// handlers. The namespace the reservation was made in rides in the MAC
+/// (`docs/shared-cache.md` §4), so the capability paths resolve to it —
+/// except for a REMOTE owner's host (`base` not self): the owner's
+/// reservation was relayed into its legacy-namespace rows until the
+/// cluster-wire slice (§8), so such URLs bind nothing.
+fn mint_create_response(
+    state: &AppState,
+    base: &str,
+    namespace: &Namespace,
+    remote_owner: bool,
+    cache_id: &str,
+) -> Response {
     let policy = state.auth();
     let secret = super::signing_secret(&policy);
     let now = auth::now_secs();
     let ttl = state.cache_limits().signed_url_ttl_seconds;
+    let ns: &str = if remote_owner { "" } else { &namespace.0 };
     let upload_path = format!("{UPLOAD_PATH_PREFIX}{cache_id}");
     let download_path = format!("{ARTIFACT_PATH_PREFIX}{cache_id}");
     let signed_upload = format!(
         "{base}{upload_path}{}",
-        urls::mint(&upload_path, cache_id, secret, ttl, now).query()
+        urls::mint(&upload_path, cache_id, secret, ttl, now, ns).query()
     );
     let signed_download = format!(
         "{base}{download_path}{}",
-        urls::mint(&download_path, cache_id, secret, ttl, now).query()
+        urls::mint(&download_path, cache_id, secret, ttl, now, ns).query()
     );
     // `snake_case` proto/Twirp JSON names (see the module docs): the vendored
     // go-actions-cache `cache_v2.go` reads `signed_upload_url` from this
@@ -387,7 +409,7 @@ fn mint_create_response(state: &AppState, base: &str, cache_id: &str) -> Respons
 ///
 /// Single-node: the blob is local. In cluster mode the owning node may be a
 /// peer; task 32 forwards this call to `POST B/_internal/peers/v2/finalize`.
-async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn finalize_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: FinalizeCacheEntryUploadRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -397,12 +419,12 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache_limits().key_case);
-    let stat = match stat_key_or_id(storage, &key, request.cache_id.as_deref()).await {
+    let stat = match stat_key_or_id(storage.as_ref(), &key, request.cache_id.as_deref()).await {
         Ok(stat) => stat,
         Err(err) => {
             tracing::error!(error = %err, "v2 finalize: stat failed");
@@ -421,7 +443,12 @@ async fn finalize_cache_entry(state: &AppState, body: &[u8]) -> Response {
     // the finalize out to the healthy owner(s) (plan task 32).
     if let Some(relay) = state.relay.as_deref() {
         match relay
-            .v2_finalize(&key, request.size_bytes, request.cache_id.as_deref())
+            .v2_finalize(
+                &namespace.0,
+                &key,
+                request.size_bytes,
+                request.cache_id.as_deref(),
+            )
             .await
         {
             V2Finalize::Ok => return Json(json!({"ok": true})).into_response(),
@@ -461,7 +488,7 @@ pub(crate) async fn stat_key_or_id(
 ///
 /// Single-node: deletes locally. In cluster mode task 32 forwards this to the
 /// owner (`POST B/_internal/peers/v2/supersede`).
-async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
+async fn supersede_cache_entry(state: &AppState, namespace: &Namespace, body: &[u8]) -> Response {
     let request: SupersedeCacheEntryRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -469,13 +496,13 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
                 .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
     let key = normalize_key(&request.key, state.cache_limits().key_case);
     if let Some(relay) = state.relay.as_deref() {
-        relay.v2_supersede(&key).await;
+        relay.v2_supersede(&namespace.0, &key).await;
         return Json(json!({"ok": true})).into_response();
     }
     if let Err(err) = storage.delete(&key).await {
@@ -498,7 +525,11 @@ async fn supersede_cache_entry(state: &AppState, body: &[u8]) -> Response {
 /// Single-node: mints locally. In cluster mode the entry node first checks
 /// locally (self-owned) and, on miss, fans out to the owner (task 32) — it
 /// never proxies the download body.
-async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response {
+async fn get_cache_entry_download_url(
+    state: &AppState,
+    namespace: &Namespace,
+    body: &[u8],
+) -> Response {
     let request: GetCacheEntryDownloadURLRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -508,7 +539,7 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return ApiError::Unavailable(String::from("storage backend not configured"))
             .into_twirp_response();
     };
@@ -550,34 +581,35 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
         &Version::from(request.version.as_str()),
         limits.key_case,
     ) {
-        {
-            let matched_key = entry.key.clone();
-            let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
-            let base = state.external_url.as_deref().unwrap_or_default();
-            let signed = format!(
-                "{}{artifact_path}{}",
-                base,
-                urls::mint(
-                    &artifact_path,
-                    &matched_key,
-                    super::signing_secret(&policy),
-                    limits.signed_url_ttl_seconds,
-                    auth::now_secs(),
-                )
-                .query()
-            );
-            return Json(json!({
-                "ok": true,
-                "signed_download_url": signed,
-                "matched_key": matched_key,
-            }))
-            .into_response();
-        }
+        let matched_key = entry.key.clone();
+        let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
+        let base = state.external_url.as_deref().unwrap_or_default();
+        let signed = format!(
+            "{}{artifact_path}{}",
+            base,
+            urls::mint(
+                &artifact_path,
+                &matched_key,
+                super::signing_secret(&policy),
+                limits.signed_url_ttl_seconds,
+                auth::now_secs(),
+                &namespace.0,
+            )
+            .query()
+        );
+        return Json(json!({
+            "ok": true,
+            "signed_download_url": signed,
+            "matched_key": matched_key,
+        }))
+        .into_response();
     }
     // Local miss: fan out to owners (plan task 32). Only queries peers, never
     // proxies the download body.
     if let Some(relay) = state.relay.as_deref() {
-        let hits = relay.find(&lookup_keys, &request.version).await;
+        let hits = relay
+            .find(&lookup_keys, &request.version, &namespace.0)
+            .await;
         if let Some(hit) = relay::best_hit(&hits, &lookup_keys, limits.key_case) {
             let matched_key = hit.key.clone();
             let artifact_path = format!("{ARTIFACT_PATH_PREFIX}{matched_key}");
@@ -591,6 +623,9 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
                     super::signing_secret(&policy),
                     limits.signed_url_ttl_seconds,
                     auth::now_secs(),
+                    // The owner answered from the namespace carried on the
+                    // wire (§8), so bind the URL to that same namespace.
+                    &namespace.0,
                 )
                 .query()
             );
@@ -612,7 +647,11 @@ async fn get_cache_entry_download_url(state: &AppState, body: &[u8]) -> Response
 ///
 /// Single-node: reports this node's entries. In cluster mode task 32 fans the
 /// query out across healthy peers and unions the responses.
-async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> Response {
+async fn find_missing_or_stale_cache_entries(
+    state: &AppState,
+    namespace: &Namespace,
+    body: &[u8],
+) -> Response {
     let request: FindMissingOrStaleCacheEntriesRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
@@ -622,7 +661,7 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             .into_twirp_response();
         }
     };
-    let Some(storage) = state.storage.as_deref() else {
+    let Some(storage) = state.storage_scoped(&namespace.0) else {
         return Json(json!({"cache_entries": []})).into_response();
     };
     let limits = state.cache_limits();
@@ -664,7 +703,9 @@ async fn find_missing_or_stale_cache_entries(state: &AppState, body: &[u8]) -> R
             continue;
         }
         if let Some(relay) = state.relay.as_deref() {
-            let hits = relay.find(std::slice::from_ref(&key), &version).await;
+            let hits = relay
+                .find(std::slice::from_ref(&key), &version, &namespace.0)
+                .await;
             if let Some(hit) = relay::best_hit(&hits, std::slice::from_ref(&key), limits.key_case) {
                 cache_entries.push(json!({
                     "key": hit.key.clone(),
@@ -718,30 +759,33 @@ fn generate_cache_id(key: &str, version: &str) -> String {
 }
 
 /// Bearer/JWT gate: static tokens first (all modes), then dynamic tokens
-/// (all modes), then a self-minted JWT in `bearer`/`merge` modes only.
-async fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(token) = auth::bearer_token(headers) else {
-        return false;
-    };
+/// (all modes), then the shared bearer chain in `bearer`/`merge` modes only
+/// (cachette's self-minted JWT, then the configured forge runtime tokens,
+/// then - when installed - OIDC). Returns the namespace the accepted
+/// credential resolves to; twirp has no HMAC arm, so a request this gate
+/// accepts always carries a namespace.
+async fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Namespace> {
+    let token = auth::bearer_token(headers)?;
     let policy = state.auth();
     let is_static = policy
         .static_tokens
         .iter()
         .any(|candidate| auth::constant_time_eq(candidate.as_bytes(), token.as_bytes()));
     if is_static || state.tokens.is_valid(token).await.unwrap_or(false) {
-        return true;
+        return Some(Namespace::legacy());
     }
     match policy.mode {
-        AuthMode::Hmac => false,
-        AuthMode::Bearer | AuthMode::Merge => jwt_is_valid(state, token),
-    }
-}
-
-/// Validate a self-minted JWT against the configured signing secret.
-fn jwt_is_valid(state: &AppState, token: &str) -> bool {
-    match state.auth().secret.as_deref() {
-        Some(secret) => jwt::validate(token, secret, auth::now_secs()).is_ok(),
-        None => false,
+        AuthMode::Hmac => None,
+        AuthMode::Bearer | AuthMode::Merge => {
+            bearer::verify(
+                &policy,
+                &state.tokens,
+                state.runtime().as_deref(),
+                state.oidc().as_ref(),
+                headers,
+            )
+            .await
+        }
     }
 }
 
