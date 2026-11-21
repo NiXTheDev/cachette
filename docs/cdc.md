@@ -334,3 +334,11 @@ referrers in only one of them; crash injection at each conversion bound
 and a `used_bytes` consistency check; a staged chunk surviving a concurrent
 sweep; a zero-ref chunk of a chunked entry still being swept; a chunk
 referenced across namespaces surviving the sweep.
+
+**v1.2 status:** landed. The zero-ref purge in `sweep_orphan_chunks` consults the referring entry's `layout` (a live manifest of a complete
+`chunked` entry is a referrer even if `refs` drifted to zero; a `whole` row
+never owns a manifest), counts referrers from any namespace, and purges only
+the unreferenced row. The guarded conversion transaction plus the age grace
+on rowless staged files covers the three crash bounds; the `storage_fs`
+tests drive each bound through boot + sweep and check `used_bytes` against
+the at-rest invariant.

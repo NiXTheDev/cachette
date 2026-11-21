@@ -575,9 +575,26 @@ impl FsStorage {
                 let conn = lock(&conn)?;
                 // Zero-ref rows first: purging them makes their files
                 // sweepable in this same pass (one-pass convergence).
+                // B-3 (docs/cdc.md): the predicate consults the LAYOUT of
+                // every referencing entry, not just the `refs` counter. A
+                // live manifest row of a complete `chunked` entry is a
+                // referrer even if the counter drifted to 0; a stale
+                // manifest row of a `whole` entry is not (whole rows own a
+                // blob, never a manifest). Referrers count from ANY
+                // namespace, so a cross-namespace manifest keeps the chunk
+                // alive; only the unreferenced row itself is purged.
                 let stale: Vec<String> = {
                     let mut stmt = conn
-                        .prepare("SELECT id FROM chunks WHERE refs <= 0 AND created_at <= ?1")
+                        .prepare(
+                            "SELECT c.id FROM chunks c \
+                             WHERE c.refs <= 0 AND c.created_at <= ?1 \
+                               AND NOT EXISTS ( \
+                                 SELECT 1 FROM entry_chunks ec \
+                                 JOIN entries e ON e.id = ec.entry_id \
+                                 WHERE ec.chunk_id = c.id \
+                                   AND e.layout = 'chunked' AND e.complete = 1 \
+                               )",
+                        )
                         .map_err(sql)?;
                     let rows = stmt
                         .query_map([cutoff], |row| row.get::<_, String>(0))
@@ -5282,6 +5299,290 @@ mod storage_fs {
             at_rest_invariant(&storage),
             "a zero-ref purge moves no accounting"
         );
+    }
+
+    /// B-3 (docs/cdc.md): the zero-ref predicate consults the referring
+    /// entry's LAYOUT. A stale manifest row of a `whole` entry does not make
+    /// a chunk row live; a manifest row of a complete `chunked` entry does,
+    /// even when the `refs` counter drifted to 0.
+    #[tokio::test]
+    async fn sweep_zero_ref_predicate_consults_the_referring_layout() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let ghost = "deadbeefdeadbeef";
+        let ghost_file = dir.path().join("chunks").join(format!("{ghost}.chunk"));
+        let now = super::super::unix_now() as i64;
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, size, created_at, accessed_at, \
+                     complete, layout, namespace) \
+                 VALUES ('whole-row', 'whole', 5, 0, 0, 1, 'whole', '')",
+                [],
+            )
+            .expect("seed whole row");
+            conn.execute(
+                "INSERT INTO entries (id, key, size, created_at, accessed_at, \
+                     complete, layout, namespace) \
+                 VALUES ('chunked-row', 'chunked', 5, 0, 0, 1, 'chunked', '')",
+                [],
+            )
+            .expect("seed chunked row");
+        }
+
+        let plant = |refs: i64, manifest_entry: Option<&str>| {
+            std::fs::write(&ghost_file, b"ghost").expect("plant ghost file");
+            backdate(&ghost_file, 2 * 3600);
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO chunks (id, size, refs, created_at, namespace) \
+                 VALUES (?1, 5, ?2, ?3, '')",
+                params![ghost, refs, now - 7200],
+            )
+            .expect("plant ghost row");
+            if let Some(entry) = manifest_entry {
+                conn.execute(
+                    "INSERT INTO entry_chunks (entry_id, seq, chunk_id, namespace) \
+                     VALUES (?1, 0, ?2, '')",
+                    params![entry, ghost],
+                )
+                .expect("plant manifest row");
+            }
+        };
+
+        // A whole row's stale manifest does NOT protect the chunk: purged.
+        plant(0, Some("whole-row"));
+        let report = storage
+            .sweep_orphan_chunks(super::super::unix_now() - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.rows, 1, "whole manifest is not a referrer");
+        assert!(chunk_rows(&storage).is_empty(), "ghost row purged");
+        assert!(!ghost_file.exists(), "ghost file swept in the same pass");
+
+        // A complete chunked row's manifest DOES protect it, even with a
+        // drifted zero `refs` counter.
+        plant(0, Some("chunked-row"));
+        let report = storage
+            .sweep_orphan_chunks(super::super::unix_now() - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.rows, 0, "chunked manifest keeps the row live");
+        assert_eq!(report.files, 0, "and keeps its file");
+        assert!(ghost_file.exists(), "referenced chunk file survives");
+
+        // Once the manifest is gone the row is collectable again.
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute("DELETE FROM entry_chunks", [])
+                .expect("drop manifest");
+        }
+        let report = storage
+            .sweep_orphan_chunks(super::super::unix_now() - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.rows, 1, "unreferenced again");
+    }
+
+    /// B-3: a manifest from a DIFFERENT namespace is still a referrer, and
+    /// the sweep never touches that namespace's rows.
+    #[tokio::test]
+    async fn sweep_keeps_a_chunk_referenced_from_another_namespace() {
+        let dir = TestDir::new();
+        let storage = open_cdc(&dir);
+        let ghost = "deadbeefdeadbeef";
+        let ghost_file = dir.path().join("chunks").join(format!("{ghost}.chunk"));
+        let now = super::super::unix_now() as i64;
+        {
+            let conn = lock(&storage.conn).expect("lock");
+            conn.execute(
+                "INSERT INTO entries (id, key, size, created_at, accessed_at, \
+                     complete, layout, namespace) \
+                 VALUES ('other-entry', 'other', 5, 0, 0, 1, 'chunked', 'forge|b')",
+                [],
+            )
+            .expect("seed other-namespace row");
+            conn.execute(
+                "INSERT INTO chunks (id, size, refs, created_at, namespace) \
+                 VALUES (?1, 5, 0, ?2, 'forge|a')",
+                params![ghost, now - 7200],
+            )
+            .expect("plant ghost row in namespace A");
+            conn.execute(
+                "INSERT INTO entry_chunks (entry_id, seq, chunk_id, namespace) \
+                 VALUES ('other-entry', 0, ?1, 'forge|b')",
+                [ghost],
+            )
+            .expect("cross-namespace manifest");
+        }
+        std::fs::write(&ghost_file, b"ghost").expect("plant ghost file");
+        backdate(&ghost_file, 2 * 3600);
+
+        let report = storage
+            .sweep_orphan_chunks(super::super::unix_now() - 3600)
+            .await
+            .expect("sweep");
+        assert_eq!(report.rows, 0, "cross-namespace referrer keeps the row");
+        assert_eq!(report.files, 0, "and keeps its file");
+        assert!(ghost_file.exists(), "the file survives");
+        let rows = chunk_rows(&storage);
+        assert_eq!(rows.len(), 1, "the other namespace's row is untouched");
+        assert_eq!(rows[0].0, ghost);
+    }
+
+    /// B-3: a conversion's staged chunk files are protected by the age
+    /// grace while the pass is parked at the writer gate — a concurrent
+    /// sweep cannot delete them mid-conversion.
+    #[tokio::test]
+    async fn staged_chunks_survive_a_concurrent_sweep_until_the_grace() {
+        let dir = TestDir::new();
+        let storage = Arc::new(open_cdc(&dir));
+        // A separate handle models a concurrent sweeper with its own gate.
+        let sweeper = open_cdc(&dir);
+        let payload = pattern(48 * 1024, 7);
+        let _id = seed_whole_entry(&dir, storage.as_ref(), "staged-sweep", &payload);
+        let before = used_of(&storage).await;
+
+        let _gate = storage.gate.write().await;
+        let task = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                storage
+                    .backfill_step(CdcParams::new(4096), &mut HashSet::new())
+                    .await
+                    .expect("step")
+            })
+        };
+        for _ in 0..200 {
+            if !chunk_files(&dir).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!chunk_files(&dir).is_empty(), "the pass staged its chunks");
+        let staged = chunk_files(&dir);
+
+        // A sweep while the conversion is parked must not touch fresh files.
+        let now = super::super::unix_now();
+        let report = sweeper
+            .sweep_orphan_chunks(now - 3600)
+            .await
+            .expect("concurrent sweep");
+        assert_eq!(report.rows, 0, "no manifest is committed yet");
+        assert_eq!(report.files, 0, "fresh staged files are kept");
+        assert_eq!(chunk_files(&dir), staged, "staged set unchanged");
+
+        drop(_gate);
+        let step = task.await.expect("join");
+        assert!(
+            matches!(step, BackfillStep::Converted(_)),
+            "the pass still commits: {step:?}"
+        );
+        assert_eq!(
+            layout_of(&storage, "staged-sweep").as_deref(),
+            Some("chunked")
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            before,
+            "a size-neutral conversion moves no accounting"
+        );
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting rests on the invariant after the sweep"
+        );
+    }
+
+    /// B-3: crash injection at the three conversion bounds (staged,
+    /// published-but-not-unlinked, unlinked) converges after a boot + sweep:
+    /// every entry is readable as exactly one layout, accounting rests on
+    /// the at-rest invariant, and the leftovers are collectable.
+    #[tokio::test]
+    async fn conversion_crash_bounds_converge_after_reboot_and_sweep() {
+        let staged_payload = pattern(32 * 1024, 11);
+        let published_payload = pattern(48 * 1024, 12);
+        let unlinked_payload = pattern(48 * 1024, 13);
+        let dir = TestDir::new();
+        {
+            let storage = open_cdc(&dir);
+
+            // Bound 1 — staged: a whole row plus rowless chunk files (the
+            // pass wrote them but never committed a manifest).
+            seed_whole_entry(&dir, &storage, "crash-staged", &staged_payload);
+            let stale = dir.path().join("chunks").join("deadbeefdeadbeef.chunk");
+            std::fs::write(&stale, b"staged").expect("plant staged chunk");
+            backdate(&stale, 2 * 3600);
+
+            // Bound 2 — published: the layout flipped and the manifest
+            // committed, but the old blob unlink was lost.
+            storage
+                .put_stream("crash-published", bytes(&published_payload))
+                .await
+                .expect("put published");
+            storage
+                .finalize("crash-published")
+                .await
+                .expect("finalize published");
+            let leftover = dir
+                .path()
+                .join("blobs")
+                .join(format!("{}.blob", entry_id("crash-published")));
+            std::fs::write(&leftover, b"leftover").expect("plant leftover blob");
+            backdate(&leftover, 2 * 3600);
+
+            // Bound 3 — unlinked: the fully converted shape, nothing left
+            // for the sweeper to collect.
+            storage
+                .put_stream("crash-unlinked", bytes(&unlinked_payload))
+                .await
+                .expect("put unlinked");
+            storage
+                .finalize("crash-unlinked")
+                .await
+                .expect("finalize unlinked");
+
+            let now = super::super::unix_now();
+            let chunks = storage
+                .sweep_orphan_chunks(now - 3600)
+                .await
+                .expect("chunk sweep");
+            let blobs = storage
+                .sweep_orphan_blobs(now - 3600)
+                .await
+                .expect("blob sweep");
+            assert_eq!(chunks.files, 1, "staged chunk collected");
+            assert_eq!(blobs, 1, "leftover blob collected");
+            assert!(!stale.exists(), "staged chunk gone");
+            assert!(!leftover.exists(), "leftover blob gone");
+            assert_eq!(
+                layout_of(&storage, "crash-staged").as_deref(),
+                Some("whole")
+            );
+            assert_eq!(used_of(&storage).await, at_rest_invariant(&storage));
+        }
+
+        // A reboot never reintroduces the leftovers or double-counts.
+        let storage = open_cdc(&dir);
+        assert_eq!(
+            used_of(&storage).await,
+            at_rest_invariant(&storage),
+            "accounting survives the reboot"
+        );
+        for (key, want) in [
+            ("crash-staged", &staged_payload),
+            ("crash-published", &published_payload),
+            ("crash-unlinked", &unlinked_payload),
+        ] {
+            let got = read_all(
+                storage
+                    .get_range(key, 0..want.len() as u64)
+                    .await
+                    .expect("get range"),
+            )
+            .await;
+            assert_eq!(got, *want, "{key} reads byte-exact after convergence");
+        }
     }
 
     /// The conversion crash window (docs/cdc.md §GC): a blob file whose row
