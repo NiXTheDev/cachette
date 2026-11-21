@@ -53,9 +53,13 @@ description: >
 # mirror that actually won. The composite does not define either var, so
 # the exported values reach its steps untouched.
 #
-# The probe fetches a channel manifest (a few hundred bytes), never a
-# toolchain archive, so the ladder costs nothing but one round-trip per
-# mirror per job.
+# The probe fetches a channel manifest for the PINNED toolchain (a few
+# hundred bytes), never a toolchain archive, so the ladder costs nothing but
+# one round-trip per mirror per job. Probing `stable` is not enough: a mirror
+# can mirror the stable channel but 404 on `channel-rust-1.100.toml.sha256`,
+# win the race, and then fail the actual 1.100 install (the v1.2 push runs
+# 632/634 died exactly there). Asking for the pinned manifest keeps those
+# half-mirrors out of the race.
 #
 # When NOTHING answers inside the deadline it leaves the defaults in
 # place and warns - the composite's own retries then apply, exactly as
@@ -83,7 +87,7 @@ runs:
           printf '%s|%s\n' "$dist" "$update" > "$race/cand.$i"
           (
             if curl -fsSL --connect-timeout 15 --max-time 45 \
-                      -o /dev/null "$dist/dist/channel-rust-stable.toml.sha256"; then
+                      -o /dev/null "$dist/dist/channel-rust-1.100.toml.sha256"; then
               ln "$race/cand.$i" "$race/winner" 2>/dev/null || true
               echo "rust mirror probe answered: $dist"
             else

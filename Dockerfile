@@ -179,17 +179,20 @@ ENV PATH="/usr/local/zig:${PATH}"
 #   build path entirely.
 RUN cargo install cargo-zigbuild --locked
 
-# The x86_64 musl std for the cross target - fetched through the SAME
+# Both musl std libs are installed explicitly: the pinned rust:1.100-alpine
+# image does not reliably ship aarch64's std (the old assumption cost the
+# v1.2 docker legs E0463 "can't find crate for core"). The SAME
 # mirror race the workflows use (.forgejo/actions/rustup-mirror): the
 # runners' path to static.rust-lang.org dies at the TLS layer
 # intermittently (the v1.1.0 cut lost run 108 to exactly this, before a
-# single line was compiled). aarch64-unknown-linux-musl is the image's
-# host target and ships preinstalled.
+# single line was compiled).
 #
 # The race mirrors the action: all four probes run at once, the FIRST one
 # to answer wins via an atomic `ln` (EEXIST for everyone else), losers
-# are killed, deadline 60s. Inside a single RUN this all stays one shell
-# so `dist` reaches the rustup call below.
+# are killed, deadline 60s. The probe asks for the PINNED channel manifest
+# (`channel-rust-1.100`), not `stable`: a mirror that carries stable but
+# not 1.100 must not win and break `rustup target add`. Inside a single RUN
+# this all stays one shell so `dist` reaches the rustup call below.
 RUN set -eu; \
     race="/tmp/rustup-mirror-race"; rm -rf "$race"; mkdir -p "$race"; \
     i=0; pids=""; \
@@ -200,7 +203,7 @@ RUN set -eu; \
       i=$((i + 1)); \
       printf '%s' "$m" > "$race/cand.$i"; \
       ( if curl -fsSL --connect-timeout 15 --max-time 45 \
-                -o /dev/null "$m/dist/channel-rust-stable.toml.sha256"; then \
+                -o /dev/null "$m/dist/channel-rust-1.100.toml.sha256"; then \
           ln "$race/cand.$i" "$race/winner" 2>/dev/null || true; \
         fi ) & \
       pids="$pids $!"; \
@@ -216,7 +219,7 @@ RUN set -eu; \
     else \
       echo "no rust mirror answered - using the rustup defaults"; \
     fi; \
-    rustup target add x86_64-unknown-linux-musl
+    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # Optional crates.io source replacement for restricted networks (CI needs NONE;
 # CI runners reach crates.io directly):
