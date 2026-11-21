@@ -133,7 +133,7 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-1.100-${{ runner.arch }}
       # No cargo cache here on purpose: `cargo fmt` builds nothing, so a
       # registry/target cache would churn bytes for nothing (cache rationale
       # lives in the NOTE (Actions cache) block of release.yml's header).
@@ -163,21 +163,27 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header. Job-scoped key (check/clippy/test
-        # keep separate targets like rust-cache's default isolation), pinned
-        # on dtolnay's rust `cachekey` + the Cargo.lock hash, with a
-        # restore-keys fallback for lockfile drift.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
 
@@ -220,18 +226,27 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       - name: clippy -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -259,7 +274,7 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
+          key: rustup-1.100-${{ runner.arch }}
       # node/npm drive the @actions/cache v3 toolkit fixture; go drives the
       # vendored go-actions-cache client. Both are REQUIRED (the real-client
       # tests fail, not skip, when a toolchain is missing). node/npm ship in
@@ -272,7 +287,7 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.npm
-          key: npm-${{ runner.arch }}-${{ hashFiles('tests/fixtures/package-lock.json') }}
+          key: npm-${{ hashFiles('tests/fixtures/package-lock.json') }}-${{ runner.arch }}
       # go is NOT in the arm64 image (node:24-trixie), so the pin stays
       # explicit here on all arches. setup-go caches ~/.cache/go-build +
       # ~/go/pkg/mod natively (restore-at-start / store-at-end), so the
@@ -282,17 +297,26 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
           go-version: "1.25"
-      - name: Cache cargo registry/build
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       # Fail loudly BEFORE cargo if a toolchain is absent: a real-client test
       # must never degenerate into a silent skip (plan tasks 22/27).
       - name: Assert real-client toolchains are present
@@ -331,18 +355,27 @@ jobs:
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: ~/.rustup/toolchains
-          key: rustup-toolchains-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}
-      - name: Cache cargo registry/build
+          key: rustup-1.100-${{ runner.arch }}
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE of release.yml's header; job-scoped key, see the check job.
+        # NOTE of release.yml's header. This key is IDENTICAL in pr-checks
+        # and release.yml, so the registry/git store is shared across all
+        # workflows on the same arch/toolchain/lockfile.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ github.job }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Host-target artifacts only; shared by the check jobs, never with
+        # release's cross-target legs.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-checks-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-checks-1.100-${{ runner.arch }}-
       # The embedded example must resolve end to end (env + file + derived
       # defaults validated); --print-config masks secrets and exits non-zero on
       # any invalid key.
@@ -545,7 +578,7 @@ jobs:
       #   the truncations as -dev (the mutable aliases track dev heads until
       #   the next release push re-points them).
       # `tags` (newline-separated) is the published tag list (feeds
-      # build-push-action and the rung-2 imagetools merge). Per-entry
+      # build-push-action and the attempt-2 imagetools merge). Per-entry
       # metadata-action tagging was considered and dropped: its tag
       # expressions can only see the github context, not the Cargo.toml
       # version, so the version family cannot live inside type=raw entries.
@@ -596,23 +629,23 @@ jobs:
       # the full dual-arch manifest list; the Dockerfile's builder stage is
       # forced to $BUILDPLATFORM, so the compile itself is native on either
       # host and cargo cache-mounts held the compile in the ~30s class):
-      #   rung 1: ONE build-push-action invocation, multi-platform --push
+      #   attempt 1: ONE build-push-action invocation, multi-platform --push
       #           (containerd-store daemons do this outright).
-      #   rung 2: classic-store-safe route - per-arch build-push-action
+      #   attempt 2: classic-store-safe route - per-arch build-push-action
       #           pushes to scratch :ci-<arch> tags, then a tiny
       #           buildx imagetools merge composes each published tag
       #           (registry-side, no DOCKER_CLI_EXPERIMENTAL needed).
-      #   rung 3: only-if-1-and-2-failed - setup-buildx-action brings up the
+      #   attempt 3: only-if-1-and-2-failed - setup-buildx-action brings up the
       #           buildkit container builder (pinned buildx) as the last
       #           resort for a stubborn publish.
-      # Each rung is gated on the previous rung's failure; every build
+      # Each attempt is gated on the previous attempt's failure; every build
       # carries the same gha cache-from/cache-to pair - the flags that used
       # to live in the CACHE_FROM/CACHE_ARGS env blobs: mode=max both ways,
       # ignore-error=true covers cache outages DURING the build, and a
       # missing/malformed/expired token is RED at exporter configure time
       # BEFORE the build starts (seen live: "invalid number of segments").
-      - name: Publish multi-arch manifest (rung 1 - native builder)
-        id: rung1
+      - name: Publish multi-arch manifest (attempt 1 - native builder)
+        id: attempt1
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -624,9 +657,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Publish amd64 scratch tag (rung 2)
-        id: rung2_amd
-        if: steps.rung1.outcome == 'failure'
+      - name: Publish amd64 scratch tag (attempt 2)
+        id: attempt2_amd
+        if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -638,9 +671,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Publish arm64 scratch tag (rung 2)
-        id: rung2_arm
-        if: steps.rung1.outcome == 'failure'
+      - name: Publish arm64 scratch tag (attempt 2)
+        id: attempt2_arm
+        if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
@@ -652,9 +685,9 @@ jobs:
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 
-      - name: Merge into manifest lists (rung 2)
-        id: rung2_merge
-        if: steps.rung2_amd.outcome == 'success' && steps.rung2_arm.outcome == 'success'
+      - name: Merge into manifest lists (attempt 2)
+        id: attempt2_merge
+        if: steps.attempt2_amd.outcome == 'success' && steps.attempt2_arm.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -669,26 +702,26 @@ jobs:
       # Rung 3: the setup-buildx contract via setup-buildx-action -
       # docker-container driver (its default), pinned buildx version,
       # cache-binary on (its default). No continue-on-error here: if the
-      # container builder cannot even start after rungs 1-2 failed, the job
+      # container builder cannot even start after attempts 1-2 failed, the job
       # is genuinely red.
-      # The builder itself is PINNED: one generic name (hangar-builder),
+      # The builder itself is PINNED: one generic name (ci),
       # shared by any workflow on this host that pins the same name - an
       # existing builder is adopted instead of spawning a fresh
       # docker-buildx-<random> container per run, and cleanup=false leaves
       # it standing (warm buildkit state included) on the runner host
       # instead of piling temp builders into its storage.
-      - name: Set up the buildkit container builder (rung 3)
-        id: rung3_builder
-        if: steps.rung1.outcome == 'failure' && (steps.rung2_merge.outcome == 'failure' || steps.rung2_merge.outcome == 'skipped')
+      - name: Set up the buildkit container builder (attempt 3)
+        id: attempt3_builder
+        if: steps.attempt1.outcome == 'failure' && (steps.attempt2_merge.outcome == 'failure' || steps.attempt2_merge.outcome == 'skipped')
         uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3.12.0
         with:
           version: v0.38.1
-          name: hangar-builder
+          name: ci
           cleanup: false
 
-      - name: Publish multi-arch manifest (rung 3 - container builder)
-        id: rung3
-        if: steps.rung3_builder.outcome == 'success'
+      - name: Publish multi-arch manifest (attempt 3 - container builder)
+        id: attempt3
+        if: steps.attempt3_builder.outcome == 'success'
         uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
         with:
           context: .
@@ -696,7 +729,7 @@ jobs:
           push: true
           provenance: false
           tags: ${{ steps.tags.outputs.tags }}
-          builder: ${{ steps.rung3_builder.outputs.name }}
+          builder: ${{ steps.attempt3_builder.outputs.name }}
           cache-from: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }}
           cache-to: type=gha,url=https://acc.nixthedev.ru,token=${{ secrets.CACHETTE_BUILDX_JWT }},mode=max,ignore-error=true
 

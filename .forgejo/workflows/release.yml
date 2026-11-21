@@ -536,21 +536,27 @@ jobs:
           toolchain: 1.100
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry/build
+      - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
-        # NOTE at the top of this file. Cross artifacts live under
-        # target/<triple>, so the scope is the matrix target, pinned on
-        # dtolnay's rust `cachekey` (the toolchain/stdlib behind the build)
-        # and the Cargo.lock hash, with a restore-keys fallback for lockfile
-        # drift; cargo re-fingerprints whatever else drifted.
+        # NOTE at the top of this file. Split so the registry/git store (which
+        # is target-independent) is NOT duplicated under every matrix target:
+        # one shared entry per arch/lockfile, then one target/<triple> entry
+        # per release leg. The pinned toolchain is part of both keys.
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
+          key: cargo-registry-1.100-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-1.100-${{ runner.arch }}-
+      - name: Cache cargo target
+        # Cross artifacts live under target/<triple>, so only that directory
+        # is matrix-scoped; cargo re-fingerprints whatever else drifted.
+        uses: https://hangar.nixthedev.ru/actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-${{ matrix.target }}-1.100-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-${{ matrix.target }}-1.100-
 
       # ---- zig driver legs (windows gnu/gnullvm only) ----
       # zig cc (behind cargo-zigbuild) is the only zig usage in these legs.
