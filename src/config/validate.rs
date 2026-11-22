@@ -81,6 +81,22 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
     }
     let mut names = HashSet::new();
     for instance in &config.storage.instances {
+        if instance.kind == crate::config::StorageKind::S3 {
+            if instance.bucket.as_deref().is_none_or(str::is_empty) {
+                return Err(ConfigError::InSection {
+                    section: String::from("storage.instances"),
+                    msg: format!("instance {:?} needs a bucket", instance.name),
+                });
+            }
+            if config.storage.cdc.enabled {
+                return Err(ConfigError::InSection {
+                    section: String::from("storage.cdc"),
+                    msg: String::from(
+                        "content-defined chunking is only supported on fs/network-mount instances",
+                    ),
+                });
+            }
+        }
         if instance.name.is_empty() || !names.insert(instance.name.clone()) {
             return Err(ConfigError::StorageInstanceName {
                 name: instance.name.clone(),

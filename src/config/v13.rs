@@ -17,6 +17,7 @@ use crate::config::min_free::MinFree;
 pub enum StorageKind {
     #[default]
     Fs,
+    S3,
 }
 
 /// One `[[storage]]` instance.
@@ -29,6 +30,10 @@ pub struct StorageInstanceConfig {
     pub path: PathBuf,
     /// Overrides the server-level `min_free` when set.
     pub min_free: Option<MinFree>,
+    /// S3 bucket/region/endpoint. Ignored for `fs`.
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl Default for StorageInstanceConfig {
@@ -38,6 +43,9 @@ impl Default for StorageInstanceConfig {
             kind: StorageKind::Fs,
             path: PathBuf::from("/var/lib/cachette"),
             min_free: None,
+            bucket: None,
+            region: None,
+            endpoint: None,
         }
     }
 }
