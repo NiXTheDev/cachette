@@ -1,26 +1,19 @@
 # Configuration
 
-cachette is configured by a single TOML file plus optional environment
-overrides. This page is the full reference; the README has a compact table.
+cachette is configured by a single TOML file plus optional environment overrides. This page is the full reference; the README has a compact table.
 
 ## Load order
 
-1. `--config <path>` if given. An explicit path that does not exist is a hard
-   error (no silent fallback).
-2. Otherwise the platform default file, if it exists:
-   `/etc/cachette/cachette.toml` (*nix), `%APPDATA%\cachette\cachette.toml`
-   (Windows), or `/config/cachette.toml` (Docker image).
+1. `--config <path>` if given. An explicit path that does not exist is a hard error (no silent fallback).
+2. Otherwise the platform default file, if it exists: `/etc/cachette/cachette.toml` (*nix), `%APPDATA%\cachette\cachette.toml` (Windows), or `/config/cachette.toml` (Docker image).
 3. If neither exists, the built-in defaults are used.
 4. `CACHETTE__*` environment variables are applied last and win over the file.
 
-Unknown keys, unknown `CACHETTE__*` variables, wrong types, and values outside
-their allowed set are all hard errors that name the offending key or variable.
-This is deliberate: a typo fails the boot instead of silently keeping a default.
+Unknown keys, unknown `CACHETTE__*` variables, wrong types, and values outside their allowed set are all hard errors that name the offending key or variable. This is deliberate: a typo fails the boot instead of silently keeping a default.
 
 ## Reference
 
-Closed sets (enums) are validated at parse time; structural rules (below) at
-`load` time.
+Closed sets (enums) are validated at parse time; structural rules (below) at `load` time.
 
 ### `[server]`
 
@@ -33,9 +26,7 @@ Closed sets (enums) are validated at parse time; structural rules (below) at
 | `max_chunk_bytes` | integer | `67108864` (64 MiB) | Largest single upload chunk (v1 `PATCH`) or Azure block (v2) accepted. The request path streams uploads, so this bounds one in-flight request rather than the process; a body over the cap is rejected with 400. Must be at least as large as the biggest chunk your client sends (the go-actions-cache client uses 32 MiB). |
 | `drain_grace_seconds` | integer | `30` | Graceful-shutdown drain window. On SIGTERM/SIGINT the node advertises `draining` (heartbeat + `/readyz`), refuses new uploads with `503` + `Retry-After`, keeps serving in-flight requests, and exits after at most this many seconds. |
 
-The node identity certificate (minted on first boot, see
-[cluster.md](cluster.md)) is served by the dedicated cluster port only — never
-on the main listener.
+The node identity certificate (minted on first boot, see [cluster.md](cluster.md)) is served by the dedicated cluster port only — never on the main listener.
 
 ### `[storage]` and `[storage.fs]`
 
@@ -51,16 +42,11 @@ on the main listener.
 
 - a fraction between `0` and `1` (exclusive) as a bare number: `min_free = 0.2`
 - a percent string: `min_free = "20%"`
-- a bytesize string, **1024-based** (so `GB` == `GiB`): `min_free = "2GiB"` or
-  `min_free = "2GB"`
+- a bytesize string, **1024-based** (so `GB` == `GiB`): `min_free = "2GiB"` or `min_free = "2GB"`
 
-A bare word such as `min_free = "abc"` and an out-of-range fraction are
-rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
+A bare word such as `min_free = "abc"` and an out-of-range fraction are rejected. Set an explicit `path` on Windows; the default is a Unix-style path.
 
-Together the two knobs define one capacity model: `total` is
-`cache.max_size` when set (otherwise the filesystem total), and `min_free`
-reserves part of it; eviction targets `free = total - used >= min_free`. In
-other words, the usable band is `total - min_free`.
+Together the two knobs define one capacity model: `total` is `cache.max_size` when set (otherwise the filesystem total), and `min_free` reserves part of it; eviction targets `free = total - used >= min_free`. In other words, the usable band is `total - min_free`.
 
 ### `[cache]`
 
@@ -83,12 +69,7 @@ other words, the usable band is `total - min_free`.
 | `v2.jwt_secret` | string | falls back to `auth.secret` | HS256 secret used to validate the Twirp JWT. |
 | `v2.jwt_ttl_seconds` | integer | `300` | TTL for the self-minted Twirp JWT. |
 
-`[auth.oidc."<issuer>"]` (see `docs/oidc.md`) and
-`[auth.runtime."<forge>"]` (see `docs/shared-cache.md` §3) are boot-only
-credential-plane tables. An enabled block of either is **tenant-yielding**,
-so the boot guard requires `auth.mode = "bearer"`. Cluster mode is allowed:
-peers carry the namespace on the wire and a mixed protocol version is
-refused (`docs/shared-cache.md` §8).
+`[auth.oidc."<issuer>"]` (see `docs/oidc.md`) and `[auth.runtime."<forge>"]` (see `docs/shared-cache.md` §3) are boot-only credential-plane tables. An enabled block of either is **tenant-yielding**, so the boot guard requires `auth.mode = "bearer"`. Cluster mode is allowed: peers carry the namespace on the wire and a mixed protocol version is refused (`docs/shared-cache.md` §8).
 
 ### `[cluster]`
 
@@ -116,9 +97,7 @@ refused (`docs/shared-cache.md` §8).
 
 ## Environment overrides
 
-Names use `CACHETTE__SECTION__KEY` with a double underscore between segments and
-are case-insensitive. Nested sections keep their double underscores, e.g.
-`CACHETTE__STORAGE__FS__PATH`.
+Names use `CACHETTE__SECTION__KEY` with a double underscore between segments and are case-insensitive. Nested sections keep their double underscores, e.g. `CACHETTE__STORAGE__FS__PATH`.
 
 | Shape | How to write it | Example |
 |---|---|---|
@@ -129,10 +108,7 @@ are case-insensitive. Nested sections keep their double underscores, e.g.
 | `min_free` | a number (fraction) or a string form | `CACHETTE__STORAGE__FS__MIN_FREE="20%"` |
 | Map | a JSON object of string values | `CACHETTE__CLUSTER__SEED_FINGERPRINTS='{"cache-a":"AA11","cache-b":"BB22"}'` |
 
-A variable with no section prefix that matches exactly one field name is also
-accepted, e.g. `CACHETTE__LISTEN` or `CACHETTE__ENABLED`. A `CACHETTE__*`
-variable that maps to no known key is a hard error naming the variable, while
-non-`CACHETTE` variables are ignored.
+A variable with no section prefix that matches exactly one field name is also accepted, e.g. `CACHETTE__LISTEN` or `CACHETTE__ENABLED`. A `CACHETTE__*` variable that maps to no known key is a hard error naming the variable, while non-`CACHETTE` variables are ignored.
 
 ```bash
 # A complete override set for a container, with no config file at all:
@@ -151,8 +127,7 @@ export CACHETTE__LOG__LEVEL="info"
 
 ## Validation rules
 
-- `auth.secret` must be set and at least 16 characters before the server will
-  serve. `--print-config` bypasses this check.
+- `auth.secret` must be set and at least 16 characters before the server will serve. `--print-config` bypasses this check.
 - `server.listen` must parse as `host:port` (IPv6 literals bracketed).
 - `cluster.listen` must parse as `host:port` (IPv6 literals bracketed).
 - `server.tls_cert` and `server.tls_key` must be set together.
@@ -162,9 +137,7 @@ export CACHETTE__LOG__LEVEL="info"
 
 ## Inspecting the resolved configuration
 
-`--print-config` resolves the file and environment, applies derived defaults,
-and prints the result as JSON with every secret masked as `***`
-(`auth.secret`, each item of `auth.tokens`, and `v2.jwt_secret`):
+`--print-config` resolves the file and environment, applies derived defaults, and prints the result as JSON with every secret masked as `***` (`auth.secret`, each item of `auth.tokens`, and `v2.jwt_secret`):
 
 ```bash
 ./cachette --config /etc/cachette/cachette.toml --print-config
@@ -172,36 +145,23 @@ and prints the result as JSON with every secret masked as `***`
 
 ## Live reload
 
-`cachette serve` re-reads its config file on `SIGHUP` (Unix) without dropping
-connections or restarting the process. The reloaded values are applied in place
-on the next request; a load balancer and the cluster pick them up immediately.
+`cachette serve` re-reads its config file on `SIGHUP` (Unix) without dropping connections or restarting the process. The reloaded values are applied in place on the next request; a load balancer and the cluster pick them up immediately.
 
 Reloadable at runtime:
 
-- `[auth]` — `mode`, `secret`, `tokens`, `hmac_max_age_seconds`. Rotate a leaked
-  admin secret by rewriting the file and sending `SIGHUP`; tokens minted (or
-  HMAC signatures made) against the old secret are rejected from the next
-  request onwards.
-- `[cache]` / `[storage.fs]` admission numbers read per request — `max_size`,
-  `min_free`, `reservation_ttl_seconds`, `key_case`, `signed_url_ttl_seconds`,
-  and `[server]` `max_chunk_bytes`.
+- `[auth]` — `mode`, `secret`, `tokens`, `hmac_max_age_seconds`. Rotate a leaked admin secret by rewriting the file and sending `SIGHUP`; tokens minted (or HMAC signatures made) against the old secret are rejected from the next request onwards.
+- `[cache]` / `[storage.fs]` admission numbers read per request — `max_size`, `min_free`, `reservation_ttl_seconds`, `key_case`, `signed_url_ttl_seconds`, and `[server]` `max_chunk_bytes`.
 - `[log] level` — the active tracing filter is swapped in place.
 
 Boot-only (restart to change):
 
-- `[server]` `listen`, `external_url`, `tls_*`, `drain_grace_seconds` — the
-  listener and identity are already bound.
+- `[server]` `listen`, `external_url`, `tls_*`, `drain_grace_seconds` — the listener and identity are already bound.
 - `[storage]` `backend` and `[storage.fs]` `path` — the backend is already open.
-- `[cluster]` — `enabled`, `mdns`, `seeds`, `seed_fingerprints`, `cert_path`,
-  timeouts and thresholds; the peer table, TLS pins, and mDNS task are live.
-- `[v2]` `jwt_secret` / `jwt_ttl_seconds` and `[v1]` / `[v2]` protocol shape —
-  these are wired into the router at boot.
-- `[auth.oidc]` and `[auth.runtime]` — the credential-plane verifiers are
-  built at boot (`docs/oidc.md`, `docs/shared-cache.md` §3); a reloaded table
-  is not swapped in.
+- `[cluster]` — `enabled`, `mdns`, `seeds`, `seed_fingerprints`, `cert_path`, timeouts and thresholds; the peer table, TLS pins, and mDNS task are live.
+- `[v2]` `jwt_secret` / `jwt_ttl_seconds` and `[v1]` / `[v2]` protocol shape — these are wired into the router at boot.
+- `[auth.oidc]` and `[auth.runtime]` — the credential-plane verifiers are built at boot (`docs/oidc.md`, `docs/shared-cache.md` §3); a reloaded table is not swapped in.
 
-A malformed or invalid file is rejected and the previously loaded configuration
-stays in effect (fail-closed); the failure is logged at `warn`.
+A malformed or invalid file is rejected and the previously loaded configuration stays in effect (fail-closed); the failure is logged at `warn`.
 
 ## A fuller example
 
@@ -245,5 +205,4 @@ seed_fingerprints = {}
 level = "info"
 format = "text"
 ```
-</content>
-</invoke>
+</content> </invoke>

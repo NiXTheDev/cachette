@@ -1,33 +1,18 @@
 # TLS and reverse proxies
 
-cachette's main listener is plaintext HTTP unless `[server] tls_cert`/`tls_key`
-are configured: TLS on the edge is the proxy's job by default, and the public
-certificates stay where the public traffic is. This page covers the three TLS
-surfaces you operate and ready-to-adapt recipes for the edge.
+cachette's main listener is plaintext HTTP unless `[server] tls_cert`/`tls_key` are configured: TLS on the edge is the proxy's job by default, and the public certificates stay where the public traffic is. This page covers the three TLS surfaces you operate and ready-to-adapt recipes for the edge.
 
 ## The TLS surfaces
 
-1. **Client-facing edge** - runners, the Actions toolkit, and `docker buildx`
-   connect here. It should present a **CA-trusted** certificate so clients
-   validate it without `--insecure` or a custom CA file. Either a reverse proxy
-   holds that certificate and forwards to the plaintext listener, or you supply
-   the pair to `[server]` and the listener terminates TLS itself.
-2. **Inter-node leg** - when clustering is on, peers talk to each other over a
-   dedicated port (`[cluster] listen`, default `0.0.0.0:8081`) that **always**
-   terminates TLS with the pinned node identity. Trust there is a fingerprint,
-   not a CA chain. See [cluster.md](cluster.md).
-3. **Loopback/proxy hop** - what a proxy forwards *to* cachette: plaintext
-   `http://` by default, `https://` with verification skipped only if you
-   enabled listener TLS.
+1. **Client-facing edge** - runners, the Actions toolkit, and `docker buildx` connect here. It should present a **CA-trusted** certificate so clients validate it without `--insecure` or a custom CA file. Either a reverse proxy holds that certificate and forwards to the plaintext listener, or you supply the pair to `[server]` and the listener terminates TLS itself.
+2. **Inter-node leg** - when clustering is on, peers talk to each other over a dedicated port (`[cluster] listen`, default `0.0.0.0:8081`) that **always** terminates TLS with the pinned node identity. Trust there is a fingerprint, not a CA chain. See [cluster.md](cluster.md).
+3. **Loopback/proxy hop** - what a proxy forwards *to* cachette: plaintext `http://` by default, `https://` with verification skipped only if you enabled listener TLS.
 
-Do not confuse them: the self-signed identity certificate belongs to the
-cluster port; runners reach a CA-trusted edge, whatever sits behind it.
+Do not confuse them: the self-signed identity certificate belongs to the cluster port; runners reach a CA-trusted edge, whatever sits behind it.
 
 ## Make `external_url` match reality
 
-By default the main listener is plain HTTP, so `external_url` derived from
-`listen` starts with `http://`. Whatever your edge looks like, set
-`server.external_url` to the public URL runners use:
+By default the main listener is plain HTTP, so `external_url` derived from `listen` starts with `http://`. Whatever your edge looks like, set `server.external_url` to the public URL runners use:
 
 ```toml
 [server]
@@ -35,15 +20,11 @@ listen = "127.0.0.1:8080"
 external_url = "https://cache.example.com"
 ```
 
-cachette builds the v1 `archiveLocation` and the v2 capability URLs from
-`external_url`. Leave it derived from `listen` and clients behind a proxy receive
-URLs pointing at the backend (for example `http://127.0.0.1:8080`) that they
-cannot reach.
+cachette builds the v1 `archiveLocation` and the v2 capability URLs from `external_url`. Leave it derived from `listen` and clients behind a proxy receive URLs pointing at the backend (for example `http://127.0.0.1:8080`) that they cannot reach.
 
 ## Supplying your own certificate
 
-To terminate TLS directly on the main listener, instead of at a proxy, supply
-the pair:
+To terminate TLS directly on the main listener, instead of at a proxy, supply the pair:
 
 ```toml
 [server]
@@ -53,15 +34,11 @@ tls_cert = "/etc/cachette/tls/fullchain.pem"
 tls_key = "/etc/cachette/tls/privkey.pem"
 ```
 
-`tls_cert` and `tls_key` must be set together; with both unset the listener is
-plaintext HTTP. The certificate is used for the client-facing listener only;
-peers keep connecting to the dedicated cluster port and authenticating with the
-node identity.
+`tls_cert` and `tls_key` must be set together; with both unset the listener is plaintext HTTP. The certificate is used for the client-facing listener only; peers keep connecting to the dedicated cluster port and authenticating with the node identity.
 
 ## nginx
 
-The default upstream is plaintext HTTP, so the proxy hop needs no TLS wiring.
-It must still stop buffering the large chunked uploads.
+The default upstream is plaintext HTTP, so the proxy hop needs no TLS wiring. It must still stop buffering the large chunked uploads.
 
 ```bash
 # /etc/nginx/conf.d/cachette.conf
@@ -92,8 +69,7 @@ NGINX
 nginx -t && systemctl reload nginx
 ```
 
-If you enabled `[server] tls_cert`/`tls_key` instead, switch the upstream to
-TLS and skip verification for the loopback hop:
+If you enabled `[server] tls_cert`/`tls_key` instead, switch the upstream to TLS and skip verification for the loopback hop:
 
 ```nginx
 location / {
@@ -107,8 +83,7 @@ location / {
 
 ## Traefik
 
-Traefik terminates TLS with a Let's Encrypt certificate and forwards to the
-plaintext listener:
+Traefik terminates TLS with a Let's Encrypt certificate and forwards to the plaintext listener:
 
 ```yaml
 http:
@@ -126,13 +101,11 @@ http:
           - url: "http://127.0.0.1:8080"
 ```
 
-With `[server]` TLS enabled instead, point the service at `https://` and add an
-`serversTransport` with `insecureSkipVerify: true` for the loopback hop.
+With `[server]` TLS enabled instead, point the service at `https://` and add an `serversTransport` with `insecureSkipVerify: true` for the loopback hop.
 
 ## SSH tunnel
 
-For a single runner host with no reverse proxy, an SSH tunnel keeps the edge
-inside your trust boundary:
+For a single runner host with no reverse proxy, an SSH tunnel keeps the edge inside your trust boundary:
 
 ```bash
 export CACHETTE_TUNNEL_HOST="cache.example.com"
@@ -147,13 +120,11 @@ curl http://127.0.0.1:8443/health
 ssh -N -R 8080:127.0.0.1:8080 "$CACHETTE_TUNNEL_HOST"
 ```
 
-With `[server]` TLS enabled the probe becomes `curl -k https://...`. Set
-`external_url` to the URL clients actually use through the tunnel.
+With `[server]` TLS enabled the probe becomes `curl -k https://...`. Set `external_url` to the URL clients actually use through the tunnel.
 
 ## WireGuard
 
-A WireGuard interface gives every runner a private, authenticated path to the
-node, so plaintext inside the tunnel is fine. Server side:
+A WireGuard interface gives every runner a private, authenticated path to the node, so plaintext inside the tunnel is fine. Server side:
 
 ```bash
 # /etc/wireguard/wg0.conf (server)
@@ -171,16 +142,11 @@ WG
 wg-quick up wg0
 ```
 
-With the tunnel up, clients use `http://10.44.0.1:8080` (or the node's
-WireGuard address); set `external_url` to match. Enable `[server]` TLS if you
-want encryption beyond the WireGuard fabric.
+With the tunnel up, clients use `http://10.44.0.1:8080` (or the node's WireGuard address); set `external_url` to match. Enable `[server]` TLS if you want encryption beyond the WireGuard fabric.
 
 ## Rate limiting
 
-cachette has no application-level rate limiter and never returns `429` for
-overload - a node that cannot admit a write answers `503`. Put request limits at
-the proxy or network edge. With nginx, the zones belong in the `http {}` block
-and the limits in the `location {}`:
+cachette has no application-level rate limiter and never returns `429` for overload - a node that cannot admit a write answers `503`. Put request limits at the proxy or network edge. With nginx, the zones belong in the `http {}` block and the limits in the `location {}`:
 
 ```bash
 # In http {} (for example /etc/nginx/nginx.conf):
@@ -197,17 +163,11 @@ Raise the limits for chunked uploads, which issue many small `PATCH` requests.
 
 ## A note on Windows clients
 
-With the default plaintext listener, Windows `curl.exe` works fine. If you
-enable `[server]` TLS with a self-served certificate, Windows `curl.exe`
-(Schannel) may reject it depending on trust and algorithm details; a
-CA-trusted certificate through the `[server]` pair avoids the whole class. For
-a manual check of the served certificate (cluster port or TLS-enabled main
-listener), inspect it with `openssl`:
+With the default plaintext listener, Windows `curl.exe` works fine. If you enable `[server]` TLS with a self-served certificate, Windows `curl.exe` (Schannel) may reject it depending on trust and algorithm details; a CA-trusted certificate through the `[server]` pair avoids the whole class. For a manual check of the served certificate (cluster port or TLS-enabled main listener), inspect it with `openssl`:
 
 ```bash
 openssl s_client -connect 127.0.0.1:8081 -servername node \
   </dev/null 2>/dev/null | openssl x509 -noout -subject -dates -fingerprint
 ```
 
-Real Actions clients are unaffected and are the intended way to exercise the
-server.
+Real Actions clients are unaffected and are the intended way to exercise the server.

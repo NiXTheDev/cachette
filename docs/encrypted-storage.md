@@ -1,13 +1,8 @@
 # Encrypted storage at rest
 
-cachette does **not** encrypt cache payloads in the application. There is a
-designed (`EncryptingBackend`) but deliberately unbuilt seam for it; the
-supported approach is to put cachette's data directory on an encrypted volume
-that the operator manages. That keeps the blobs, the SQLite metadata index, and
-(by default) the node identity certificate encrypted together.
+cachette does **not** encrypt cache payloads in the application. There is a designed (`EncryptingBackend`) but deliberately unbuilt seam for it; the supported approach is to put cachette's data directory on an encrypted volume that the operator manages. That keeps the blobs, the SQLite metadata index, and (by default) the node identity certificate encrypted together.
 
-Encryption here is at rest. In transit is covered by TLS - see
-[tls.md](tls.md).
+Encryption here is at rest. In transit is covered by TLS - see [tls.md](tls.md).
 
 ## What the volume holds
 
@@ -16,17 +11,11 @@ Encryption here is at rest. In transit is covered by TLS - see
 - the finalized blobs;
 - the SQLite index and its WAL/journal sidecars;
 - staged upload `parts/` while a reservation is in flight;
-- the node identity key/certificate, unless you override `cluster.cert_path`
-  to a path outside the data directory.
+- the node identity key/certificate, unless you override `cluster.cert_path` to a path outside the data directory.
 
-Mount the encrypted filesystem at that path and cachette needs no further
-configuration. If you move `cluster.cert_path` off the encrypted volume, that
-private key is stored in the clear on disk - keep it on the encrypted volume.
+Mount the encrypted filesystem at that path and cachette needs no further configuration. If you move `cluster.cert_path` off the encrypted volume, that private key is stored in the clear on disk - keep it on the encrypted volume.
 
-Secrets in the config file (`auth.secret`, `v2.jwt_secret`) are **not** covered
-by volume encryption. Supply those through `CACHETTE__AUTH__SECRET` /
-`CACHETTE__V2__JWT_SECRET` from your secret manager, or keep the config strictly
-root-readable.
+Secrets in the config file (`auth.secret`, `v2.jwt_secret`) are **not** covered by volume encryption. Supply those through `CACHETTE__AUTH__SECRET` / `CACHETTE__V2__JWT_SECRET` from your secret manager, or keep the config strictly root-readable.
 
 ## Linux - LUKS + TPM2
 
@@ -49,8 +38,7 @@ mkfs.ext4 /dev/mapper/cachette-crypt
 mount /dev/mapper/cachette-crypt /var/lib/cachette
 ```
 
-Then set `[storage.fs] path = "/var/lib/cachette"` and add the mount to
-`/etc/fstab` so it is present before the service starts.
+Then set `[storage.fs] path = "/var/lib/cachette"` and add the mount to `/etc/fstab` so it is present before the service starts.
 
 ## Linux - ZFS native encryption
 
@@ -62,13 +50,11 @@ zfs create -o encryption=on -o keyformat=passphrase -o keylocation=prompt \
 zfs set mountpoint=/var/lib/cachette rpool/cachette
 ```
 
-Use `keylocation=file:///etc/zfs/cachette.key` for unattended boot, and protect
-that key file with root-only permissions (it is the master key material).
+Use `keylocation=file:///etc/zfs/cachette.key` for unattended boot, and protect that key file with root-only permissions (it is the master key material).
 
 ## Windows - BitLocker + TPM
 
-Encrypt the volume that backs the cache and bind the key to the TPM. Run these
-from an elevated shell; Git Bash can invoke PowerShell:
+Encrypt the volume that backs the cache and bind the key to the TPM. Run these from an elevated shell; Git Bash can invoke PowerShell:
 
 ```bash
 # Encrypt the volume that hosts the cache data directory.
@@ -79,16 +65,12 @@ powershell -Command "Add-BitLockerKeyProtector -MountPoint 'D:' -TpmProtector"
 powershell -Command "Get-BitLockerVolume -MountPoint 'D:' | Format-List"
 ```
 
-Point `[storage.fs] path` at a directory on `D:` (for example `D:\cachette`).
-Store the recovery password in your secret manager; the TPM protector is what
-lets the node boot unattended.
+Point `[storage.fs] path` at a directory on `D:` (for example `D:\cachette`). Store the recovery password in your secret manager; the TPM protector is what lets the node boot unattended.
 
 ## Picking one
 
-- **One node, standard distro:** LUKS + TPM2 is the least surprising choice and
-  unlocks automatically.
+- **One node, standard distro:** LUKS + TPM2 is the least surprising choice and unlocks automatically.
 - **Existing ZFS pool:** native encryption avoids a second layer.
 - **Windows node:** BitLocker + TPM.
 
-All three give the same property cachette relies on: the cache data on disk is
-unreadable without the platform key, and cachette itself is none the wiser.
+All three give the same property cachette relies on: the cache data on disk is unreadable without the platform key, and cachette itself is none the wiser.
