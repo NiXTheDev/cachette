@@ -121,6 +121,18 @@ impl Quotas {
         self.default.is_some()
     }
 
+    /// One `(target, limit)` vote per configured rule, with `*` carrying the
+    /// default. Used by the cluster's quota consensus gossip.
+    #[must_use]
+    pub fn votes(&self) -> Vec<(String, u64)> {
+        let mut votes = Vec::new();
+        if let Some(default) = self.default {
+            votes.push((String::from("*"), default));
+        }
+        votes.extend(self.rules.iter().map(|rule| (rule.key.clone(), rule.limit)));
+        votes
+    }
+
     /// The configured total (bytes) of `namespace`, or `None` when quotas
     /// are off. The namespace is the RESOLVED one (after
     /// `[storage.namespaces]` mapping).

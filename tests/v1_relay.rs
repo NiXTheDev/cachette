@@ -205,7 +205,7 @@ async fn http(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> (u16, String) {
-    http_ex(addr, config, method, path, headers, body, Some("2")).await
+    http_ex(addr, config, method, path, headers, body, Some("3")).await
 }
 
 /// Same exchange, but lets a test omit or override the wire-version header

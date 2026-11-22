@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::auth;
 use crate::cluster::PeerTable;
+use crate::cluster::quota::{ClusterQuota, RuleVote, UsageReport};
 use crate::cluster::{PEER_PROTOCOL_HEADER, PEER_PROTOCOL_VERSION};
 use crate::config::{MinFree, split_host_port};
 use crate::storage::StorageBackend;
@@ -79,6 +81,12 @@ pub struct HeartbeatConfig {
     /// advertises `draining` so peers stop selecting this node for NEW
     /// placements; the self record carries it too.
     pub draining: Arc<AtomicBool>,
+    /// v1.3: live quota consensus state (votes + usage from peers).
+    pub quota_state: Arc<RwLock<ClusterQuota>>,
+    /// Live quota rules, snapshotted per heartbeat so SIGHUP reloads apply.
+    pub quotas: Arc<RwLock<Arc<crate::config::Quotas>>>,
+    /// Namespace of this server's payload accounting, for usage reports.
+    pub instance_name: String,
 }
 
 /// Handle to the spawned heartbeat task (plan task 47). Wraps the task's
@@ -200,12 +208,24 @@ async fn send_all(
     used: u64,
     total: u64,
 ) {
+    // v1.3: quota votes and this node's usage piggyback on the heartbeat.
+    let usage: Vec<UsageReport> = vec![(config.instance_name.clone(), String::from("*"), used)];
+    let quota_rules: Vec<RuleVote> = config
+        .quotas
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .votes()
+        .into_iter()
+        .map(|(target, limit)| (String::from("namespace"), target, limit))
+        .collect();
     let payload = serde_json::json!({
         "node_id": config.node_id,
         "used_bytes": used,
         "total_bytes": total,
         "draining": config.draining.load(Ordering::Relaxed),
         "protocol_version": PEER_PROTOCOL_VERSION,
+        "quota_rules": quota_rules,
+        "usage": usage,
         "ts": now,
     });
     let body = serde_json::to_string(&payload).expect("heartbeat JSON is a fixed shape");

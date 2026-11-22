@@ -253,7 +253,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     state.set_instances(
         backends,
         config.storage.routes.clone().into_iter().collect(),
-        default_name,
+        default_name.clone(),
     );
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     // Startup sweep, before the listener binds: rowless blobs older than the
@@ -301,6 +301,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             interval: Duration::from_secs(config.cluster.heartbeat_interval_seconds),
             timeout: Duration::from_secs(config.cluster.peer_timeout_seconds),
             draining: draining.clone(),
+            quota_state: state.cluster_quota.clone(),
+            quotas: state.quotas.clone(),
+            instance_name: default_name.clone(),
         })
     });
 

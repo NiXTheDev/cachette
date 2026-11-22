@@ -358,6 +358,7 @@ async fn peer_heartbeat(State(state): State<AppState>, request: Request) -> Resp
         now as u64,
         beat.draining,
     );
+    state.observe_quota(&node_id, beat.quota_rules, beat.usage);
     Json(serde_json::json!({ "accepted": true })).into_response()
 }
 
@@ -413,6 +414,12 @@ struct HeartbeatBody {
     /// authoritative, this is defense in depth.
     #[serde(default)]
     protocol_version: Option<u32>,
+    /// v1.3 quota votes `(scope, target, limit)`; absent = abstain.
+    #[serde(default)]
+    quota_rules: Vec<crate::cluster::quota::RuleVote>,
+    /// v1.3 usage reports `(instance, namespace, bytes)`.
+    #[serde(default)]
+    usage: Vec<crate::cluster::quota::UsageReport>,
     ts: i64,
 }
 

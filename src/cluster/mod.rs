@@ -18,6 +18,7 @@
 pub mod heartbeat;
 mod mdns;
 pub mod placement;
+pub mod quota;
 pub mod relay;
 mod seeds;
 pub(crate) mod tls_client;
@@ -38,7 +39,7 @@ pub use seeds::{Seed, parse_seeds};
 /// resolved storage namespace on every key-bearing peer request, so a
 /// mixed-version cluster drains to "no healthy peer" instead of silently
 /// merging one tenant's rows into another's.
-pub const PEER_PROTOCOL_VERSION: u32 = 2;
+pub const PEER_PROTOCOL_VERSION: u32 = 3;
 
 /// The header every peer request carries: the sender's
 /// [`PEER_PROTOCOL_VERSION`].

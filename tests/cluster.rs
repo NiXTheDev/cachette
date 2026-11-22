@@ -54,7 +54,7 @@ fn hello_body(node_id: &str, fingerprint: &str) -> Request<Body> {
         .method("POST")
         .uri("/_internal/peers/hello")
         .header("content-type", "application/json")
-        .header("x-cachette-peer-protocol", "2")
+        .header("x-cachette-peer-protocol", "3")
         .body(Body::from(
             json!({ "node_id": node_id, "fingerprint": fingerprint }).to_string(),
         ))
@@ -65,7 +65,7 @@ fn get_peers() -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri("/_internal/peers")
-        .header("x-cachette-peer-protocol", "2")
+        .header("x-cachette-peer-protocol", "3")
         .body(Body::empty())
         .expect("request")
 }
@@ -75,7 +75,7 @@ fn heartbeat_body(node_id: &str, used: u64, total: u64, ts: i64) -> Request<Body
         .method("POST")
         .uri("/_internal/peers/heartbeat")
         .header("content-type", "application/json")
-        .header("x-cachette-peer-protocol", "2")
+        .header("x-cachette-peer-protocol", "3")
         .body(Body::from(
             json!({
                 "node_id": node_id,
@@ -202,7 +202,7 @@ async fn hello_without_a_body_still_identifies_via_the_cert() {
     let request = Request::builder()
         .method("POST")
         .uri("/_internal/peers/hello")
-        .header("x-cachette-peer-protocol", "2")
+        .header("x-cachette-peer-protocol", "3")
         .body(Body::empty())
         .expect("request");
     let response = routes::router(state.clone())
@@ -323,7 +323,7 @@ async fn heartbeat_advertises_draining_through_the_router() {
         .method("POST")
         .uri("/_internal/peers/heartbeat")
         .header("content-type", "application/json")
-        .header("x-cachette-peer-protocol", "2")
+        .header("x-cachette-peer-protocol", "3")
         .body(Body::from(
             json!({
                 "node_id": "node-b",
@@ -460,6 +460,9 @@ async fn heartbeat_spawn_registers_the_own_node_immediately() {
         interval: Duration::from_secs(3600),
         timeout: Duration::from_secs(7200),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        quota_state: Arc::new(std::sync::RwLock::new(Default::default())),
+        quotas: Arc::new(std::sync::RwLock::new(Arc::new(Default::default()))),
+        instance_name: String::from("default"),
     });
     // Registration is synchronous, so the record exists before any tick runs.
     let peers = table.snapshot();

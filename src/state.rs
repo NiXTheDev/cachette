@@ -9,6 +9,7 @@ use crate::auth::oidc::OidcVerifier;
 use crate::auth::runtime::{RuntimeVerifier, SharedRuntimeVerifier};
 use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
+use crate::cluster::quota::ClusterQuota;
 use crate::cluster::relay::ClusterRelay;
 use crate::config::{Config, KeyCase, MinFree, OidcConfig, Quotas, glob_matches};
 use crate::metrics::Metrics;
@@ -206,6 +207,8 @@ pub struct AppState {
     /// §5). Swapped wholesale by a SIGHUP reload; the default has no quotas,
     /// so every namespace is unlimited.
     pub quotas: Arc<RwLock<Arc<Quotas>>>,
+    /// Cluster gossip: peer quota votes and per-(instance, namespace) usage.
+    pub cluster_quota: Arc<RwLock<ClusterQuota>>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -252,6 +255,7 @@ impl AppState {
             cache: Arc::new(RwLock::new(CacheLimits::default())),
             namespaces: Arc::new(std::collections::BTreeMap::new()),
             quotas: Arc::new(RwLock::new(Arc::new(Quotas::default()))),
+            cluster_quota: Arc::new(RwLock::new(ClusterQuota::default())),
             external_url: None,
             relay: None,
             capacity_total: 0,
@@ -416,10 +420,36 @@ impl AppState {
     /// `docs/shared-cache.md` §5), or `None` when quotas are off.
     #[must_use]
     pub fn quota_for(&self, namespace: &str) -> Option<u64> {
-        self.quotas
+        let local = self
+            .quotas
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .limit_for(namespace)
+            .limit_for(namespace);
+        if local.is_some() {
+            return local;
+        }
+        // Semi-binding fallback: the cluster's plurality vote for this exact
+        // target, then its `*` catch-all. Abstentions are ignored by `consensus`.
+        let gossip = self
+            .cluster_quota
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gossip
+            .consensus("namespace", namespace)
+            .or_else(|| gossip.consensus("namespace", "*"))
+    }
+
+    /// Replace one peer's quota votes and usage reports from its heartbeat.
+    pub fn observe_quota(
+        &self,
+        node: &str,
+        votes: Vec<crate::cluster::quota::RuleVote>,
+        usage: Vec<crate::cluster::quota::UsageReport>,
+    ) {
+        self.cluster_quota
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(node, votes, usage);
     }
 
     /// Snapshot for the eviction reaper (boot and reload).
