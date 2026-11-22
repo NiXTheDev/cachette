@@ -2,11 +2,7 @@
 
 Status: **proposal** (2026-11-21). Nothing here is committed until the design is approved. Base: the v1.2 tip (`feat/cachette-v1.2`).
 
-Tagline candidates (undecided):
-
-- "Storage Galore, place the cache anywhere the hell you want"
-- "Storage-a-nanza, place the cache anywhere the hell you want"
-- suggestion: "Fine, I'll put it anywhere." (echoes the v1 merge-commit voice)
+Tagline (settled): **"Stick it onto the ceiling for all I care!"**
 
 Settled: v1.3 includes **all** storage options — multiple local `fs` roots, network mounts (SMB/NFS) and S3-compatible object storage. The legacy `[storage.fs]` form is accepted as the `default` instance; routes match the resolved namespace; quotas are a separate repeatable plane, not part of the storage block.
 
@@ -276,4 +272,4 @@ v1.3 stops hand-maintaining `cachette.example.toml`. A **declarative Rust spec t
 - Auth precedence: HMAC wins when both HMAC headers and a Bearer token are present; legacy OIDC/runtime tables stay authoritative with a deprecation warning.
 - Route glob ties: longest matching pattern wins; quota gossip piggybacks on heartbeat first, with a separate gossip protocol as a follow-up; stale peer usage is ignored.
 - S3: one bucket with per-instance prefixes; credentials from env with config-file fallback (env wins). Reload: routes + quotas on SIGHUP; instances and forge blocks boot-only.
-- Tagline: decide later, at the release cut.
+- Tagline: settled — "Stick it onto the ceiling for all I care!"
