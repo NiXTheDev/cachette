@@ -259,6 +259,8 @@ Set `[cluster] enabled = true`, list peers in `seeds`, and pin their fingerprint
 - [docs/cdc.md](docs/cdc.md) - content-defined chunking: layouts, dedup, backfill migration, GC, and rollout.
 - [docs/oidc.md](docs/oidc.md) - OIDC bearer auth: issuers, audiences, JWKS wiring, and the acceptance chain.
 - [docs/shared-cache.md](docs/shared-cache.md) - multi-tenant design: credential planes, namespaces, quotas/eviction, admin mappings and the peer wire.
+- [docs/multi-storage.md](docs/multi-storage.md) - multiple storage instances, routing, quotas, the state directory and migration.
+- [docs/hmac-tenancy.md](docs/hmac-tenancy.md) - per-forge auth blocks and tenant-yielding HMAC.
 - [docs/image-stitching.md](docs/image-stitching.md) - assembling multi-arch images with the cache in the loop.
 
 ### CI & releases
