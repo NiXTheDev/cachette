@@ -125,9 +125,9 @@ impl Drop for DataDirLock {
 pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
     match command {
         Command::Identity { action } => identity(action.as_ref(), config),
-        Command::Verify => block_on(verify(config)),
-        Command::Cache { action } => block_on(cache(action, config)),
-        Command::Gc => block_on(gc(config)),
+        Command::Verify { storage } => block_on(verify(config, storage.as_deref())),
+        Command::Cache { action, storage } => block_on(cache(action, config, storage.as_deref())),
+        Command::Gc { storage } => block_on(gc(config, storage.as_deref())),
         Command::Doctor { action } => match action {
             None => block_on(doctor(config)),
             Some(DoctorCommand::Migrate {
@@ -177,6 +177,20 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
     }
 }
 
+/// Open the named storage instance (default: `default`) against the one
+/// control DB. All instances share the DB; only the payload root differs.
+fn open_named_storage(config: &Config, name: Option<&str>) -> io::Result<FsStorage> {
+    let name = name.unwrap_or("default");
+    let root = config
+        .storage
+        .instances
+        .iter()
+        .find(|instance| instance.name == name)
+        .map(|instance| instance.path.clone())
+        .unwrap_or_else(|| config.storage.fs.path.clone());
+    FsStorage::open_cdc_with_db(root, &config.data_path, None)
+}
+
 /// Build a small current-thread runtime for the async ops bodies (the server's
 /// multi-thread runtime is created only on the serve path).
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -220,12 +234,12 @@ fn acquire(dir: &Path) -> Result<DataDirLock, i32> {
 
 /// `cachette verify` — recompute every published entry's digest (plan task 50)
 /// and report the ones that no longer match. Non-zero exit on any finding.
-async fn verify(config: &Config) -> Result<i32, Box<dyn Error>> {
+async fn verify(config: &Config, storage_name: Option<&str>) -> Result<i32, Box<dyn Error>> {
     let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
+    let storage = open_named_storage(config, storage_name)?;
     let reports = storage.verify_all()?;
     let mut bad = 0usize;
     for report in &reports {
@@ -269,12 +283,16 @@ fn health_label(health: &EntryHealth) -> String {
 
 /// `cachette cache list|prune` — inspect or selectively evict entries through
 /// the same storage path the server uses (plan task 46).
-async fn cache(action: &CacheCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
+async fn cache(
+    action: &CacheCommand,
+    config: &Config,
+    storage_name: Option<&str>,
+) -> Result<i32, Box<dyn Error>> {
     let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
+    let storage = open_named_storage(config, storage_name)?;
     match action {
         CacheCommand::List { json } => {
             let entries = storage.list().await?;
@@ -355,12 +373,12 @@ struct EntryJson<'a> {
 
 /// `cachette gc` — one reservation-reaper + orphan-sweep pass (plan task 34's
 /// [`Reaper`]) then exit.
-async fn gc(config: &Config) -> Result<i32, Box<dyn Error>> {
+async fn gc(config: &Config, storage_name: Option<&str>) -> Result<i32, Box<dyn Error>> {
     let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
+    let storage = open_named_storage(config, storage_name)?;
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     let report = reaper.sweep_once(&storage).await?;
     println!("reservations_reaped: {}", report.reservations_reaped);

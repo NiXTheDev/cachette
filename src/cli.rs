@@ -37,15 +37,26 @@ pub enum Command {
         action: Option<IdentityCommand>,
     },
     /// Recompute every published entry's stored digest and report mismatches.
-    Verify,
+    Verify {
+        /// Storage instance to operate on (default: `default`).
+        #[arg(long, value_name = "name")]
+        storage: Option<String>,
+    },
     /// Inspect or prune cached entries (offline; takes the data-dir lock).
     Cache {
+        /// Storage instance to operate on (default: `default`).
+        #[arg(long, value_name = "name")]
+        storage: Option<String>,
         /// `list` or `prune`.
         #[command(subcommand)]
         action: CacheCommand,
     },
     /// Run the reservation reaper and orphan-blob sweep once, then exit.
-    Gc,
+    Gc {
+        /// Storage instance to operate on (default: `default`).
+        #[arg(long, value_name = "name")]
+        storage: Option<String>,
+    },
     /// Check config, data dir, SQLite, identity, seeds, and disk headroom, or
     /// migrate a v1.2 config/data layout to v1.3.
     Doctor {
@@ -290,11 +301,11 @@ mod tests {
     fn ops_subcommands_parse() {
         assert_eq!(
             Cli::try_parse_from(["cachette", "verify"]).unwrap().command,
-            Some(Command::Verify)
+            Some(Command::Verify { storage: None })
         );
         assert_eq!(
             Cli::try_parse_from(["cachette", "gc"]).unwrap().command,
-            Some(Command::Gc)
+            Some(Command::Gc { storage: None })
         );
         assert_eq!(
             Cli::try_parse_from(["cachette", "doctor"]).unwrap().command,
@@ -305,6 +316,7 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Cache {
+                storage: None,
                 action: CacheCommand::List { json: true }
             })
         );
@@ -313,6 +325,7 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Cache {
+                storage: None,
                 action: CacheCommand::Prune {
                     older_than: String::from("7d"),
                     dry_run: false,
