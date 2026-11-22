@@ -603,6 +603,13 @@ jobs:
 
       - name: Build
         if: matrix.driver == 'zig'
+        env:
+          # aarch64-pc-windows-gnullvm's std uses GCC-style unwinding
+          # (std::sys::personality::gcc / panic_unwind). zig's default
+          # --unwindlib=libunwind does not provide _GCC_specific_handler on
+          # this target, so lld-link fails with undefined _Unwind_* symbols.
+          # Link mingw's libgcc EH runtime explicitly for this leg only.
+          RUSTFLAGS: ${{ matrix.target == 'aarch64-pc-windows-gnullvm' && '-C link-arg=-lgcc_eh' || '' }}
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       # ---- native driver legs (linux): plain cargo, host toolchain ----
