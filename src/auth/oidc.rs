@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::auth::jwks::RsaKeySource;
 use crate::auth::jwks_cache::{JwksCache, JwksCacheError};
-use crate::config::Config;
+use crate::config::{Config, OidcConfig, OidcIssuerConfig};
 use crate::state::AppState;
 
 const ALGORITHM: &str = "RS256";
@@ -289,9 +289,46 @@ impl IssuerTrust {
 /// # Errors
 /// [`JwksCacheError`] when the CA bundle cannot back a fetch client.
 pub fn install(state: &AppState, config: &Config) -> Result<(), JwksCacheError> {
-    let Some(oidc) = config.auth.oidc.as_ref().filter(|oidc| oidc.enabled) else {
+    // v1.3: per-forge blocks feed the same verifier as the legacy per-issuer
+    // tables. An explicitly configured issuer of the same URL wins.
+    let mut combined = config.auth.oidc.clone().unwrap_or_default();
+    if let Some(value) = config.auth.oidc_jwks_refresh_seconds {
+        combined.jwks_refresh_seconds = value;
+    }
+    if let Some(value) = config.auth.oidc_jwks_max_keys {
+        combined.jwks_max_keys = usize::try_from(value).unwrap_or(usize::MAX);
+    }
+    if let Some(value) = &config.auth.oidc_jwks_ca_pem {
+        combined.jwks_ca_pem = Some(value.clone());
+    }
+    for block in config.auth.forge.values() {
+        let Some(issuer) = &block.oidc_issuer else {
+            continue;
+        };
+        let mut issuer_block = OidcIssuerConfig::default();
+        if let Some(audiences) = &block.oidc_audiences {
+            issuer_block.audiences = audiences.clone();
+        }
+        issuer_block.jwks_url = block.oidc_jwks_url.clone();
+        if let Some(claim) = &block.oidc_tenant_claim {
+            issuer_block.tenant_claim = claim.clone();
+        }
+        if let Some(require) = &block.oidc_require {
+            issuer_block.require = require.clone();
+        }
+        if let Some(leeway) = block.oidc_leeway_seconds {
+            issuer_block.leeway_seconds = leeway;
+        }
+        combined
+            .issuers
+            .entry(issuer.clone())
+            .or_insert(issuer_block);
+        combined.enabled = true;
+    }
+    if !combined.enabled {
         return Ok(());
-    };
+    }
+    let oidc: &OidcConfig = &combined;
     let keys = JwksCache::try_new(oidc)?;
     let trust: BTreeMap<String, IssuerTrust> = oidc
         .issuers
