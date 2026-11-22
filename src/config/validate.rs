@@ -2,9 +2,10 @@
 //! cannot express. Closed sets (eviction, key_case, tiebreak, mode, backend,
 //! log level/format) are enforced by their serde enums at parse time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::config::error::ConfigError;
+use crate::config::min_free::parse_byte_size;
 use crate::config::{AuthMode, Config, QuotasConfig, RuntimeForgeConfig};
 
 /// Split `host:port` (IPv6 literals bracketed: `[::1]:8080`).
@@ -59,6 +60,86 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
     validate_oidc(config)?;
     validate_runtime(&config.auth.runtime)?;
     validate_tenancy(config)?;
+    validate_v13(config)?;
+    Ok(())
+}
+
+/// v1.3 config shape: structural checks on the new fields. The legacy fields
+/// keep driving runtime behavior, so this is deliberately validation-only.
+fn validate_v13(config: &Config) -> Result<(), ConfigError> {
+    let mut names = HashSet::new();
+    for instance in &config.storage.instances {
+        if instance.name.is_empty() || !names.insert(instance.name.clone()) {
+            return Err(ConfigError::StorageInstanceName {
+                name: instance.name.clone(),
+            });
+        }
+        if instance.path.as_os_str().is_empty() {
+            return Err(ConfigError::EmptyStoragePath);
+        }
+    }
+    for target in config.storage.routes.values() {
+        if !names.contains(target) {
+            return Err(ConfigError::StorageRouteTarget {
+                target: target.clone(),
+            });
+        }
+    }
+    for rule in &config.quota {
+        if parse_byte_size(&rule.limit).is_none_or(|bytes| bytes == 0) {
+            return Err(ConfigError::QuotaRuleLimit {
+                target: rule.target.clone(),
+                limit: rule.limit.clone(),
+            });
+        }
+    }
+    for (forge, block) in &config.auth.forge {
+        if forge.is_empty() || forge.contains('|') {
+            return Err(ConfigError::RuntimeForgeKey {
+                forge: forge.clone(),
+            });
+        }
+        let has_oidc_keys = block.oidc_issuer.is_some()
+            || block.oidc_audiences.is_some()
+            || block.oidc_jwks_url.is_some()
+            || block.oidc_tenant_claim.is_some()
+            || block.oidc_require.is_some()
+            || block.oidc_leeway_seconds.is_some();
+        if has_oidc_keys && block.oidc_issuer.is_none() {
+            return Err(ConfigError::ForgeOidcIssuerMissing {
+                forge: forge.clone(),
+            });
+        }
+        if block.hmac_secret.is_none() && block.runtime_secret.is_none() && !has_oidc_keys {
+            return Err(ConfigError::ForgeEmpty {
+                forge: forge.clone(),
+            });
+        }
+    }
+
+    // State and payloads in one tree make `du` misleading and let a sweep
+    // reach state. A legacy config's derived data_path equals storage.fs.path
+    // by design, so that case is the documented exception and stays quiet.
+    if let Some(data_path) = &config.server.data_path
+        && data_path != &config.storage.fs.path
+        && !data_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".db"))
+    {
+        for instance in &config.storage.instances {
+            if data_path == &instance.path
+                || data_path.starts_with(&instance.path)
+                || instance.path.starts_with(data_path)
+            {
+                tracing::warn!(
+                    data_path = %data_path.display(),
+                    storage_path = %instance.path.display(),
+                    "server.data_path overlaps a storage instance path; state and payloads should be separate"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -262,7 +343,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::config::{AuthMode, OidcConfig, OidcIssuerConfig, RuntimeForgeConfig};
+    use crate::config::{
+        AuthMode, ForgeAuthConfig, OidcConfig, OidcIssuerConfig, QuotaRuleConfig,
+        RuntimeForgeConfig, StorageInstanceConfig,
+    };
 
     /// Enabled Plane B surface. Validation only checks the block's shape -
     /// the secret file is read by `auth::runtime::install` at boot.
@@ -968,5 +1052,80 @@ mod tests {
             .insert(String::from("default"), String::from("not-a-size"));
         let err = validate(&config).expect_err("bad default limit");
         assert!(matches!(err, ConfigError::QuotaValue { .. }));
+    }
+
+    #[test]
+    fn v13_duplicate_instance_names_are_rejected() {
+        let mut config = Config::default();
+        config.storage.instances = vec![
+            StorageInstanceConfig {
+                name: String::from("same"),
+                ..StorageInstanceConfig::default()
+            },
+            StorageInstanceConfig {
+                name: String::from("same"),
+                ..StorageInstanceConfig::default()
+            },
+        ];
+        assert!(matches!(
+            validate(&config),
+            Err(ConfigError::StorageInstanceName { .. })
+        ));
+    }
+
+    #[test]
+    fn v13_unknown_route_target_is_rejected() {
+        let mut config = Config::default();
+        config
+            .storage
+            .routes
+            .insert(String::from("acme|*"), String::from("missing"));
+        assert!(matches!(
+            validate(&config),
+            Err(ConfigError::StorageRouteTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn v13_bad_quota_limit_is_rejected() {
+        let mut config = Config {
+            quota: vec![QuotaRuleConfig {
+                limit: String::from("plenty"),
+                ..QuotaRuleConfig::default()
+            }],
+            ..Config::default()
+        };
+        assert!(matches!(
+            validate(&config),
+            Err(ConfigError::QuotaRuleLimit { .. })
+        ));
+        config.quota[0].limit = String::from("20GiB");
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn v13_forge_blocks_need_one_plane_and_an_issuer_for_oidc_keys() {
+        let mut config = Config::default();
+        config
+            .auth
+            .forge
+            .insert(String::from("hangar"), ForgeAuthConfig::default());
+        assert!(matches!(
+            validate(&config),
+            Err(ConfigError::ForgeEmpty { .. })
+        ));
+
+        config.auth.forge.insert(
+            String::from("hangar"),
+            ForgeAuthConfig {
+                oidc_audiences: Some(vec![String::from("cachette")]),
+                ..ForgeAuthConfig::default()
+            },
+        );
+        let err = validate(&config).expect_err("oidc keys without issuer");
+        assert!(
+            matches!(err, ConfigError::ForgeOidcIssuerMissing { .. }),
+            "unexpected error: {err:?}"
+        );
     }
 }

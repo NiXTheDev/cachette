@@ -7,7 +7,7 @@
 //! to serve: `--print-config` succeeds without it (secrets render as `***`).
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -20,12 +20,14 @@ mod error;
 mod min_free;
 mod quotas;
 mod sections;
+mod v13;
 mod validate;
 
 pub use error::ConfigError;
 pub use min_free::MinFree;
 pub use quotas::{Quotas, QuotasConfig};
 pub use sections::*;
+pub use v13::{ForgeAuthConfig, QuotaRuleConfig, QuotaScope, StorageInstanceConfig, StorageKind};
 
 /// Name of the config file looked for inside [`default_config_dir`].
 pub const CONFIG_FILE_NAME: &str = "cachette.toml";
@@ -74,6 +76,9 @@ pub struct Config {
     pub v2: V2Config,
     pub cluster: ClusterConfig,
     pub log: LogConfig,
+    /// v1.3 top-level `[[quota]]` rules. Legacy `[storage.quotas]` is copied
+    /// here at load time; runtime still reads the legacy table for now.
+    pub quota: Vec<QuotaRuleConfig>,
 }
 
 impl Config {
@@ -98,6 +103,29 @@ impl Config {
             .cert_path
             .clone()
             .unwrap_or_else(|| self.storage.fs.path.join("identity"))
+    }
+
+    /// v1.3 control-plane DB file. A configured directory resolves to
+    /// `<dir>/cachette.db`; a path whose final component ends in `.db` is used
+    /// verbatim. With no configured path, the config file's directory is used
+    /// (or the platform default config dir when no file was given).
+    #[must_use]
+    pub fn data_path(&self, config_file: Option<&Path>) -> PathBuf {
+        let raw = self.server.data_path.clone().unwrap_or_else(|| {
+            match config_file.and_then(Path::parent) {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+                _ => default_config_dir(),
+            }
+        });
+        if raw
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|n| n.ends_with(".db"))
+        {
+            raw
+        } else {
+            raw.join("cachette.db")
+        }
     }
 }
 
@@ -145,6 +173,7 @@ pub(crate) fn from_sources(
     let object = doc
         .as_object_mut()
         .ok_or_else(|| ConfigError::Toml(String::from("top level must be a table")))?;
+    v13::normalize(object);
     let config = Config {
         server: take(object, "server")?,
         storage: take(object, "storage")?,
@@ -154,6 +183,7 @@ pub(crate) fn from_sources(
         v2: take(object, "v2")?,
         cluster: take(object, "cluster")?,
         log: take(object, "log")?,
+        quota: take(object, "quota")?,
     };
     if let Some(key) = object.keys().next() {
         return Err(ConfigError::UnknownKey(key.clone()));
@@ -222,6 +252,9 @@ pub fn render_masked(config: &Config) -> Result<String, ConfigError> {
                 for token in tokens {
                     mask_string(token);
                 }
+            }
+            if let Some(jwt_secret) = auth.get_mut("jwt_secret") {
+                mask_string(jwt_secret);
             }
         }
         if let Some(v2) = object.get_mut("v2").and_then(Value::as_object_mut)

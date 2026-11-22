@@ -171,6 +171,30 @@ pub enum ConfigError {
     )]
     HmacInMultiTenant { mode: &'static str },
 
+    /// v1.3: duplicate or empty `[[storage.instances]]` name.
+    #[error("storage.instances names must be non-empty and unique (duplicate or empty: {name:?})")]
+    StorageInstanceName { name: String },
+
+    /// v1.3: a `[storage.routes]` target that is not a configured instance.
+    #[error("storage.routes target {target:?} is not a configured storage instance")]
+    StorageRouteTarget { target: String },
+
+    /// v1.3: a `[[quota]]` limit is not a positive bytesize.
+    #[error(
+        "invalid [[quota]] limit for {target:?}: {limit:?} (expected a bytesize such as \"20GiB\")"
+    )]
+    QuotaRuleLimit { target: String, limit: String },
+
+    /// v1.3: an `[auth.<forge>]` block has no credential plane.
+    #[error(
+        "auth.forge.{forge:?} needs at least one of hmac_secret, runtime_secret or oidc_issuer"
+    )]
+    ForgeEmpty { forge: String },
+
+    /// v1.3: `oidc_*` keys without the issuer they belong to.
+    #[error("auth.forge.{forge:?} sets oidc_* keys but has no oidc_issuer")]
+    ForgeOidcIssuerMissing { forge: String },
+
     /// A `serde_json` failure while rendering `--print-config` output.
     /// Effectively unreachable; kept so rendering never panics.
     #[error("internal config serialization error: {0}")]

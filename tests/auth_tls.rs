@@ -245,11 +245,9 @@ async fn start_server(root: &Path, mode: AuthMode, pki: &Pki, peers: PeerPins) -
     .expect("server identity");
     let section = ServerConfig {
         listen: String::from("127.0.0.1:0"),
-        external_url: None,
         tls_cert: Some(root.join("server.crt")),
         tls_key: Some(root.join("server.key")),
-        max_chunk_bytes: 64 * 1024 * 1024,
-        drain_grace_seconds: 30,
+        ..ServerConfig::default()
     };
     let config = tls::server_config(&section, &identity).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");

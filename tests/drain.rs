@@ -132,11 +132,7 @@ async fn serve(
     let draining = state.draining.clone();
     let section = ServerConfig {
         listen: String::from("127.0.0.1:0"),
-        external_url: None,
-        tls_cert: None,
-        tls_key: None,
-        max_chunk_bytes: 64 * 1024 * 1024,
-        drain_grace_seconds: 30,
+        ..ServerConfig::default()
     };
     let config = tls::server_config(&section, identity).expect("TLS config builds");
     let listener = tls::bind("127.0.0.1:0", config).await.expect("binds");

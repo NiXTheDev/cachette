@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::config::min_free::MinFree;
 use crate::config::quotas::QuotasConfig;
+use crate::config::v13::{ForgeAuthConfig, StorageInstanceConfig};
 
 /// `[server]` - the main listener runners and clients enter through. It is
 /// plaintext HTTP unless `tls_cert`/`tls_key` are both set; peers have their
@@ -29,6 +30,18 @@ pub struct ServerConfig {
     /// node advertises `draining`, refuses new uploads with `503`, and keeps
     /// serving in-flight requests for up to this many seconds before exiting.
     pub drain_grace_seconds: u64,
+    /// v1.3 control-plane state directory (or a `.db` file path). Populated by
+    /// legacy normalization for v1.2 configs; later slices resolve the
+    /// config-dir default and move DB/identity/lock here.
+    pub data_path: Option<PathBuf>,
+    /// v1.3: old `[cache]` keys, copied here at load time.
+    pub max_size: Option<u64>,
+    pub eviction: Option<String>,
+    pub key_case: Option<String>,
+    pub reservation_ttl_seconds: Option<u64>,
+    /// v1.3: old `[log]` keys, copied here at load time.
+    pub level: Option<String>,
+    pub format: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +53,13 @@ impl Default for ServerConfig {
             tls_key: None,
             max_chunk_bytes: 64 * 1024 * 1024,
             drain_grace_seconds: 30,
+            data_path: None,
+            max_size: None,
+            eviction: None,
+            key_case: None,
+            reservation_ttl_seconds: None,
+            level: None,
+            format: None,
         }
     }
 }
@@ -61,6 +81,11 @@ pub struct StorageConfig {
     /// §5): a `default` plus exact and wildcard overrides. Absent or empty
     /// means every namespace is unlimited.
     pub quotas: QuotasConfig,
+    /// v1.3 repeatable `[[storage]]` instances. A legacy `[storage.fs]` config
+    /// gets a synthesized `default` instance at load time.
+    pub instances: Vec<StorageInstanceConfig>,
+    /// v1.3: resolved namespace -> instance name, with `"*"` catch-all.
+    pub routes: BTreeMap<String, String>,
 }
 
 impl Default for StorageConfig {
@@ -71,6 +96,8 @@ impl Default for StorageConfig {
             cdc: CdcConfig::default(),
             namespaces: BTreeMap::new(),
             quotas: QuotasConfig::default(),
+            instances: Vec::new(),
+            routes: BTreeMap::new(),
         }
     }
 }
@@ -196,6 +223,16 @@ pub struct AuthConfig {
     /// `docs/shared-cache.md` §3): one block per forge, keyed by the forge
     /// id. Empty = Plane B off.
     pub runtime: BTreeMap<String, RuntimeForgeConfig>,
+    /// v1.3: every credential plane for one forge in a single block.
+    pub forge: BTreeMap<String, ForgeAuthConfig>,
+    /// v1.3: old `[v1]`/`[v2]` keys and `[auth.oidc]` globals, copied here at
+    /// load time. Runtime still reads the legacy locations for now.
+    pub signed_url_ttl_seconds: Option<u64>,
+    pub jwt_secret: Option<String>,
+    pub jwt_ttl_seconds: Option<u64>,
+    pub oidc_jwks_refresh_seconds: Option<u64>,
+    pub oidc_jwks_max_keys: Option<u64>,
+    pub oidc_jwks_ca_pem: Option<PathBuf>,
 }
 
 impl Default for AuthConfig {
@@ -207,6 +244,13 @@ impl Default for AuthConfig {
             hmac_max_age_seconds: 600,
             oidc: None,
             runtime: BTreeMap::new(),
+            forge: BTreeMap::new(),
+            signed_url_ttl_seconds: None,
+            jwt_secret: None,
+            jwt_ttl_seconds: None,
+            oidc_jwks_refresh_seconds: None,
+            oidc_jwks_max_keys: None,
+            oidc_jwks_ca_pem: None,
         }
     }
 }
