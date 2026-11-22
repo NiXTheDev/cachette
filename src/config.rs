@@ -25,6 +25,7 @@ mod validate;
 
 pub use error::ConfigError;
 pub use min_free::MinFree;
+pub(crate) use quotas::glob_matches;
 pub use quotas::{Quotas, QuotasConfig};
 pub use sections::*;
 pub use v13::{ForgeAuthConfig, QuotaRuleConfig, QuotaScope, StorageInstanceConfig, StorageKind};

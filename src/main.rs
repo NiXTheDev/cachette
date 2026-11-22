@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,7 +165,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
     // §5): parsed once at boot, like the namespace mapping; validation has
     // already proven the table parses, so this cannot fail late.
-    state.quotas = Arc::new(config.storage.quotas.parse()?);
+    state.set_quotas(config.storage.quotas.parse()?);
     // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
     // enabled, build the JWKS cache + verifier and hang them on the state.
     // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
@@ -210,13 +210,51 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         .cdc
         .enabled
         .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
-    let storage = Arc::new(FsStorage::open_cdc_with_db(
-        &config.storage.fs.path,
-        &config.data_path,
-        cdc,
-    )?);
+    // Every instance shares the one control DB but owns its own payload root.
+    let mut backends: BTreeMap<String, Arc<dyn StorageBackend>> = BTreeMap::new();
+    let mut default_fs: Option<Arc<FsStorage>> = None;
+    for instance in &config.storage.instances {
+        let fs = Arc::new(FsStorage::open_cdc_with_db(
+            &instance.path,
+            &config.data_path,
+            cdc,
+        )?);
+        if instance.name == "default" {
+            default_fs = Some(fs.clone());
+        }
+        backends.insert(instance.name.clone(), fs as Arc<dyn StorageBackend>);
+    }
+    if backends.is_empty() {
+        // Defensive: the loader synthesizes `default`, but hand-built configs
+        // can reach here without instances.
+        let fs = Arc::new(FsStorage::open_cdc_with_db(
+            &config.storage.fs.path,
+            &config.data_path,
+            cdc,
+        )?);
+        default_fs = Some(fs.clone());
+        backends.insert(String::from("default"), fs as Arc<dyn StorageBackend>);
+    }
+    let default_name = if backends.contains_key("default") {
+        String::from("default")
+    } else {
+        backends.keys().next().cloned().unwrap_or_default()
+    };
+    let storage = match default_fs {
+        Some(fs) => fs,
+        None => Arc::new(FsStorage::open_cdc_with_db(
+            &config.storage.fs.path,
+            &config.data_path,
+            cdc,
+        )?),
+    };
     let backend: Arc<dyn StorageBackend> = storage.clone();
     state.storage = Some(backend.clone());
+    state.set_instances(
+        backends,
+        config.storage.routes.clone().into_iter().collect(),
+        default_name,
+    );
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     // Startup sweep, before the listener binds: rowless blobs older than the
     // 1h grace and reservations whose TTL has passed (plan task 34).
@@ -355,7 +393,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         Arc::new(LeaseSet::new(DEFAULT_BORROW_TTL)),
     )
     .with_metrics(state.metrics.clone())
-    .with_quotas(state.quotas.clone());
+    .with_quotas(state.quotas_snapshot());
     let eviction_storage = storage.clone();
     let eviction_metrics = state.metrics.clone();
     let eviction_storage_ok = state.storage_ok.clone();

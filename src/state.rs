@@ -1,5 +1,6 @@
 //! Shared application state (plan task 3).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -9,7 +10,7 @@ use crate::auth::runtime::{RuntimeVerifier, SharedRuntimeVerifier};
 use crate::auth::{AuthPolicy, Namespace, TokenStore};
 use crate::cluster::PeerTable;
 use crate::cluster::relay::ClusterRelay;
-use crate::config::{Config, KeyCase, MinFree, OidcConfig, Quotas};
+use crate::config::{Config, KeyCase, MinFree, OidcConfig, Quotas, glob_matches};
 use crate::metrics::Metrics;
 use crate::storage::StorageBackend;
 use crate::tls::PeerPins;
@@ -83,6 +84,70 @@ pub struct OidcRuntime {
     pub boot_signature: Option<String>,
 }
 
+/// Named storage backends and the namespace -> instance routing table.
+/// Backends and the default instance are fixed at boot; routes are swapped
+/// atomically by a SIGHUP reload.
+#[derive(Default)]
+pub struct InstanceRegistry {
+    backends: BTreeMap<String, Arc<dyn StorageBackend>>,
+    routes: Vec<(String, String)>,
+    default_name: String,
+}
+
+impl InstanceRegistry {
+    pub fn new(
+        backends: BTreeMap<String, Arc<dyn StorageBackend>>,
+        routes: Vec<(String, String)>,
+        default_name: String,
+    ) -> Self {
+        Self {
+            backends,
+            routes,
+            default_name,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+
+    pub fn set_routes(&mut self, routes: Vec<(String, String)>) {
+        self.routes = routes;
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.backends.keys().cloned().collect()
+    }
+
+    /// Exact namespace match, then the longest matching glob, then `"*"`,
+    /// then the default instance.
+    pub fn resolve(&self, namespace: &str) -> &str {
+        let mut best: Option<(&str, &str)> = None; // (pattern, instance)
+        for (pattern, instance) in &self.routes {
+            let matches =
+                pattern == namespace || (pattern.contains('*') && glob_matches(pattern, namespace));
+            if !matches {
+                continue;
+            }
+            let is_star = pattern == "*";
+            let better = match best {
+                None => true,
+                Some((current, _)) => !is_star && (current == "*" || pattern.len() > current.len()),
+            };
+            if better {
+                best = Some((pattern, instance));
+            }
+        }
+        best.map(|(_, instance)| instance)
+            .filter(|name| self.backends.contains_key(*name))
+            .unwrap_or(self.default_name.as_str())
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn StorageBackend>> {
+        self.backends.get(name).cloned()
+    }
+}
+
 /// State threaded through every route handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -94,7 +159,12 @@ pub struct AppState {
     /// `--config <path>` placeholder; config loading lands in plan task 5.
     pub config_path: Option<PathBuf>,
     /// Storage handle; `None` until a backend is constructed (plan tasks 8-9).
+    /// v1.3: the `default` instance is also held here so capacity/reaper code
+    /// keeps its existing call shape.
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// v1.3 named storage instances and namespace routes. Empty for legacy
+    /// single-backend deployments and tests, which keep using `storage`.
+    pub instances: Arc<RwLock<InstanceRegistry>>,
     /// Cluster peer-certificate pins (plan task 14 / B2). Seeded from
     /// `[cluster] seed_fingerprints`; gates `/_internal/peers/*`.
     pub peers: Arc<PeerPins>,
@@ -133,9 +203,9 @@ pub struct AppState {
     /// empty, so every credential keeps its derived namespace.
     pub namespaces: Arc<std::collections::BTreeMap<String, String>>,
     /// Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
-    /// §5). Boot-time wiring like the namespace mapping; the default has no
-    /// quotas, so every namespace is unlimited.
-    pub quotas: Arc<Quotas>,
+    /// §5). Swapped wholesale by a SIGHUP reload; the default has no quotas,
+    /// so every namespace is unlimited.
+    pub quotas: Arc<RwLock<Arc<Quotas>>>,
     /// Runner-visible base URL (`[server] external_url`, resolved from `listen`
     /// when unset) prefixed onto capability URLs minted for `/v2/*` (task 24).
     /// `None` yields host-relative URLs (tests without a configured host).
@@ -172,6 +242,7 @@ impl AppState {
             node_id: default_node_id(),
             config_path: None,
             storage: None,
+            instances: Arc::new(RwLock::new(InstanceRegistry::default())),
             peers: Arc::new(PeerPins::default()),
             peer_table: Arc::new(PeerTable::new()),
             tokens: Arc::new(TokenStore::open_memory().expect("in-memory token store")),
@@ -180,7 +251,7 @@ impl AppState {
             runtime: Arc::new(RwLock::new(None)),
             cache: Arc::new(RwLock::new(CacheLimits::default())),
             namespaces: Arc::new(std::collections::BTreeMap::new()),
-            quotas: Arc::new(Quotas::default()),
+            quotas: Arc::new(RwLock::new(Arc::new(Quotas::default()))),
             external_url: None,
             relay: None,
             capacity_total: 0,
@@ -278,9 +349,55 @@ impl AppState {
     /// per-request namespace resolution viable.
     #[must_use]
     pub fn storage_scoped(&self, namespace: &str) -> Option<Arc<dyn StorageBackend>> {
-        self.storage
-            .as_ref()
-            .map(|backend| backend.scoped(namespace))
+        let registry = self
+            .instances
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.is_empty() {
+            return self
+                .storage
+                .as_ref()
+                .map(|backend| backend.scoped(namespace));
+        }
+        let name = registry.resolve(namespace);
+        registry.get(name).map(|backend| backend.scoped(namespace))
+    }
+
+    /// Install the boot-time instance set and routing table.
+    pub fn set_instances(
+        &self,
+        backends: BTreeMap<String, Arc<dyn StorageBackend>>,
+        routes: Vec<(String, String)>,
+        default_name: String,
+    ) {
+        let mut registry = self
+            .instances
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *registry = InstanceRegistry::new(backends, routes, default_name);
+    }
+
+    /// Replace the live routing table on a SIGHUP reload. In-flight requests
+    /// that already cloned a scoped backend keep using it for that call.
+    pub fn set_routes(&self, routes: Vec<(String, String)>) {
+        self.instances
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_routes(routes);
+    }
+
+    /// Instance name a namespace resolves to, for logs and the cluster wire.
+    #[must_use]
+    pub fn resolve_storage(&self, namespace: &str) -> String {
+        let registry = self
+            .instances
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.is_empty() {
+            String::from("default")
+        } else {
+            registry.resolve(namespace).to_owned()
+        }
     }
 
     /// Apply the admin namespace mapping (v1.2 workstream F,
@@ -299,7 +416,27 @@ impl AppState {
     /// `docs/shared-cache.md` §5), or `None` when quotas are off.
     #[must_use]
     pub fn quota_for(&self, namespace: &str) -> Option<u64> {
-        self.quotas.limit_for(namespace)
+        self.quotas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limit_for(namespace)
+    }
+
+    /// Snapshot for the eviction reaper (boot and reload).
+    #[must_use]
+    pub fn quotas_snapshot(&self) -> Arc<Quotas> {
+        self.quotas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the live quota rules (boot + SIGHUP reload).
+    pub fn set_quotas(&self, quotas: Quotas) {
+        *self
+            .quotas
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(quotas);
     }
 
     /// Replace the live cache limits (boot + SIGHUP reload).
@@ -344,6 +481,11 @@ impl AppState {
     pub fn apply_reload(&self, config: &Config) {
         self.set_auth(AuthPolicy::from_config(config));
         self.set_cache_limits(CacheLimits::from_config(config));
+        self.set_routes(config.storage.routes.clone().into_iter().collect());
+        // Validation at load time guarantees the rules parse.
+        if let Ok(quotas) = config.storage.quotas.parse() {
+            self.set_quotas(quotas);
+        }
         let reloaded_signature = config
             .auth
             .oidc
@@ -427,5 +569,29 @@ mod tests {
             state.resolve_namespace(Namespace::legacy()),
             Namespace::legacy()
         );
+    }
+
+    #[test]
+    fn registry_resolves_exact_then_longest_glob_then_star_then_default() {
+        let dir = std::env::temp_dir().join(format!("cachette-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fs: Arc<dyn StorageBackend> =
+            Arc::new(crate::storage::fs::FsStorage::open(&dir).expect("fs"));
+        let mut backends = BTreeMap::new();
+        for name in ["default", "east", "scratch"] {
+            backends.insert(String::from(name), fs.clone());
+        }
+        let routes = vec![
+            (String::from("acme|*"), String::from("east")),
+            (String::from("acme|team/*"), String::from("scratch")),
+            (String::from("acme|team/exact"), String::from("default")),
+            (String::from("*"), String::from("default")),
+        ];
+        let registry = InstanceRegistry::new(backends, routes, String::from("default"));
+        assert_eq!(registry.resolve("acme|team/exact"), "default");
+        assert_eq!(registry.resolve("acme|team/other"), "scratch");
+        assert_eq!(registry.resolve("acme|ops"), "east");
+        assert_eq!(registry.resolve("other|ns"), "default");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

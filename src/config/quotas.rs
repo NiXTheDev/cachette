@@ -200,7 +200,7 @@ fn parse_pattern(key: &str) -> Result<Pattern, ConfigError> {
 
 /// Anchored glob: `*` matches any run of characters, including an empty
 /// one. Byte-wise, so UTF-8 names match exactly and only on whole bytes.
-fn glob_matches(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
     let (mut pi, mut vi) = (0usize, 0usize);
