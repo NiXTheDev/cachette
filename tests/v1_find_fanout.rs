@@ -124,6 +124,7 @@ fn state_with(
     state.peers = Arc::new(PeerPins::new(&seed, false));
     state.storage = Some(storage.clone());
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: None,
         hmac_max_age_seconds: 600,

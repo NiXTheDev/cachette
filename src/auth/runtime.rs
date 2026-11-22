@@ -195,7 +195,25 @@ impl RuntimeVerifier {
 /// # Errors
 /// [`RuntimeInstallError`] when an enabled block's secret cannot be read.
 pub fn install(state: &AppState, config: &Config) -> Result<(), RuntimeInstallError> {
-    let Some(verifier) = RuntimeVerifier::from_config(&config.auth.runtime)? else {
+    // v1.3 per-forge blocks feed the same verifier as the legacy per-plane
+    // tables. An explicit `[auth.runtime]` block wins on a name collision.
+    let mut runtime = config.auth.runtime.clone();
+    for (forge, block) in &config.auth.forge {
+        if let Some(secret) = &block.runtime_secret {
+            let entry = RuntimeForgeConfig {
+                enabled: true,
+                secret: secret.clone(),
+                tenant_claim: block
+                    .runtime_tenant_claim
+                    .clone()
+                    .unwrap_or_else(|| String::from(DEFAULT_TENANT_CLAIM)),
+                leeway_seconds: block.oidc_leeway_seconds.unwrap_or(30),
+                ..RuntimeForgeConfig::default()
+            };
+            runtime.entry(forge.clone()).or_insert(entry);
+        }
+    }
+    let Some(verifier) = RuntimeVerifier::from_config(&runtime)? else {
         return Ok(());
     };
     tracing::info!(

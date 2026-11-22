@@ -258,6 +258,7 @@ async fn start_server(root: &Path, mode: AuthMode, pki: &Pki, peers: PeerPins) -
     state.tokens =
         Arc::new(TokenStore::open(&root.join("auth.sqlite3")).expect("token store opens"));
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

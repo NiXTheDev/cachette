@@ -29,46 +29,78 @@ pub const HEADER_WRITE_ISOLATION: &str = "forgejo-cache-writeisolationkey";
 /// Clock-skew tolerance for future timestamps (seconds).
 const MAX_FUTURE_SKEW_SECONDS: i64 = 5;
 
-/// Verify the Forgejo HMAC headers against `policy.secret`.
-///
-/// Fails closed: any missing header, unparseable timestamp, bad hex, or MAC
-/// mismatch rejects the request. A missing `auth.secret` rejects everything.
-pub fn verify(policy: &AuthPolicy, headers: &HeaderMap) -> bool {
-    let Some(secret) = policy.secret.as_deref() else {
-        return false;
-    };
-    let Some(repo) = header(headers, HEADER_REPO) else {
-        return false;
-    };
-    let Some(run) = header(headers, HEADER_RUN) else {
-        return false;
-    };
-    let Some(ts) = header(headers, HEADER_TS) else {
-        return false;
-    };
-    let Some(provided) = header(headers, HEADER_MAC) else {
-        return false;
-    };
-    let Ok(ts) = ts.parse::<i64>() else {
-        return false;
-    };
+struct Parsed<'a> {
+    repo: &'a str,
+    run: &'a str,
+    ts: i64,
+    isolation: &'a str,
+    provided: Vec<u8>,
+}
+
+/// Read and shape-check the HMAC headers. Fails closed on any missing header,
+/// unparseable timestamp or hex, impossible timestamp, or stale signature.
+fn parse<'a>(policy: &AuthPolicy, headers: &'a HeaderMap) -> Option<Parsed<'a>> {
+    let repo = header(headers, HEADER_REPO)?;
+    let run = header(headers, HEADER_RUN)?;
+    let ts = header(headers, HEADER_TS)?.parse::<i64>().ok()?;
+    let provided = hex_decode(header(headers, HEADER_MAC)?)?;
     let now = now_secs();
     if ts > now + MAX_FUTURE_SKEW_SECONDS {
-        return false;
+        return None;
     }
     if policy.hmac_max_age_seconds > 0 && now - ts > policy.hmac_max_age_seconds as i64 {
-        return false;
+        return None;
     }
-    let isolation = header(headers, HEADER_WRITE_ISOLATION).unwrap_or("");
-    let payload = format!("{repo}>{run}>{ts}>{isolation}");
-    let Some(provided) = hex_decode(provided) else {
-        return false;
-    };
+    Some(Parsed {
+        repo,
+        run,
+        ts,
+        isolation: header(headers, HEADER_WRITE_ISOLATION).unwrap_or(""),
+        provided,
+    })
+}
+
+fn mac_matches(secret: &str, payload: &str, provided: &[u8]) -> bool {
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
     mac.update(payload.as_bytes());
-    mac.verify_slice(&provided).is_ok()
+    mac.verify_slice(provided).is_ok()
+}
+
+/// Verify the Forgejo HMAC headers against `policy.secret` (legacy path).
+///
+/// Fails closed: any missing header, unparseable timestamp, bad hex, or MAC
+/// mismatch rejects the request. A missing `auth.secret` rejects everything.
+pub fn verify(policy: &AuthPolicy, headers: &HeaderMap) -> bool {
+    let Some(parsed) = parse(policy, headers) else {
+        return false;
+    };
+    let payload = format!(
+        "{}>{}>{}>{}",
+        parsed.repo, parsed.run, parsed.ts, parsed.isolation
+    );
+    policy
+        .secret
+        .as_deref()
+        .is_some_and(|secret| mac_matches(secret, &payload, &parsed.provided))
+}
+
+/// v1.3: verify against every configured forge secret and return the forge
+/// plus the signed repository as tenant. The first matching secret wins.
+#[must_use]
+pub fn verify_tenant(policy: &AuthPolicy, headers: &HeaderMap) -> Option<(String, String)> {
+    let parsed = parse(policy, headers)?;
+    let payload = format!(
+        "{}>{}>{}>{}",
+        parsed.repo, parsed.run, parsed.ts, parsed.isolation
+    );
+    for (forge, secret) in &policy.forge_hmac_secrets {
+        if mac_matches(secret, &payload, &parsed.provided) {
+            return Some((forge.clone(), parsed.repo.to_owned()));
+        }
+    }
+    None
 }
 
 /// Mint the hex `Forgejo-Cache-MAC` over `repo`, `run`, `timestamp`, and
@@ -180,5 +212,27 @@ mod tests {
                     acc
                 });
         assert_eq!(mint("secret", "o/r", 7, 1_700_000_000, "iso"), expected);
+    }
+
+    #[test]
+    fn verify_tenant_matches_the_forge_secret_and_signed_repo() {
+        let policy = AuthPolicy {
+            forge_hmac_secrets: vec![
+                (String::from("hangar"), String::from("hangar-secret")),
+                (String::from("other"), String::from("other-secret")),
+            ],
+            ..AuthPolicy::default()
+        };
+        let ts = now_secs();
+        let mac = mint("other-secret", "owner/repo", 7, ts, "");
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_REPO, HeaderValue::from_static("owner/repo"));
+        headers.insert(HEADER_RUN, HeaderValue::from_static("7"));
+        headers.insert(HEADER_TS, HeaderValue::from_str(&ts.to_string()).unwrap());
+        headers.insert(HEADER_MAC, HeaderValue::from_str(&mac).unwrap());
+        assert_eq!(
+            verify_tenant(&policy, &headers),
+            Some((String::from("other"), String::from("owner/repo")))
+        );
     }
 }

@@ -99,6 +99,7 @@ fn state_with(identity: &Identity, storage: &Arc<MemoryStorage>, draining: bool)
     state.peers = Arc::new(cachette::tls::PeerPins::new(&BTreeMap::new(), false));
     state.storage = Some(storage.clone());
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: None,
         hmac_max_age_seconds: 600,

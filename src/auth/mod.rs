@@ -87,6 +87,9 @@ pub struct AuthPolicy {
     pub hmac_max_age_seconds: u64,
     pub static_tokens: Vec<String>,
     pub cluster_enabled: bool,
+    /// v1.3 `(forge, hmac_secret)` pairs from `[auth.<forge>]` blocks. A
+    /// matching MAC yields that forge and the signed repo as tenant.
+    pub forge_hmac_secrets: Vec<(String, String)>,
 }
 
 impl AuthPolicy {
@@ -98,6 +101,17 @@ impl AuthPolicy {
             hmac_max_age_seconds: config.auth.hmac_max_age_seconds,
             static_tokens: config.auth.tokens.clone(),
             cluster_enabled: config.cluster.enabled,
+            forge_hmac_secrets: config
+                .auth
+                .forge
+                .iter()
+                .filter_map(|(forge, block)| {
+                    block
+                        .hmac_secret
+                        .clone()
+                        .map(|secret| (forge.clone(), secret))
+                })
+                .collect(),
         }
     }
 }
@@ -110,6 +124,7 @@ impl Default for AuthPolicy {
             hmac_max_age_seconds: 600,
             static_tokens: Vec::new(),
             cluster_enabled: false,
+            forge_hmac_secrets: Vec::new(),
         }
     }
 }
@@ -143,22 +158,23 @@ pub async fn require_auth(
     // and the tenant-less bearer paths are single-tenant and resolve to the
     // legacy namespace. HMAC in a multi-tenant boot is refused before this
     // layer is ever reached.
-    let namespace = match policy.mode {
-        AuthMode::Hmac => hmac::verify(&policy, request.headers()).then(Namespace::legacy),
-        AuthMode::Bearer => {
-            bearer::verify(
-                &policy,
-                &state.tokens,
-                runtime.as_deref(),
-                oidc.as_ref(),
-                request.headers(),
-            )
-            .await
-        }
-        AuthMode::Merge => {
-            if hmac::verify(&policy, request.headers()) {
-                Some(Namespace::legacy())
-            } else {
+    // v1.3: HMAC wins when it is allowed and a forge secret matches; the
+    // signed repo becomes the tenant. Legacy single-secret HMAC stays
+    // single-tenant. Bearer is consulted only when HMAC did not authorize.
+    let hmac_identity = matches!(policy.mode, AuthMode::Hmac | AuthMode::Merge)
+        .then(|| hmac::verify_tenant(&policy, request.headers()))
+        .flatten();
+    let legacy_hmac = hmac_identity.is_none()
+        && matches!(policy.mode, AuthMode::Hmac | AuthMode::Merge)
+        && hmac::verify(&policy, request.headers());
+    let namespace = if let Some((forge, tenant)) = hmac_identity {
+        Some(Namespace(format!("{forge}|{tenant}")))
+    } else if legacy_hmac {
+        Some(Namespace::legacy())
+    } else {
+        match policy.mode {
+            AuthMode::Hmac => None,
+            AuthMode::Bearer | AuthMode::Merge => {
                 bearer::verify(
                     &policy,
                     &state.tokens,

@@ -100,6 +100,7 @@ async fn fixture_state() -> AppState {
     let mut state = AppState::new();
     state.storage = Some(storage);
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -118,6 +119,7 @@ async fn sized_state(max_size: u64) -> (AppState, Arc<MemoryStorage>) {
     state.with_cache_limits(|c| c.max_size = max_size);
     state.storage = Some(storage.clone());
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -133,6 +135,7 @@ async fn hmac_state(cluster_enabled: bool) -> AppState {
     let mut state = AppState::new();
     state.storage = Some(storage);
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Hmac,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -592,6 +595,7 @@ async fn fs_state() -> (AppState, TempDir) {
     let mut state = AppState::new();
     state.storage = Some(storage);
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
@@ -607,6 +611,7 @@ async fn fs_state_with_fs() -> (AppState, Arc<FsStorage>, TempDir) {
     let mut state = AppState::new();
     state.storage = Some(storage.clone());
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

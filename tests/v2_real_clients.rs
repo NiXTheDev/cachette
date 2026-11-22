@@ -412,6 +412,7 @@ fn fixture_state(storage_dir: &Path, jwt: &str, base: &str) -> AppState {
     state.storage = Some(Arc::new(storage));
     state.external_url = Some(base.trim_end_matches('/').to_owned());
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Merge,
         secret: Some(FIXTURE_SECRET.to_owned()),
         hmac_max_age_seconds: 600,

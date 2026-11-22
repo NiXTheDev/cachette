@@ -67,6 +67,18 @@ pub(crate) fn validate(config: &Config) -> Result<(), ConfigError> {
 /// v1.3 config shape: structural checks on the new fields. The legacy fields
 /// keep driving runtime behavior, so this is deliberately validation-only.
 fn validate_v13(config: &Config) -> Result<(), ConfigError> {
+    // The legacy per-plane tables stay authoritative for one release, but
+    // point operators at the unified per-forge blocks on every boot.
+    if config.auth.oidc.as_ref().is_some_and(|oidc| oidc.enabled) {
+        tracing::warn!(
+            "[auth.oidc] is deprecated in v1.3; use [auth.<forge>] blocks with oidc_issuer"
+        );
+    }
+    if config.auth.runtime.values().any(|block| block.enabled) {
+        tracing::warn!(
+            "[auth.runtime] is deprecated in v1.3; use [auth.<forge>] blocks with runtime_secret"
+        );
+    }
     let mut names = HashSet::new();
     for instance in &config.storage.instances {
         if instance.name.is_empty() || !names.insert(instance.name.clone()) {
@@ -299,6 +311,16 @@ fn validate_runtime(runtime: &BTreeMap<String, RuntimeForgeConfig>) -> Result<()
 fn validate_tenancy(config: &Config) -> Result<(), ConfigError> {
     let oidc_enabled = config.auth.oidc.as_ref().is_some_and(|oidc| oidc.enabled);
     let runtime_enabled = config.auth.runtime.values().any(|block| block.enabled);
+    // v1.3: a forge block with hmac_secret makes Plane C tenant-yielding, so
+    // hmac/merge are safe even alongside OIDC or runtime tokens.
+    let forge_hmac = config
+        .auth
+        .forge
+        .values()
+        .any(|block| block.hmac_secret.is_some());
+    if forge_hmac {
+        return Ok(());
+    }
     if !oidc_enabled && !runtime_enabled {
         return Ok(());
     }
@@ -1100,6 +1122,27 @@ mod tests {
             Err(ConfigError::QuotaRuleLimit { .. })
         ));
         config.quota[0].limit = String::from("20GiB");
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn v13_forge_hmac_allows_merge_with_oidc() {
+        use crate::config::ForgeAuthConfig;
+
+        let mut config = enabled_oidc();
+        config.auth.mode = AuthMode::Merge;
+        assert!(matches!(
+            validate(&config),
+            Err(ConfigError::HmacInMultiTenant { .. })
+        ));
+
+        config.auth.forge.insert(
+            String::from("hangar"),
+            ForgeAuthConfig {
+                hmac_secret: Some(String::from("secret")),
+                ..ForgeAuthConfig::default()
+            },
+        );
         assert!(validate(&config).is_ok());
     }
 

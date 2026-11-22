@@ -61,6 +61,7 @@ fn metrics_state() -> AppState {
     let mut state = AppState::new();
     state.storage = Some(storage);
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode: AuthMode::Bearer,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,

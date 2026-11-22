@@ -40,6 +40,7 @@ fn now_secs() -> i64 {
 fn state_with_mode(mode: AuthMode) -> AppState {
     let state = AppState::new();
     state.set_auth(AuthPolicy {
+        forge_hmac_secrets: Vec::new(),
         mode,
         secret: Some(SECRET.to_owned()),
         hmac_max_age_seconds: 600,
