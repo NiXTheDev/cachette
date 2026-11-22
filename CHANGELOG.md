@@ -1,88 +1,41 @@
 # Changelog
 
-All notable changes to cachette are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-semantic versioning with the major digit reserved for truly breaking
-silently-incompatible changes. Design contracts live in `docs/`. Dates are
-the release commits' dates (Hangar publish timestamps can differ by a day).
+All notable changes to cachette are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semantic versioning with the major digit reserved for truly breaking silently-incompatible changes. Design contracts live in `docs/`. Dates are the release commits' dates (Hangar publish timestamps can differ by a day).
 
 ## [1.2.0] - 2026-11-21
 
-*One cache, many forges: credentials choose namespaces, quotas bound them,
-and peers without protocol v2 get 426.*
+*One cache, many forges: credentials choose namespaces, quotas bound them, and peers without protocol v2 get 426.*
 
-The multi-tenant shared cache (workstream F), the OIDC per-issuer reshape
-(workstream A), and CDC completion (workstream B commit 3), plus the 1.2.0
-cut. Full feature narrative: PR #13 and `temp/pr-v12-body.md`.
+v1.2 makes the namespace the unit of identity. One cachette, one cluster, many forges - and the tenant comes from the CREDENTIAL, never from the request. The v1 key scope is client-controlled, and the HMAC payload's `<repo>><run>` is client-asserted, so neither can carry an identity the server can trust. Now they do not have to.
 
 ### Added
 
-- **Namespaced storage.** Schema v3 adds a `namespace` to each row; the same
-  key in two namespaces is two isolated entries with two payloads, and the
-  legacy namespace keeps the v1.1 id derivation verbatim so existing rows
-  and blob files stay reachable. A verified migration backfills pre-v1.2
-  rows; a newer index is refused at boot.
-- **Per-request namespace resolution.** Credentials resolve to a namespace
-  in the auth gate and every client-facing handler addresses storage through
-  a `scoped()` view. Admin mappings in `[storage.namespaces]` can fold
-  identities into a shared namespace. Capability URLs MAC-bind the resolved
-  namespace (a stripped or swapped `ns` is a mismatch; pre-namespace URLs
-  stay valid).
-- **Per-namespace quotas.** `[storage.quotas]` sets a `default` plus exact or
-  tenant-side wildcard rules, most-specific wins. An over-quota namespace is
-  evicted first (worst excess first, LRU within it), before the global
-  `min_free` floor reclaims anything; `eviction = "none"` leaves quotas
-  advisory. v1 `cacheSize` reports the tenant's quota window narrowed by the
-  global budget, and a periodic sweep enforces quotas continuously.
-- **Forge runtime tokens (Plane B).** `[auth.runtime."<forge>"]` verifies
-  HS256 tokens signed by a forge's general token secret (read from a file at
-  boot, empty/unreadable is fatal), with a configurable tenant claim, scope
-  allow-list and claim pins. Runtime tokens are tried before OIDC, so an
-  HS256 token never reaches the RS256 verifier.
-- **Namespace-aware cluster wire.** Every key-bearing peer request carries
-  the resolved namespace and `x-cachette-peer-protocol: 2`. A missing or
-  different version is refused with `426 Upgrade Required` (hello and
-  heartbeat included), so a mixed cluster drains to "no healthy peer"
-  instead of merging tenants' rows. Multi-tenant + cluster is now supported.
-- **CDC completion (B-3).** The zero-ref purge consults the referring entry's
-  layout and namespaces (a complete `chunked` manifest is a referrer even
-  if `refs` drifted; referrers from any namespace count). Crash bounds for
-  whole-to-chunked conversion converge under boot + sweep with `used_bytes`
-  on the at-rest invariant.
+- **Namespaced storage.** Schema v3 adds a `namespace` to each row; the same key in two namespaces is two isolated entries with two payloads, and the legacy namespace keeps the v1.1 id derivation verbatim so existing rows and blob files stay reachable. A verified migration backfills pre-v1.2 rows; a newer index is refused at boot.
+- **Per-request namespace resolution.** Credentials resolve to a namespace in the auth gate and every client-facing handler addresses storage through a `scoped()` view. Admin mappings in `[storage.namespaces]` can fold identities into a shared namespace. Capability URLs MAC-bind the resolved namespace (a stripped or swapped `ns` is a mismatch; pre-namespace URLs stay valid).
+- **Per-namespace quotas.** `[storage.quotas]` sets a `default` plus exact or tenant-side wildcard rules, most-specific wins. An over-quota namespace is evicted first (worst excess first, LRU within it), before the global `min_free` floor reclaims anything; `eviction = "none"` leaves quotas advisory. v1 `cacheSize` reports the tenant's quota window narrowed by the global budget, and a periodic sweep enforces quotas continuously.
+- **Forge runtime tokens (Plane B).** `[auth.runtime."<forge>"]` verifies HS256 tokens signed by a forge's general token secret (read from a file at boot, empty/unreadable is fatal), with a configurable tenant claim, scope allow-list and claim pins. Runtime tokens are tried before OIDC, so an HS256 token never reaches the RS256 verifier.
+- **Namespace-aware cluster wire.** Every key-bearing peer request carries the resolved namespace and `x-cachette-peer-protocol: 2`. A missing or different version is refused with `426 Upgrade Required` (hello and heartbeat included), so a mixed cluster drains to "no healthy peer" instead of merging tenants' rows. Multi-tenant + cluster is now supported.
+- **CDC completion (B-3).** The zero-ref purge consults the referring entry's layout and namespaces (a complete `chunked` manifest is a referrer even if `refs` drifted; referrers from any namespace count). Crash bounds for whole-to-chunked conversion converge under boot + sweep with `used_bytes` on the at-rest invariant.
 
 ### Changed
 
-- **OIDC is per issuer.** `[auth.oidc."<issuer>"]` carries its own audiences,
-  tenant claim, claim pins, trust roots and clock skew; the v1.1 flat table
-  is rejected with a precise error naming the new form. `nbf` is optional as
-  RFC 7519 requires; a present but non-numeric `nbf` is still a structural
-  failure.
-- **Boot guard.** A tenant-yielding plane (OIDC or runtime) requires
-  `auth.mode = "bearer"`; HMAC stays single-tenant and is refused in a
-  multi-tenant boot. Cluster mode is allowed with the namespace-bearing wire.
-- **Build and CI.** Rust 1.100 and Zig 0.17.1; every external `uses:` still
-  resolves to hangar mirrors. The rustup mirror ladder now probes the pinned
-  channel manifest instead of `stable`, so a mirror that lacks 1.100 cannot
-  win the race and 404 the toolchain install.
+- **OIDC is per issuer.** `[auth.oidc."<issuer>"]` carries its own audiences, tenant claim, claim pins, trust roots and clock skew; the v1.1 flat table is rejected with a precise error naming the new form. `nbf` is optional as RFC 7519 requires; a present but non-numeric `nbf` is still a structural failure.
+- **Boot guard.** A tenant-yielding plane (OIDC or runtime) requires `auth.mode = "bearer"`; HMAC stays single-tenant and is refused in a multi-tenant boot. Cluster mode is allowed with the namespace-bearing wire.
+- **Build and CI.** Rust 1.100 and Zig 0.17.1; every external `uses:` still resolves to hangar mirrors. The rustup mirror ladder now probes the pinned channel manifest instead of `stable`, so a mirror that lacks 1.100 cannot win the race and 404 the toolchain install.
+
+### Upgrading
+
+with no tenant-yielding plane configured, every credential still resolves to the legacy namespace and single-tenant deployments are byte-identical. Existing OIDC configs must move to the per-issuer block shape (the boot error names the new form), and a tenant-yielding plane requires `auth.mode = "bearer"` - HMAC stays single-tenant and is refused in a multi-tenant boot rather than degraded. See `docs/shared-cache.md` for the tenancy model and migration notes.
 
 ## [1.1.0] - 2026-11-15
 
 ### Added
 
-- **OIDC bearer auth.** RS256-only verification against your IdP's JWKS,
-  kid routing, a cache that survives rotation via prefetch + lazy
-  singleflight, and fail-closed gates. Enabled through the flat `[auth.oidc]`
-  table (`issuers`, `audiences`, `jwks_urls`, `require`).
-- **Self-minted HS256 bearer JWTs** verified by signature in the v1 gate, in
-  addition to static and dynamically registered tokens (`cachette token mint`).
-- **Content-defined chunking (CDC).** The `gear-fastcdc-v1` splitter,
-  `[storage.cdc]` chunk storage alongside the whole-blob layout, refs-counted
-  accounting, a GC sweeper, a paced whole-to-chunked backfill walker, and a
-  layout-aware read path — all opt-in.
-- **Versioned schema migrations.** The index records a schema version, applies
-  verified migrations at boot, and refuses an index newer than the binary.
-- **Eight-target release matrix** with pinned cross toolchains and a
-  registry-published multi-arch image; all external actions mirrored.
+- **OIDC bearer auth.** RS256-only verification against your IdP's JWKS, kid routing, a cache that survives rotation via prefetch + lazy singleflight, and fail-closed gates. Enabled through the flat `[auth.oidc]` table (`issuers`, `audiences`, `jwks_urls`, `require`).
+- **Self-minted HS256 bearer JWTs** verified by signature in the v1 gate, in addition to static and dynamically registered tokens (`cachette token mint`).
+- **Content-defined chunking (CDC).** The `gear-fastcdc-v1` splitter, `[storage.cdc]` chunk storage alongside the whole-blob layout, refs-counted accounting, a GC sweeper, a paced whole-to-chunked backfill walker, and a layout-aware read path — all opt-in.
+- **Versioned schema migrations.** The index records a schema version, applies verified migrations at boot, and refuses an index newer than the binary.
+- **Eight-target release matrix** with pinned cross toolchains and a registry-published multi-arch image; all external actions mirrored.
 
 ## [1.0.0] - 2026-10-25
 
@@ -90,23 +43,12 @@ Initial release (`cc76396`).
 
 ### Added
 
-- One static binary serving the legacy v1 `artifactcache` REST API and the v2
-  Twirp `CacheService` API (plus the Azure block-blob upload emulation) on a
-  runner-facing port, with a dedicated mTLS peer port for clustering.
-- Filesystem storage with a SQLite index, chunked resumable v1 uploads,
-  reservation TTL reaping, and capacity-based eviction (`lru`, `oldest`,
-  `none`, with fraction/percent/bytesize `min_free`).
+- One static binary serving the legacy v1 `artifactcache` REST API and the v2 Twirp `CacheService` API (plus the Azure block-blob upload emulation) on a runner-facing port, with a dedicated mTLS peer port for clustering.
+- Filesystem storage with a SQLite index, chunked resumable v1 uploads, reservation TTL reaping, and capacity-based eviction (`lru`, `oldest`, `none`, with fraction/percent/bytesize `min_free`).
 - Signed capability URLs (`?id&exp&mac`) for downloads and v2 block uploads.
-- HMAC and static/dynamic bearer authentication, admin token register/revoke,
-  and hot config reload on `SIGHUP`.
-- Peer-to-peer clustering: static seeds, mDNS discovery, fingerprint pinning
-  with TOFU, capacity-aware placement, heartbeats, graceful drain, and
-  owner-side relayed uploads.
-- Self-signed Ed25519 node identity that survives restarts and storage wipes,
-  plus `cachette doctor`, `gc`, `verify`, `cache`, and `identity` CLI commands.
-- TLS recipes and a Docker image; CI dogfoods a live cachette for its
-  `docker buildx` layer cache.
+- HMAC and static/dynamic bearer authentication, admin token register/revoke, and hot config reload on `SIGHUP`.
+- Peer-to-peer clustering: static seeds, mDNS discovery, fingerprint pinning with TOFU, capacity-aware placement, heartbeats, graceful drain, and owner-side relayed uploads.
+- Self-signed Ed25519 node identity that survives restarts and storage wipes, plus `cachette doctor`, `gc`, `verify`, `cache`, and `identity` CLI commands.
+- TLS recipes and a Docker image; CI dogfoods a live cachette for its `docker buildx` layer cache.
 
-[1.2.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/pulls/13
-[1.1.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.1.0
-[1.0.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.0.0
+[1.2.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/pulls/13 [1.1.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.1.0 [1.0.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.0.0

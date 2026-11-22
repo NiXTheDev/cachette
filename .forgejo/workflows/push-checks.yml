@@ -513,49 +513,61 @@ jobs:
           fi
           [ "$ok" -eq 1 ] || { echo "::error::builder base unavailable after the full pull ladder"; exit 1; }
 
-      # The buildx CLI plugin: Cache the pinned binary and skip the per-job
-      # GitHub gamble (the re-downloads died three times in a row on a flaky
-      # proxy window). Cache hit -> assert the docker CLI sees the plugin.
-      # Then the daemon may bundle its own buildx (Docker Desktop does) -
-      # version-matched against the pin so the cache key stays honest; the
-      # github.com download stays a cold corner case, not a per-job dice
-      # roll (cache-binary semantics, kept from the setup-buildx contract).
-      - name: Cache the pinned buildx CLI
+      # The buildx CLI plugin tracks the latest release. Resolve its tag once
+      # via the releases/latest redirect, key the cache by that tag, and assert
+      # a restored binary still matches it. github.com downloads stay a cold
+      # corner case, not a per-job gamble (cache-binary semantics, kept from
+      # the setup-buildx contract).
+      - name: Resolve the latest buildx release
+        id: buildx_release
+        run: |
+          set -euo pipefail
+          url=""
+          for attempt in 1 2 3; do
+            url=$(curl -fsSL --retry 3 --connect-timeout 20 \
+              -o /dev/null -w '%{url_effective}' \
+              https://github.com/docker/buildx/releases/latest) && break
+            echo "::warning::buildx release lookup attempt $attempt failed"
+            sleep $((attempt * 5))
+          done
+          tag="${url##*/}"
+          case "$tag" in v*) ;; *) echo "::error::could not resolve the latest buildx tag"; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest buildx: $tag"
+
+      - name: Cache the buildx CLI
         uses: https://hangar.nixthedev.ru/actions/cache@v6
         with:
           path: /usr/local/lib/docker/cli-plugins/docker-buildx
-          key: buildx-0.38.1-${{ runner.arch }}
+          key: buildx-${{ steps.buildx_release.outputs.tag }}-${{ runner.arch }}
 
-      - name: Pin the buildx CLI
+      - name: Install the buildx CLI (latest)
+        env:
+          BUILDX_TAG: ${{ steps.buildx_release.outputs.tag }}
         run: |
           set -euo pipefail
-          # Cache hit: the pinned binary was restored - assert the docker
-          # CLI sees the plugin - skip the download.
-          if /usr/local/lib/docker/cli-plugins/docker-buildx version 2>/dev/null | grep -q 'v0.38.1'; then
-            echo "buildx present from cache: $(/usr/local/lib/docker/cli-plugins/docker-buildx version)"
+          plugin=/usr/local/lib/docker/cli-plugins/docker-buildx
+          # Cache hit: the binary was restored and still matches the tag we
+          # just resolved, so assert the docker CLI sees it and skip download.
+          if "$plugin" version 2>/dev/null | grep -q "$BUILDX_TAG"; then
+            echo "buildx from cache: $("$plugin" version)"
             docker buildx version
             exit 0
           fi
-          # The daemon may bundle its own buildx (Docker Desktop does) -
-          # version-matched against the pin, so the cache key stays honest.
-          if docker buildx version 2>/dev/null | grep -q 'v0.38.1'; then
-            echo "buildx bundled by the daemon matches the pin: $(docker buildx version)"
-            exit 0
-          fi
           case "$(uname -m)" in
-            x86_64)  asset="buildx-v0.38.1.linux-amd64" ;;
-            aarch64) asset="buildx-v0.38.1.linux-arm64" ;;
+            x86_64)  asset="buildx-${BUILDX_TAG}.linux-amd64" ;;
+            aarch64) asset="buildx-${BUILDX_TAG}.linux-arm64" ;;
             *) echo "::error::unsupported arch for buildx: $(uname -m)"; exit 1 ;;
           esac
-          url="https://github.com/docker/buildx/releases/download/v0.38.1/${asset}"
-          mkdir -p /usr/local/lib/docker/cli-plugins
+          url="https://github.com/docker/buildx/releases/latest/download/${asset}"
+          mkdir -p "$(dirname "$plugin")"
           for attempt in 1 2 3; do
             echo "== buildx download attempt $attempt =="
-            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o /usr/local/lib/docker/cli-plugins/docker-buildx && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx; then
-              /usr/local/lib/docker/cli-plugins/docker-buildx version
+            if curl -fsSL --retry 3 --connect-timeout 20 "$url" -o "$plugin" && chmod +x "$plugin"; then
+              "$plugin" version
               exit 0
             fi
-            rm -f /usr/local/lib/docker/cli-plugins/docker-buildx
+            rm -f "$plugin"
             echo "attempt $attempt failed; retrying"
             sleep $((attempt * 5))
           done
@@ -565,7 +577,7 @@ jobs:
       # Account-wide registry token (the same credentials regexYbot's pipelines
       # use): the default GITHUB_TOKEN has no registry write on Forgejo.
       - name: Log in to the forge registry
-        uses: https://hangar.nixthedev.ru/docker/login-action@v3.7.0
+        uses: https://hangar.nixthedev.ru/docker/login-action@v4
         with:
           registry: hangar.nixthedev.ru
           username: ${{ github.repository_owner }}
@@ -647,7 +659,7 @@ jobs:
       - name: Publish multi-arch manifest (attempt 1 - native builder)
         id: attempt1
         continue-on-error: true
-        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -661,7 +673,7 @@ jobs:
         id: attempt2_amd
         if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
-        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -675,7 +687,7 @@ jobs:
         id: attempt2_arm
         if: steps.attempt1.outcome == 'failure'
         continue-on-error: true
-        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7
         with:
           context: .
           platforms: linux/arm64
@@ -713,16 +725,15 @@ jobs:
       - name: Set up the buildkit container builder (attempt 3)
         id: attempt3_builder
         if: steps.attempt1.outcome == 'failure' && (steps.attempt2_merge.outcome == 'failure' || steps.attempt2_merge.outcome == 'skipped')
-        uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v3.12.0
+        uses: https://hangar.nixthedev.ru/docker/setup-buildx-action@v4
         with:
-          version: v0.38.1
           name: ci
           cleanup: false
 
       - name: Publish multi-arch manifest (attempt 3 - container builder)
         id: attempt3
         if: steps.attempt3_builder.outcome == 'success'
-        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7.4.0
+        uses: https://hangar.nixthedev.ru/docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
