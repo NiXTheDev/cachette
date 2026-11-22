@@ -108,6 +108,8 @@ A minted long-lived `buildx-jwt` still works: it is signed with the same secret 
 - Duplicate secrets across forge blocks are a **boot error** — otherwise the identity would depend on iteration order.
 - Runtime-token and OIDC verification become per-forge: try the matching block's `runtime_secret` / `oidc_*` fields, same claim checks as v1.2.
 - Timestamp freshness, hex parsing and the rest of the fail-closed checks are unchanged.
+- **Precedence:** if a request carries both HMAC headers and a Bearer runtime token, **HMAC wins** and decides the tenant — this matches today's merge-mode order. The Bearer token is not consulted for tenancy on that request.
+- The legacy `[auth.oidc]` and `[auth.runtime]` tables stay authoritative for one release with a **boot-time deprecation warning** pointing at the per-forge blocks; they are not removed in v1.3. The scalar `[auth].secret` stays silent (v1.1 behavior).
 
 ## Namespace resolution
 

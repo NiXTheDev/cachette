@@ -108,7 +108,7 @@ Rules:
 
 - `AppState` keeps `HashMap<String, Arc<dyn StorageBackend>>` plus a `default_instance` name instead of one `Option<Arc<dyn StorageBackend>>`.
 - `storage_scoped(namespace)` becomes `storage_scoped(namespace) -> Option<Arc<dyn StorageBackend>>` by looking up `resolve_storage(namespace)` first, then scoping the resulting instance. Existing handlers keep their current call shape.
-- `resolve_storage(namespace)` applies `[storage.routes]` (exact namespace, then glob, then `"*"`), returning `default` when unmatched.
+- `resolve_storage(namespace)` applies `[storage.routes]`: exact namespace first, then a glob (**longest matching pattern wins**, independent of declaration order), then `"*"`. Unmatched namespaces go to `default`.
 - Instances own **only** payload directories. There is no per-instance SQLite file and no per-root lock: all index/accounting rows live in the single `cachette.db`, keyed by instance, and one process-wide lock sits in `server.data_path`. Namespaces inside one instance stay isolated as in v1.2.
 
 ### 2. Quotas are a separate plane
@@ -122,7 +122,8 @@ Rules:
 - **One server, one DB:** each cachette process owns its own DB under its own `server.data_path`. Peers never share a DB file or a database connection — cluster state is still exchanged over the peer wire, as in v1.2. `instance` identifies a storage root *within* one server, not a peer.
 - Peer requests carry a `storage` field naming the target instance, alongside the namespace; heartbeats advertise per-instance capacity, not one number.
 - Placement becomes `(peer, instance)` rather than just `peer`; the owner writes to the named instance it is told to (no re-mapping), matching the v1.2 rule for namespaces.
-- Peer protocol version bumps from 2 to 3; a v2 peer gets the same 426 treatment as v1.2 gives v1 peers.
+- Peer protocol version bumps from 2 to 3; a v2 peer gets the same 426 treatment as v1.2 gives v1 peers. No degraded compat mode and no opt-in flag — a mixed cluster drains rather than risking cross-tenant writes.
+- Quota rules and usage are **piggybacked on the existing heartbeat** first; a separate gossip protocol is the planned follow-up once the wire format and the consensus math have settled. This keeps v1.3 to one new peer field set rather than a new transport.
 - **Quotas are semi-binding with a cluster fallback.** Each peer advertises its configured quota rules (per instance and per namespace) in gossip. A missing rule is an **abstention**, not a vote for "no quota". For a given `(scope, target)` a server resolves the limit in this order:
   1. its own configured rule, if any — always wins;
   2. otherwise the cluster consensus value — the value with the most votes (**plurality**, no weighting by capacity); ties mean no consensus;
@@ -130,13 +131,14 @@ Rules:
 
   Voting is **per `(scope, target)`**: every server gets one vote for each namespace or instance, independently — not one vote for the whole cluster or one vote shared across all rules. A server that configures `team-a` but not `team-b` votes only on `team-a` and abstains on `team-b`. A single configured server among abstainers therefore sets the cluster value for that target. When two admins configure different values, plurality picks the most popular one, even without a majority. A mismatch never breaks placement: every server can resolve *some* answer, and a server with no rule simply inherits the cluster's.
 - **The limit covers cluster-wide usage, not per-instance usage.** Each peer advertises its usage per `(instance, namespace)`; every server sums the reports into a global total. Admission compares the resolved limit against that total plus the requested bytes, so adding instances does not multiply the budget. Each peer's usage report includes its active reservations. Gossip is eventually consistent, so a small overshoot window is accepted and documented — no leader election or quota-token service in v1.3.
+- **Stale peer reports:** if a peer's usage report is older than its freshness window, that peer's contribution is **ignored** in the global total rather than treated as zero or blocking admissions. A warning is logged so the gap is visible.
 - **Partition behavior:** with no usable consensus view, a server falls back to its own configured rules only; if it has none, no quota applies. Availability wins over strictness, matching the existing cluster posture.
 
 ### 4. Backends
 
 - **fs (phase 1):** the existing `FsStorage` with a configurable root; two instances are just two roots. No code change beyond the registry.
 - **networked fs (phase 1):** an `fs` instance whose `path` is an SMB/NFS mount; no dedicated backend needed, document the mount/failure semantics.
-- **S3-compatible (phase 2):** a new `StorageBackend` implementation. Blobs and CDC chunks live in the bucket; index rows live in the central control DB keyed by instance, so manifests, accounting and range reads keep their atomicity without any DB in the bucket or on the mount. Multipart/range operations and crash windows need their own design pass before implementation.
+- **S3-compatible (phase 2):** a new `StorageBackend` implementation. **One bucket with a per-instance key prefix** (instance name becomes the prefix) — simpler IAM and lifecycle rules than a bucket per instance. Blobs and CDC chunks live under that prefix; index rows live in the central control DB keyed by instance, so manifests, accounting and range reads keep their atomicity without any DB in the bucket. Credentials come from the environment (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_ENDPOINT_URL` etc.) with config-file keys as a fallback for simple deployments; env always wins and config secrets are masked in `--print-config`. Multipart/range operations and crash windows need their own design pass before implementation.
 
 #### Payload layout (fs and networked fs)
 
@@ -157,7 +159,7 @@ The legacy `default` instance keeps its existing hashed layout until an explicit
 
 - `cachette doctor` and `--print-config` list every instance, its floor and its route rules; secrets remain masked.
 - Offline commands (`gc`, `verify`, `cache`) take `--storage <name>`, defaulting to `default`, and acquire that instance's data-dir lock.
-- Config reload remains boot-only for the instance set and routes (same rule as v1.2 namespaces/quotas); `min_free` is already reloadable.
+- SIGHUP reload: **`[storage.routes]` and `[[quota]]` are reloadable** (atomic swap of the routing table and parsed quota rules); the instance set and `[auth.<forge>]` blocks stay boot-only, like v1.2's namespace mappings. `min_free` is already reloadable.
 
 #### Migration commands (`cachette doctor`)
 
@@ -199,7 +201,7 @@ Nothing below happens automatically at boot. A legacy v1.2 config still boots as
 2. **Config, then files.** Either run `doctor --migrate <file>` for the whole sequence, use `--let-me-edit` to pause after the config write and before any file moves, or do it in stages: `doctor --migrate-config --write <file>` for config only (old config → `<file>.bak`), then the `state migrate` commands for each data step. Review warnings and confirm `--print-config` before starting the server. Auth blocks, `[server]` flat keys, `[[storage.instances]]`, `[[quota]]` and routes all land in the config.
 3. **State** — if `server.data_path` differs from the old location, run `cachette state migrate --from <old> --to <new>` **offline**. This copies the SQLite DB, identity and token store, verifies the identity fingerprint is unchanged, and never deletes the source. The DB itself is migrated in place to schema v4 (one `instance` column; all existing rows assigned to `default`) by the normal boot migration, not by this copy.
 4. **Data layout (optional)** — v1.2 blobs stay in the hashed layout under `default` until an explicit offline `cachette state migrate --layout` rewrites them into `<root>/<forge>/<tenant>/{blobs,parts,tmp}`. Chunks are relocated to instance/forge level in the same pass, preserving refs.
-5. **Namespace re-tag (optional)** — existing rows in `""` are **not** auto-assigned to a forge/tenant. An explicit offline operation re-tags them when the admin knows which identity owned the old single-tenant cache; otherwise they remain accessible as `__legacy__`.
+5. **Namespace re-tag (optional)** — existing rows in `""` are **not** auto-assigned to a forge/tenant. An explicit offline operation re-tags them when the admin knows which identity owned the old single-tenant cache; otherwise they remain accessible as `__legacy__`. Both forms are supported: repeatable `--retag 'old=new'` pairs for small migrations, and a dedicated TOML mapping file for bulk rewrites.
 6. **Cluster** — drain peers one at a time and restart them with the new config. Protocol v2 peers get 426 against a v3 node and are excluded from placement, so a mixed cluster degrades rather than sharing wrong rows.
 7. **Workflows** — outside config: once the runtime plane is verified with a real buildx export, `token=` and the long-lived `CACHETTE_BUILDX_JWT` secret can be removed from the workflow.
 
@@ -239,7 +241,7 @@ Non-DB state (`identity/`, `.cachette.lock`, `doctor/`) lives in the **DB file's
 
 ### 7. Generated example config
 
-v1.3 should stop hand-maintaining `cachette.example.toml`. A single schema description (or a `cachette config example` command) emits every knob with its default and comment, so new keys cannot be forgotten; the checked-in file becomes generated output. The same renderer backs `doctor --migrate`: migration starts from the generated example, populates what it can, emits repeatable instances in schema order, and keeps unmapped residue at the end. The hand-maintained complete example lands first as a separate config-only fix based on `release`.
+v1.3 stops hand-maintaining `cachette.example.toml`. A **declarative Rust spec table plus one renderer** emits every knob with its default and comment, so new keys cannot be forgotten; the checked-in file becomes generated output. A `cachette config example` command exposes the same renderer. It also backs `doctor --migrate`: migration starts from the generated example, populates what it can, emits repeatable instances in schema order, and keeps unmapped residue at the end. The hand-maintained complete example landed first as a separate config-only fix on `release` (#16).
 
 ## Rollout
 
@@ -271,4 +273,7 @@ v1.3 should stop hand-maintaining `cachette.example.toml`. A single schema descr
 - Cluster quota policy: settled — semi-binding; local rule wins, otherwise a cluster-wide plurality vote (abstentions ignored) supplies the value; the limit applies to aggregate usage across all peers; bounded overshoot and local fallback on partition are accepted (see §3).
 - Control-plane storage: settled — one local SQLite DB with an `instance` column, no external RDBMS in v1.3 (see §6).
 - Scope: per-forge auth / HMAC tenancy (`docs/hmac-tenancy.md`) is **in v1.3**; its forge-level namespace fallback stays deferred.
+- Auth precedence: HMAC wins when both HMAC headers and a Bearer token are present; legacy OIDC/runtime tables stay authoritative with a deprecation warning.
+- Route glob ties: longest matching pattern wins; quota gossip piggybacks on heartbeat first, with a separate gossip protocol as a follow-up; stale peer usage is ignored.
+- S3: one bucket with per-instance prefixes; credentials from env with config-file fallback (env wins). Reload: routes + quotas on SIGHUP; instances and forge blocks boot-only.
 - Tagline: decide later, at the release cut.
