@@ -46,8 +46,17 @@ pub enum Command {
     },
     /// Run the reservation reaper and orphan-blob sweep once, then exit.
     Gc,
-    /// Check config, data dir, SQLite, identity, seeds, and disk headroom.
-    Doctor,
+    /// Check config, data dir, SQLite, identity, seeds, and disk headroom, or
+    /// migrate a v1.2 config/data layout to v1.3.
+    Doctor {
+        #[command(subcommand)]
+        action: Option<DoctorCommand>,
+    },
+    /// Offline control-plane state migration and restore.
+    State {
+        #[command(subcommand)]
+        action: StateCommand,
+    },
     /// Mint tokens for the configured secret: Forgejo HMAC headers (the
     /// default) or a buildx `type=gha` bearer JWT (`buildx-jwt`).
     Token {
@@ -60,6 +69,78 @@ pub enum Command {
         /// `status`.
         #[command(subcommand)]
         action: ClusterCommand,
+    },
+}
+
+/// `cachette doctor <action>`.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum DoctorCommand {
+    /// Full migration: back up, write the new config, move state and data.
+    Migrate {
+        /// Config file to migrate in place.
+        file: PathBuf,
+        /// Pause after the config write so it can be edited before file moves.
+        #[arg(long)]
+        let_me_edit: bool,
+        /// Accept CAUTION-level changes.
+        #[arg(long)]
+        ack_caution: bool,
+        /// Typed confirmation for a DANGER step (`migrate-state`, ...).
+        #[arg(long = "confirm", value_name = "action")]
+        confirm: Vec<String>,
+    },
+    /// Config-only migration; no data is moved.
+    MigrateConfig {
+        file: PathBuf,
+        /// Replace the original (old config is copied to `<file>.bak`).
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        ack_caution: bool,
+    },
+}
+
+/// `cachette state <action>`.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum StateCommand {
+    /// Copy the control plane to a new directory.
+    Migrate {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long = "confirm", value_name = "action")]
+        confirm: Option<String>,
+    },
+    /// Restore a verified snapshot archive.
+    Restore {
+        archive: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Convert the legacy hashed payload layout to the v1.3 hierarchy.
+    Layout {
+        #[arg(long = "confirm", value_name = "action")]
+        confirm: Option<String>,
+    },
+    /// Re-tag legacy `""` rows into their real namespaces.
+    Retag {
+        /// Repeatable `old=new` pairs.
+        #[arg(long = "retag", value_name = "old=new")]
+        retag: Vec<String>,
+        /// Optional TOML mapping file for bulk rewrites.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long = "confirm", value_name = "action")]
+        confirm: Option<String>,
+    },
+    /// Delete a migrated source after verification.
+    DeleteSource {
+        backup: PathBuf,
+        #[arg(long = "confirm", value_name = "action")]
+        confirm: Option<String>,
     },
 }
 
@@ -217,7 +298,7 @@ mod tests {
         );
         assert_eq!(
             Cli::try_parse_from(["cachette", "doctor"]).unwrap().command,
-            Some(Command::Doctor)
+            Some(Command::Doctor { action: None })
         );
         assert_eq!(
             Cli::try_parse_from(["cachette", "cache", "list", "--json"])

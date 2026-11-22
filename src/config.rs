@@ -28,6 +28,7 @@ pub use min_free::MinFree;
 pub(crate) use quotas::glob_matches;
 pub use quotas::{Quotas, QuotasConfig};
 pub use sections::*;
+pub(crate) use v13::normalize;
 pub use v13::{ForgeAuthConfig, QuotaRuleConfig, QuotaScope, StorageInstanceConfig, StorageKind};
 
 /// Name of the config file looked for inside [`default_config_dir`].

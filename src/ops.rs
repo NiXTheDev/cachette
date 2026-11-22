@@ -12,6 +12,8 @@
 //! the SQLite file: SQLite already serialises its own writers across processes,
 //! but it cannot tell an operator "a server is running here"; the lock file can.
 
+pub mod migrate;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
@@ -26,7 +28,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::cli::{
-    CacheCommand, ClusterCommand, Command, IdentityCommand, MintKind, Scope, TokenCommand,
+    CacheCommand, ClusterCommand, Command, DoctorCommand, IdentityCommand, MintKind, Scope,
+    StateCommand, TokenCommand,
 };
 use crate::config::{Config, split_host_port};
 use crate::identity::Identity;
@@ -125,7 +128,50 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
         Command::Verify => block_on(verify(config)),
         Command::Cache { action } => block_on(cache(action, config)),
         Command::Gc => block_on(gc(config)),
-        Command::Doctor => block_on(doctor(config)),
+        Command::Doctor { action } => match action {
+            None => block_on(doctor(config)),
+            Some(DoctorCommand::Migrate {
+                file,
+                let_me_edit,
+                ack_caution,
+                confirm,
+            }) => block_on(migrate::full(
+                file,
+                *let_me_edit,
+                *ack_caution,
+                confirm,
+                config,
+            )),
+            Some(DoctorCommand::MigrateConfig {
+                file,
+                write,
+                ack_caution,
+            }) => block_on(migrate::config_only(file, *write, *ack_caution)),
+        },
+        Command::State { action } => match action {
+            StateCommand::Migrate { from, to, confirm } => {
+                block_on(migrate::state_copy(from, to, confirm.as_deref()))
+            }
+            StateCommand::Restore { archive, to, force } => {
+                block_on(migrate::state_restore(archive, to, *force))
+            }
+            StateCommand::Layout { confirm } => {
+                block_on(migrate::layout(config, confirm.as_deref()))
+            }
+            StateCommand::Retag {
+                retag,
+                file,
+                confirm,
+            } => block_on(migrate::retag(
+                config,
+                retag,
+                file.as_deref(),
+                confirm.as_deref(),
+            )),
+            StateCommand::DeleteSource { backup, confirm } => {
+                block_on(migrate::delete_source(backup, confirm.as_deref()))
+            }
+        },
         Command::Token { action } => token(action, config),
         Command::Cluster { action } => block_on(cluster_status(action, config)),
     }
