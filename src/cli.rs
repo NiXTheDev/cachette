@@ -75,12 +75,24 @@ pub enum Command {
         #[command(subcommand)]
         action: TokenCommand,
     },
+    /// Configuration utilities.
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
     /// Print the live cluster member table from a running server.
     Cluster {
         /// `status`.
         #[command(subcommand)]
         action: ClusterCommand,
     },
+}
+
+/// `cachette config <action>`.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the complete generated example config.
+    Example,
 }
 
 /// `cachette doctor <action>`.

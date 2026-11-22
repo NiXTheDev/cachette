@@ -1,0 +1,413 @@
+//! Declarative config schema and one renderer for `cachette config example`
+//! and `doctor --migrate`. Every knob appears with its default; optional
+//! keys are commented out so the emitted file boots as-is.
+
+/// How a field is rendered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Form {
+    /// Present with its default value.
+    Required,
+    /// Commented out with the default spelled in the comment.
+    Optional,
+}
+
+/// One config knob.
+#[derive(Clone, Copy, Debug)]
+pub struct Field {
+    pub key: &'static str,
+    pub default: &'static str,
+    pub form: Form,
+    pub comment: &'static str,
+}
+
+/// One TOML section (a literal header; empty means root-level).
+#[derive(Clone, Copy, Debug)]
+pub struct Section {
+    pub header: &'static str,
+    pub fields: &'static [Field],
+}
+
+/// The canonical spec. Ordering here is the order in the generated file and
+/// in migration output.
+pub static SECTIONS: &[Section] = &[
+    Section {
+        header: "server",
+        fields: &[
+            Field {
+                key: "data_path",
+                default: "\"/etc/cachette\"",
+                form: Form::Optional,
+                comment: "directory -> <dir>/cachette.db, or a .db file path",
+            },
+            Field {
+                key: "listen",
+                default: "\"0.0.0.0:8080\"",
+                form: Form::Required,
+                comment: "runner-facing listener (host:port)",
+            },
+            Field {
+                key: "external_url",
+                default: "\"http://127.0.0.1:8080\"",
+                form: Form::Optional,
+                comment: "runner-visible base URL",
+            },
+            Field {
+                key: "min_free",
+                default: "0.2",
+                form: Form::Required,
+                comment: "default free-space floor for all instances",
+            },
+            Field {
+                key: "max_size",
+                default: "0",
+                form: Form::Required,
+                comment: "0 = use disk total; accepts bytesizes like \"32GiB\"",
+            },
+            Field {
+                key: "eviction",
+                default: "\"lru\"",
+                form: Form::Required,
+                comment: "lru | oldest | none",
+            },
+            Field {
+                key: "key_case",
+                default: "\"preserve\"",
+                form: Form::Required,
+                comment: "preserve | lower",
+            },
+            Field {
+                key: "reservation_ttl_seconds",
+                default: "3600",
+                form: Form::Required,
+                comment: "reservation lifetime",
+            },
+            Field {
+                key: "max_chunk_bytes",
+                default: "67108864",
+                form: Form::Required,
+                comment: "largest single upload chunk",
+            },
+            Field {
+                key: "drain_grace_seconds",
+                default: "30",
+                form: Form::Required,
+                comment: "graceful-shutdown window",
+            },
+            Field {
+                key: "tls_cert",
+                default: "\"/etc/cachette/tls.crt\"",
+                form: Form::Optional,
+                comment: "TLS cert (must be set with tls_key)",
+            },
+            Field {
+                key: "tls_key",
+                default: "\"/etc/cachette/tls.key\"",
+                form: Form::Optional,
+                comment: "TLS key",
+            },
+            Field {
+                key: "level",
+                default: "\"info\"",
+                form: Form::Required,
+                comment: "log level",
+            },
+            Field {
+                key: "format",
+                default: "\"text\"",
+                form: Form::Required,
+                comment: "text | json",
+            },
+        ],
+    },
+    Section {
+        header: "auth",
+        fields: &[
+            Field {
+                key: "mode",
+                default: "\"merge\"",
+                form: Form::Required,
+                comment: "hmac | bearer | merge",
+            },
+            Field {
+                key: "secret",
+                default: "\"CHANGE_ME_MIN_16_CHARS\"",
+                form: Form::Required,
+                comment: "HMAC key (minimum 16 characters)",
+            },
+            Field {
+                key: "tokens",
+                default: "[]",
+                form: Form::Optional,
+                comment: "static bearer tokens",
+            },
+            Field {
+                key: "hmac_max_age_seconds",
+                default: "600",
+                form: Form::Required,
+                comment: "0 disables the staleness check",
+            },
+            Field {
+                key: "signed_url_ttl_seconds",
+                default: "900",
+                form: Form::Required,
+                comment: "v1/v2 capability URL lifetime",
+            },
+            Field {
+                key: "jwt_secret",
+                default: "\"CHANGE_ME_MIN_16_CHARS\"",
+                form: Form::Optional,
+                comment: "falls back to [auth] secret",
+            },
+            Field {
+                key: "jwt_ttl_seconds",
+                default: "300",
+                form: Form::Required,
+                comment: "Twirp v2 JWT lifetime",
+            },
+            Field {
+                key: "oidc_jwks_refresh_seconds",
+                default: "1800",
+                form: Form::Optional,
+                comment: "JWKS prefetch interval",
+            },
+            Field {
+                key: "oidc_jwks_max_keys",
+                default: "32",
+                form: Form::Optional,
+                comment: "cached-key cap",
+            },
+            Field {
+                key: "oidc_jwks_ca_pem",
+                default: "\"/etc/ssl/certs/ca-certificates.crt\"",
+                form: Form::Optional,
+                comment: "default JWKS trust roots",
+            },
+        ],
+    },
+    Section {
+        header: "auth.\"<forge>\"",
+        fields: &[
+            Field {
+                key: "hmac_secret",
+                default: "\"secret\"",
+                form: Form::Optional,
+                comment: "runner cache.secret; yields forge + signed repo tenant",
+            },
+            Field {
+                key: "runtime_secret",
+                default: "\"/etc/cachette/forge-token.secret\"",
+                form: Form::Optional,
+                comment: "file holding the forge's token signing secret",
+            },
+            Field {
+                key: "runtime_tenant_claim",
+                default: "\"oidc_extra.repository\"",
+                form: Form::Optional,
+                comment: "where the runtime token carries the tenant",
+            },
+            Field {
+                key: "oidc_issuer",
+                default: "\"https://idp.example.org/realms/ci\"",
+                form: Form::Optional,
+                comment: "exact iss claim for this forge",
+            },
+            Field {
+                key: "oidc_audiences",
+                default: "[\"cachette\"]",
+                form: Form::Optional,
+                comment: "accepted aud values",
+            },
+            Field {
+                key: "oidc_jwks_url",
+                default: "\"https://idp.example.org/realms/ci/protocol/openid-connect/certs\"",
+                form: Form::Optional,
+                comment: "explicit JWKS endpoint",
+            },
+            Field {
+                key: "oidc_tenant_claim",
+                default: "\"repository\"",
+                form: Form::Optional,
+                comment: "claim whose value becomes the tenant",
+            },
+            Field {
+                key: "oidc_require",
+                default: "{ \"groups\" = \"ci\" }",
+                form: Form::Optional,
+                comment: "claim pins",
+            },
+            Field {
+                key: "oidc_leeway_seconds",
+                default: "30",
+                form: Form::Optional,
+                comment: "clock skew",
+            },
+        ],
+    },
+    Section {
+        header: "storage",
+        fields: &[Field {
+            key: "routes",
+            default: "{}",
+            form: Form::Optional,
+            comment: "resolved namespace -> instance; see [storage.routes]",
+        }],
+    },
+    Section {
+        header: "storage.cdc",
+        fields: &[
+            Field {
+                key: "enabled",
+                default: "false",
+                form: Form::Required,
+                comment: "content-defined chunking",
+            },
+            Field {
+                key: "avg_chunk_bytes",
+                default: "131072",
+                form: Form::Optional,
+                comment: "target mean chunk size",
+            },
+            Field {
+                key: "backfill",
+                default: "true",
+                form: Form::Optional,
+                comment: "convert existing whole entries",
+            },
+            Field {
+                key: "backfill_delay_ms",
+                default: "100",
+                form: Form::Optional,
+                comment: "pace between conversions",
+            },
+        ],
+    },
+    Section {
+        header: "cluster",
+        fields: &[
+            Field {
+                key: "enabled",
+                default: "false",
+                form: Form::Required,
+                comment: "peer-to-peer clustering",
+            },
+            Field {
+                key: "listen",
+                default: "\"0.0.0.0:8081\"",
+                form: Form::Required,
+                comment: "always-mTLS peer listener",
+            },
+            Field {
+                key: "advertise_addr",
+                default: "\"0.0.0.0:8081\"",
+                form: Form::Optional,
+                comment: "peer-facing address",
+            },
+            Field {
+                key: "node_id",
+                default: "\"node-a\"",
+                form: Form::Optional,
+                comment: "override the fingerprint node id",
+            },
+            Field {
+                key: "mdns",
+                default: "true",
+                form: Form::Optional,
+                comment: "mDNS discovery",
+            },
+            Field {
+                key: "seeds",
+                default: "[]",
+                form: Form::Optional,
+                comment: "static peer addresses",
+            },
+            Field {
+                key: "seed_fingerprints",
+                default: "{}",
+                form: Form::Optional,
+                comment: "static peer pin map",
+            },
+            Field {
+                key: "tiebreak",
+                default: "\"random\"",
+                form: Form::Optional,
+                comment: "placement tie-break",
+            },
+            Field {
+                key: "heartbeat_interval_seconds",
+                default: "5",
+                form: Form::Optional,
+                comment: "heartbeat cadence",
+            },
+            Field {
+                key: "peer_timeout_seconds",
+                default: "15",
+                form: Form::Optional,
+                comment: "peer staleness window",
+            },
+            Field {
+                key: "cert_path",
+                default: "\"/etc/cachette/identity\"",
+                form: Form::Optional,
+                comment: "identity key/cert directory",
+            },
+        ],
+    },
+    Section {
+        header: "log",
+        fields: &[Field {
+            key: "file",
+            default: "\"/var/log/cachette.log\"",
+            form: Form::Optional,
+            comment: "log file (stdout when unset)",
+        }],
+    },
+];
+
+/// Render the complete commented example config.
+#[must_use]
+pub fn render_example() -> String {
+    let mut out = String::from(
+        "# cachette configuration - generated from the config schema.\n# Every knob is present; optional keys are commented out with their defaults.\n\n",
+    );
+    for section in SECTIONS {
+        out.push_str(&format!("[{}]\n", section.header));
+        for field in section.fields {
+            match field.form {
+                Form::Required => {
+                    out.push_str(&format!(
+                        "{} = {} # {}\n",
+                        field.key, field.default, field.comment
+                    ));
+                }
+                Form::Optional => {
+                    out.push_str(&format!(
+                        "# {} = {} # {}\n",
+                        field.key, field.default, field.comment
+                    ));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_covers_every_section_and_parses() {
+        let rendered = render_example();
+        for section in SECTIONS {
+            assert!(rendered.contains(&format!("[{}]", section.header)));
+            for field in section.fields {
+                assert!(rendered.contains(field.key), "missing {}", field.key);
+            }
+        }
+        let table: toml::Table =
+            toml::from_str(&rendered).expect("generated example is valid TOML");
+        assert!(table.contains_key("server"));
+        assert!(table.contains_key("auth"));
+    }
+}

@@ -28,8 +28,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::cli::{
-    CacheCommand, ClusterCommand, Command, DoctorCommand, IdentityCommand, MintKind, Scope,
-    StateCommand, TokenCommand,
+    CacheCommand, ClusterCommand, Command, ConfigCommand, DoctorCommand, IdentityCommand, MintKind,
+    Scope, StateCommand, TokenCommand,
 };
 use crate::config::{Config, split_host_port};
 use crate::identity::Identity;
@@ -170,6 +170,12 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
             )),
             StateCommand::DeleteSource { backup, confirm } => {
                 block_on(migrate::delete_source(backup, confirm.as_deref()))
+            }
+        },
+        Command::Config { action } => match action {
+            ConfigCommand::Example => {
+                print!("{}", crate::config::example::render_example());
+                Ok(0)
             }
         },
         Command::Token { action } => token(action, config),

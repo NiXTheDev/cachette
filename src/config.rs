@@ -17,6 +17,7 @@ pub(crate) use crate::config::validate::split_host_port;
 
 mod env;
 mod error;
+pub mod example;
 mod min_free;
 mod quotas;
 mod sections;
