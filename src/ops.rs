@@ -175,11 +175,11 @@ fn acquire(dir: &Path) -> Result<DataDirLock, i32> {
 /// `cachette verify` — recompute every published entry's digest (plan task 50)
 /// and report the ones that no longer match. Non-zero exit on any finding.
 async fn verify(config: &Config) -> Result<i32, Box<dyn Error>> {
-    let _lock = match acquire(&config.storage.fs.path) {
+    let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open(&config.storage.fs.path)?;
+    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
     let reports = storage.verify_all()?;
     let mut bad = 0usize;
     for report in &reports {
@@ -224,11 +224,11 @@ fn health_label(health: &EntryHealth) -> String {
 /// `cachette cache list|prune` — inspect or selectively evict entries through
 /// the same storage path the server uses (plan task 46).
 async fn cache(action: &CacheCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
-    let _lock = match acquire(&config.storage.fs.path) {
+    let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open(&config.storage.fs.path)?;
+    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
     match action {
         CacheCommand::List { json } => {
             let entries = storage.list().await?;
@@ -310,11 +310,11 @@ struct EntryJson<'a> {
 /// `cachette gc` — one reservation-reaper + orphan-sweep pass (plan task 34's
 /// [`Reaper`]) then exit.
 async fn gc(config: &Config) -> Result<i32, Box<dyn Error>> {
-    let _lock = match acquire(&config.storage.fs.path) {
+    let _lock = match acquire(&config.state_dir()) {
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = FsStorage::open(&config.storage.fs.path)?;
+    let storage = FsStorage::open_cdc_with_db(&config.storage.fs.path, &config.data_path, None)?;
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     let report = reaper.sweep_once(&storage).await?;
     println!("reservations_reaped: {}", report.reservations_reaped);
@@ -342,7 +342,7 @@ async fn doctor(config: &Config) -> Result<i32, Box<dyn Error>> {
     }
 
     // SQLite: `PRAGMA integrity_check` + accounted bytes (read-only queries).
-    let db = path.join("cachette.sqlite3");
+    let db = config.data_path.clone();
     match sqlite_report(&db) {
         Ok((true, used, true)) => println!("sqlite: ok ({} bytes accounted)", used),
         Ok((_, _, false)) => println!("sqlite: not initialized (created on first boot)"),

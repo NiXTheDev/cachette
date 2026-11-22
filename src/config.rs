@@ -79,6 +79,9 @@ pub struct Config {
     /// v1.3 top-level `[[quota]]` rules. Legacy `[storage.quotas]` is copied
     /// here at load time; runtime still reads the legacy table for now.
     pub quota: Vec<QuotaRuleConfig>,
+    /// Resolved control-plane database file. Derived once at load time from
+    /// `server.data_path` and the config file location.
+    pub data_path: PathBuf,
 }
 
 impl Config {
@@ -99,33 +102,66 @@ impl Config {
     /// `Config::default`, which bypasses `resolve`).
     #[must_use]
     pub fn cert_path(&self) -> PathBuf {
-        self.cluster
-            .cert_path
-            .clone()
-            .unwrap_or_else(|| self.storage.fs.path.join("identity"))
+        self.cluster.cert_path.clone().unwrap_or_else(|| {
+            if self.data_path.as_os_str().is_empty() {
+                self.storage.fs.path.join("identity")
+            } else {
+                self.state_dir().join("identity")
+            }
+        })
     }
 
-    /// v1.3 control-plane DB file. A configured directory resolves to
-    /// `<dir>/cachette.db`; a path whose final component ends in `.db` is used
-    /// verbatim. With no configured path, the config file's directory is used
-    /// (or the platform default config dir when no file was given).
+    /// Directory holding the database and the other control-plane files.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        if self.data_path.as_os_str().is_empty() {
+            self.storage.fs.path.clone()
+        } else {
+            self.data_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        }
+    }
+
+    /// Resolve the configured `data_path` against a config file location. A
+    /// final component ending in `.db` is used verbatim; anything else is a
+    /// directory and gets `cachette.db` appended. With no configured path the
+    /// config file's directory is used (or the platform default).
     #[must_use]
     pub fn data_path(&self, config_file: Option<&Path>) -> PathBuf {
-        let raw = self.server.data_path.clone().unwrap_or_else(|| {
-            match config_file.and_then(Path::parent) {
-                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-                _ => default_config_dir(),
-            }
-        });
-        if raw
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|n| n.ends_with(".db"))
-        {
-            raw
-        } else {
-            raw.join("cachette.db")
+        resolve_data_path(self.server.data_path.as_ref(), config_file)
+    }
+
+    /// Recompute the resolved database path after the config file location is
+    /// known (only `load` needs this; `from_sources` has no path).
+    pub(crate) fn set_config_path(&mut self, config_file: &Path) {
+        let old_cert = self.state_dir().join("identity");
+        self.data_path = self.data_path(Some(config_file));
+        // A default cert path derived by `resolve` must follow the state dir;
+        // an operator-supplied `cluster.cert_path` is left alone.
+        if self.cluster.cert_path.as_deref() == Some(old_cert.as_path()) {
+            self.cluster.cert_path = Some(self.state_dir().join("identity"));
         }
+    }
+}
+
+fn resolve_data_path(raw: Option<&PathBuf>, config_file: Option<&Path>) -> PathBuf {
+    let raw = raw
+        .cloned()
+        .unwrap_or_else(|| match config_file.and_then(Path::parent) {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => default_config_dir(),
+        });
+    if raw
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.ends_with(".db"))
+    {
+        raw
+    } else {
+        raw.join("cachette.db")
     }
 }
 
@@ -151,7 +187,9 @@ pub fn load(cli_config: Option<PathBuf>) -> Result<Config, ConfigError> {
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    from_sources(raw.as_deref(), &env)
+    let mut config = from_sources(raw.as_deref(), &env)?;
+    config.set_config_path(&path);
+    Ok(config)
 }
 
 /// Pure loader core: TOML text + env pairs in, resolved `Config` out.
@@ -184,6 +222,14 @@ pub(crate) fn from_sources(
         cluster: take(object, "cluster")?,
         log: take(object, "log")?,
         quota: take(object, "quota")?,
+        data_path: PathBuf::new(),
+    };
+    let mut config = config;
+    // The pure loader has no config file location, so keep the legacy state
+    // location. `load` overrides this once the real config path is known.
+    config.data_path = match &config.server.data_path {
+        Some(raw) => resolve_data_path(Some(raw), None),
+        None => config.storage.fs.path.join("cachette.db"),
     };
     if let Some(key) = object.keys().next() {
         return Err(ConfigError::UnknownKey(key.clone()));
@@ -219,7 +265,9 @@ fn resolve(mut config: Config) -> Config {
         config.cluster.advertise_addr = Some(config.cluster.listen.clone());
     }
     if config.cluster.cert_path.is_none() {
-        config.cluster.cert_path = Some(config.storage.fs.path.join("identity"));
+        // Identity follows the control-plane state directory (v1.3) or the
+        // legacy storage root when no data path was resolved.
+        config.cluster.cert_path = Some(config.cert_path());
     }
     if config.v2.jwt_secret.is_none() {
         config.v2.jwt_secret = config.auth.secret.clone();
@@ -559,6 +607,35 @@ mod tests {
         // An explicit but missing path must be an error, NOT a silent fallback
         // to the platform default file.
         load(Some(dir.join("missing.toml"))).expect_err("explicit missing path is an error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v13_state_paths_follow_the_config_file_or_explicit_db() {
+        let dir = std::env::temp_dir().join(format!("cachette-state-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let config_file = dir.join("cachette.toml");
+        // A v1.3 config (explicit instances) so the legacy data_path derivation
+        // does not apply and the config-file default can be observed.
+        let base = "[server]\nlisten = \"127.0.0.1:0\"\n\n[[storage.instances]]\nname = 'default'\ntype = 'fs'\npath = '/tmp/cache-payload'\n\n[auth]\nsecret = \"0123456789abcdef\"\n";
+        std::fs::write(&config_file, base).expect("write config");
+
+        let config = load(Some(config_file.clone())).expect("load config");
+        assert_eq!(config.data_path, dir.join("cachette.db"));
+        assert_eq!(config.state_dir(), dir);
+        assert_eq!(config.cert_path(), dir.join("identity"));
+
+        let explicit_db = dir.join("custom.db");
+        let with_db = format!(
+            "[server]\ndata_path = '{}'\n{}",
+            explicit_db.display(),
+            base.trim_start_matches("[server]\n")
+        );
+        std::fs::write(&config_file, with_db).expect("write config");
+        let config = load(Some(config_file.clone())).expect("load config");
+        assert_eq!(config.data_path, explicit_db);
+        assert_eq!(config.state_dir(), dir);
 
         std::fs::remove_dir_all(&dir).ok();
     }

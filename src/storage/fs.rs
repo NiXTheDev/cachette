@@ -259,10 +259,29 @@ impl FsStorage {
     /// deletes are layout-aware either way (docs/cdc.md).
     pub fn open_cdc(root: impl AsRef<Path>, cdc: Option<CdcParams>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let db = root.join("cachette.sqlite3");
+        Self::open_cdc_with_db(root, db, cdc)
+    }
+
+    /// [`FsStorage::open_cdc`] with the control database at an explicit path.
+    /// The root still holds payloads only; the DB (and its WAL/SHM sidecars)
+    /// live under `server.data_path` in v1.3, shared by all instances.
+    pub fn open_cdc_with_db(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        cdc: Option<CdcParams>,
+    ) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
         for dir in ["blobs", "chunks", "parts", "tmp"] {
             std::fs::create_dir_all(root.join(dir))?;
         }
-        let mut conn = Connection::open(root.join("cachette.sqlite3")).map_err(sql)?;
+        let db_path = db_path.as_ref();
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut conn = Connection::open(db_path).map_err(sql)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(sql)?;

@@ -91,7 +91,11 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // exclusive lock for its whole lifetime so offline ops commands (`verify`,
     // `cache`, `gc`) can detect a live server and refuse instead of racing it.
     // A second server on the same directory is likewise rejected here.
-    let _data_lock = cachette::ops::DataDirLock::acquire(&config.storage.fs.path)?;
+    // v1.3: control-plane state lives under server.data_path, not the payload
+    // root. Legacy configs resolve data_path to the old root, so this is a
+    // no-op for them.
+    let state_dir = config.state_dir();
+    let _data_lock = cachette::ops::DataDirLock::acquire(&state_dir)?;
     // First boot mints the Ed25519 identity at `cluster.cert_path`; later
     // boots reuse it, so the fingerprint survives restarts and storage wipes
     // (plan task 13). It also becomes the `/health` node_id.
@@ -152,9 +156,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     // Auth (plan task 15): sqlite-backed dynamic token store sharing the
     // storage database file, plus the per-request auth policy snapshot.
-    state.tokens = Arc::new(TokenStore::open(
-        &config.storage.fs.path.join("cachette.sqlite3"),
-    )?);
+    state.tokens = Arc::new(TokenStore::open(&config.data_path)?);
     state.set_auth(AuthPolicy::from_config(&config));
     // Admin namespace mappings (v1.2 workstream F): a tenant the admin mapped
     // into a shared namespace resolves there; every other credential keeps
@@ -208,7 +210,11 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         .cdc
         .enabled
         .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
-    let storage = Arc::new(FsStorage::open_cdc(&config.storage.fs.path, cdc)?);
+    let storage = Arc::new(FsStorage::open_cdc_with_db(
+        &config.storage.fs.path,
+        &config.data_path,
+        cdc,
+    )?);
     let backend: Arc<dyn StorageBackend> = storage.clone();
     state.storage = Some(backend.clone());
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));

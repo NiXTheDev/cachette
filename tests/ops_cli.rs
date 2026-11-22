@@ -84,7 +84,7 @@ fn base_config(dir: &Path, listen: &str, cluster: bool) -> String {
         ""
     };
     format!(
-        "[server]\nlisten = \"{listen}\"\n\n[storage.fs]\npath = '{data}'\nmin_free = \"1MiB\"\n\n[auth]\nsecret = \"{SECRET}\"\n{cluster}",
+        "[server]\nlisten = \"{listen}\"\ndata_path = '{data}'\n\n[storage.fs]\npath = '{data}'\nmin_free = \"1MiB\"\n\n[auth]\nsecret = \"{SECRET}\"\n{cluster}",
         data = data.display()
     )
 }
@@ -96,7 +96,8 @@ fn data_dir(dir: &Path) -> PathBuf {
 /// Seed one finalized entry with `bytes` directly through the FS backend.
 fn seed_entry(data: &Path, key: &str, bytes: &[u8]) {
     block_on(async {
-        let storage = FsStorage::open(data).expect("open storage");
+        let storage = FsStorage::open_cdc_with_db(data, data.join("cachette.db"), None)
+            .expect("open storage");
         let stream: ByteStream<'static> = Box::pin(Cursor::new(bytes.to_vec()));
         storage.put_stream(key, stream).await.expect("put");
         storage.finalize(key).await.expect("finalize");
@@ -203,7 +204,7 @@ fn cache_list_json_then_prune_dry_run_and_delete() {
     seed_entry(&data, "keep-me", b"fresh");
     seed_entry(&data, "prune-me", b"stale");
     // Age only `prune-me` (entry_id order is key-hashed, so age by key).
-    let conn = rusqlite::Connection::open(data.join("cachette.sqlite3")).expect("open db");
+    let conn = rusqlite::Connection::open(data.join("cachette.db")).expect("open db");
     conn.execute(
         "UPDATE entries SET accessed_at = 1 WHERE key = 'prune-me'",
         [],
@@ -255,7 +256,8 @@ fn gc_sweeps_an_old_orphan_blob() {
     let data = data_dir(dir.path());
     // An empty data dir initializes storage, then we plant a rowless blob.
     block_on(async {
-        let _ = FsStorage::open(&data).expect("open storage");
+        let _ = FsStorage::open_cdc_with_db(&data, data.join("cachette.db"), None)
+            .expect("open storage");
     });
     let blobs = data.join("blobs");
     let orphan = blobs.join(format!("{}.blob", "a".repeat(64)));
@@ -386,7 +388,8 @@ fn cluster_status_reads_the_running_server() {
     let data = data_dir(dir.path());
     // Pre-create the identity so we can assert on its fingerprint.
     block_on(async {
-        let _ = FsStorage::open(&data).expect("open storage");
+        let _ = FsStorage::open_cdc_with_db(&data, data.join("cachette.db"), None)
+            .expect("open storage");
     });
     let port = free_port();
     let config = write_config(dir.path(), &format!("127.0.0.1:{port}"), true);
