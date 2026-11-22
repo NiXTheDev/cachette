@@ -918,7 +918,7 @@ jobs:
           tag: ${{ needs.version.outputs.tag }}
           sha: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          title: "cachette ${{ needs.version.outputs.tag }}"
+          title: "${{ needs.version.outputs.tag }}"
           release-notes-file: RELEASE_NOTES.md
           release-dir: dist
           override: true
