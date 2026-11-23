@@ -92,6 +92,7 @@ pub struct FileWriter {
     offset: u64,
     skip: u64,
     remaining: Option<u64>,
+    written: u64,
 }
 
 impl FileWriter {
@@ -108,7 +109,15 @@ impl FileWriter {
             offset,
             skip,
             remaining: take,
+            written: 0,
         })
+    }
+
+    /// Bytes actually written into the cache file. A server that returns a
+    /// short body must be reported, not silently padded with sparse zeros.
+    #[must_use]
+    pub const fn written(&self) -> u64 {
+        self.written
     }
 }
 
@@ -139,6 +148,7 @@ impl BodyWriter for FileWriter {
             *remaining -= limited as u64;
         }
         self.file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
         Ok(())
     }
 }

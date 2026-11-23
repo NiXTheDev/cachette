@@ -139,6 +139,14 @@ impl RemoteOps for WebDavOps {
                     response.text()
                 )));
             }
+            if writer.written() != len {
+                return Err(io::Error::other(format!(
+                    "WebDAV ranged GET wrote {} of {len} bytes (status {}, content-range {:?})",
+                    writer.written(),
+                    response.status,
+                    response.header("content-range")
+                )));
+            }
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -158,6 +166,9 @@ impl RemoteOps for WebDavOps {
                 .client
                 .send("DELETE", &self.object_url(id)?, self.headers(), Body::Empty)
                 .await?;
+            if response.status == 404 {
+                return Ok(()); // already gone; storage deletes are idempotent
+            }
             if !response.is_ok() {
                 return Err(io::Error::other(format!(
                     "WebDAV DELETE failed ({}): {}",

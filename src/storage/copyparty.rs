@@ -278,6 +278,14 @@ impl RemoteOps for CopyPartyOps {
                     response.text()
                 )));
             }
+            if writer.written() != len {
+                return Err(io::Error::other(format!(
+                    "copyparty ranged GET wrote {} of {len} bytes (status {}, content-range {:?})",
+                    writer.written(),
+                    response.status,
+                    response.header("content-range")
+                )));
+            }
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -295,7 +303,10 @@ impl RemoteOps for CopyPartyOps {
         Box::pin(async move {
             let mut url = Url::parse(&self.config.url)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-            url.set_path("/?delete");
+            // u2c.py posts to `/?delete`: an empty path with `delete` as the
+            // query key, not a path segment containing a literal '?'.
+            url.set_path("/");
+            url.set_query(Some("delete"));
             let mut headers = self.auth_headers();
             headers.push(("Content-Type", String::from("application/json")));
             let body = serde_json::json!([self.object_relpath(id)?]).to_string();
@@ -303,6 +314,9 @@ impl RemoteOps for CopyPartyOps {
                 .client
                 .send("POST", url.as_str(), headers, Body::Bytes(body.as_bytes()))
                 .await?;
+            if response.status == 404 {
+                return Ok(()); // already gone; storage deletes are idempotent
+            }
             if !response.is_ok() {
                 return Err(io::Error::other(format!(
                     "copyparty delete failed ({}): {}",
