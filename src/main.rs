@@ -214,10 +214,12 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let mut backends: BTreeMap<String, Arc<dyn StorageBackend>> = BTreeMap::new();
     let mut default_fs: Option<Arc<FsStorage>> = None;
     for instance in &config.storage.instances {
-        let fs = Arc::new(FsStorage::open_cdc_with_db(
+        let blob = cachette::storage::blob::from_config(instance)?;
+        let fs = Arc::new(FsStorage::open_with_store(
             &instance.path,
             &config.data_path,
             cdc,
+            blob,
         )?);
         if instance.name == "default" {
             default_fs = Some(fs.clone());

@@ -22,7 +22,6 @@ data_path = "/etc/cachette"             # dir -> /etc/cachette/cachette.db, or a
                                         # .db file path used verbatim; defaults to
                                         # the config file's directory
 listen = "0.0.0.0:8080"
-min_free = 0.2                          # default floor for every instance
 max_size = "32GiB"                      # bytesize accepted (1024-based)
 eviction = "lru"
 key_case = "preserve"
@@ -33,7 +32,11 @@ format = "text"
 [auth]
 mode = "bearer"
 # signed_url_ttl_seconds, jwt_secret, jwt_ttl_seconds, and the per-forge
-# [auth.<forge>] blocks live here too
+# [auth.forge.<label>] blocks live here too
+
+[storage.fs]
+path = "/var/lib/cachette"              # legacy root; also the default state dir
+min_free = 0.2                          # default floor for every instance
 
 # Repeatable instances. `type` picks the backend.
 [[storage.instances]]
@@ -73,9 +76,9 @@ limit = "5GiB"
 
 Rules:
 
-- `server.min_free` is the default free-space floor. An instance's `min_free`
-  overrides it; `server.max_size` accepts bytesize strings as well as raw
-  integers.
+- `[storage.fs].min_free` is the default free-space floor. An instance's
+  `min_free` overrides it; `server.max_size` accepts bytesize strings as well
+  as raw integers.
 - Every instance has a stable `name`; the legacy instance is `default`.
 - `[storage.namespaces]` keeps its meaning from the multi-tenant model:
   identity → namespace name. `[storage.routes]` then maps the **resolved
@@ -112,45 +115,87 @@ atomically. The instance set and the per-forge auth blocks are boot-only.
 
 ## Backends
 
-- **fs** — a local directory. Two instances are two roots; no extra backend
-  code is involved.
-- **Network mounts** — an `fs` instance whose path is an SMB/NFS mount. Mount
-  and failure semantics are the operating system's; cachette treats it as a
-  local root.
-- **S3-compatible** — objects live under a per-instance key prefix in **one
-  bucket**. The index stays in the local control database, keyed by instance,
-  so manifests, accounting and range reads keep their atomicity without any
-  database in the bucket. Credentials come from the environment
-  (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`, …), with
-  config-file keys as a fallback; environment values always win and config
-  secrets are masked in `--print-config`. Multipart and crash-window behavior
-  is backend-specific.
+Every instance publishes the same `StorageBackend` interface to the routes:
+index rows, reservations, parts and CDC chunks stay in the local control
+database and on the instance's local root. Only the bytes of `whole` entries
+go through a payload store, chosen by `type`:
+
+| `type` | Payload home | CDC | Credentials |
+| --- | --- | --- | --- |
+| `fs` | `<path>/blobs/{id}.blob` | yes | none |
+| `fs` with `mount_url` | the same path, mounted by the OS (SMB, NFS, mounted WebDAV) | yes | the OS mount's |
+| `s3` | one bucket, keys under `prefix/{id}` | no | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, config fallback |
+| `webdav` | `url/prefix/{id}` over PUT/GET/DELETE | no | optional `username` + `password_file` |
+| `copyparty` | `url/prefix/{id}` via up2k | no | optional `username` + `password_file` (the `PW` header) |
+
+**fs** needs nothing beyond a writable root. Mounted network filesystems are
+ordinary `fs` instances: `mount_url` records what is mounted at `path` so
+`doctor` can report it, but cachette only sees a local directory. Mounting and
+failure semantics stay with the operating system.
+
+**S3** uses one bucket for all entries in the instance, with per-instance key
+prefixes. The index, manifests and accounting stay local; there is no database
+in the bucket. `endpoint` selects path-style addressing for S3-compatible
+servers (MinIO, Ceph); without it, AWS virtual-host addressing is used with
+`region`. SigV4 is signed in-process. Environment credentials win over
+`access_key`/`secret_key` in the config, and `AWS_SESSION_TOKEN` is forwarded.
+
+**WebDAV** talks HTTP directly to a collection (PUT/GET with byte ranges and
+DELETE). WebDAV that is mounted by the OS is an `fs` instance instead; both
+forms are supported because WebDAV is used both ways.
+
+**copyparty** speaks its native up2k protocol. The client hashes the payload
+in up2k chunks (SHA-512 truncated to 33 bytes, base64url), asks the server
+which chunks it is missing, and sends only those with `X-Up2k-Hash` and
+`X-Up2k-Wark` headers. A handshake with an empty missing list means the file
+is already there — including when copyparty hardlink-deduplicated it — so no
+bytes are transferred. up2k is chunked on the wire but stores whole files on
+the server, so cachette keeps its own local CDC manifests while treating the
+copyparty copy as one blob. Set `wsalt` to the server's `--wsalt` when file
+IDs matter.
+
+All three remote stores require `ca_pem` for `https` endpoints: the same
+explicit-trust posture as OIDC's `jwks_ca_pem`. Config secrets are masked in
+`--print-config`.
+
+### Capabilities and the adapter seam
+
+`StorageBackend::capabilities()` reports what an instance can actually do:
+`chunked` (CDC manifests), `ranged` (byte-range reads) and `atomic_commit`
+(publish in one store-level step). Validation asks these flags rather than
+switching on `type`, so an instance that cannot store chunk manifests refuses
+`[storage.cdc] enabled = true` with a message naming the instance. Adding a
+backend means providing a payload store and its capability set; the index,
+quota and route layers do not change.
+
+Remote stores keep a read-through cache under `<root>/blobs/{id}.blob`:
+publishing uploads the local blob after the index commit (a failed upload
+compensates by dropping the row), then removes the cache file. A ranged read
+downloads only the requested bytes into a sparse cache file, so a partial read
+never pulls a whole artifact. Boot reconciliation keeps rows whose cache file
+is absent, because the authoritative copy is remote.
 
 ## Payload layout
 
-New instances store payloads in a readable hierarchy derived from the resolved
-identity:
+Every instance's local root has the same layout:
 
 ```text
-<root>/<forge>/<owner>/<repo>/{blobs,parts,tmp}/   # tenant-scoped identity
-<root>/<forge>/{blobs,parts,tmp}/                  # forge-only identity
+<root>/blobs/{id}.blob    finalized whole payload (or a remote read-through cache)
+<root>/parts/{id}.part    staged payload awaiting finalize
+<root>/chunks/{id}.chunk  deduplicated CDC chunk payloads
+<root>/tmp/               scratch for atomic temp-file + rename writes
 ```
 
-`forge` is the configured label (or an encoded issuer URL) and `owner/repo` is
-the tenant. A minted buildx JWT with no tenant claim resolves to the
-forge-only path; a signed runner-repo header or a runtime token's
-`oidc_extra.repository` resolves to the tenant path. The legacy namespace
-`""` uses `<root>/__legacy__/{blobs,parts,tmp}/`.
+`id` is derived from the instance, namespace and key, so the same key in two
+namespaces or two instances never shares a row. CDC chunks are shared across
+namespaces inside one instance: a chunk may be referenced by several entries,
+so quotas and eviction use the SQLite accounting rather than `du`, which only
+reports exclusive bytes for a directory. A remote instance has no meaningful
+`du` for its authoritative bytes.
 
-Deduplicated CDC `chunks/` live at instance or forge level, not per tenant: a
-chunk may be shared by several namespaces, so placing it in one tenant's tree
-would break deduplication. `du` on a tenant directory therefore reports
-**exclusive** bytes only. Quotas and eviction use the SQLite accounting, with
-`du` as an ops cross-check. S3 mirrors the prefix structure but has no `du`.
-
-The legacy `default` instance keeps its original hashed layout until an
-explicit `cachette state migrate --layout` converts it. Nothing is rewritten
-on upgrade.
+Nothing is rewritten on upgrade. The tenant-scoped directory layout and the
+`cachette state migrate --layout` conversion are planned as a follow-up; the
+hashed layout above is what v1.3 actually stores.
 
 ## State directory
 
@@ -254,10 +299,10 @@ the old config. Keys it cannot map are appended at the end, commented out,
 with their original position and a note about what replaced them. Nothing is
 silently dropped. Old config is copied verbatim to `<file>.bak` before any
 write, and an existing `.bak` is never overwritten. Data-moving commands
-write a verified `<state dir>.<timestamp>.tar.zst` snapshot (`.tar.gz` when
-zstd is unavailable) before touching files; `cachette state restore <archive>
---to <state dir>` restores it. Deleting source data is a separate explicit
-command, never part of migration.
+write a verified `<state dir>.<timestamp>.snapshot` directory copy with a
+BLAKE3 manifest before touching files; `cachette state restore <snapshot>
+--to <state dir>` verifies and restores it. Deleting source data is a separate
+explicit command, never part of migration.
 
 Actions are grouped into warning tiers:
 

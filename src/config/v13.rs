@@ -18,6 +18,8 @@ pub enum StorageKind {
     #[default]
     Fs,
     S3,
+    WebDav,
+    CopyParty,
 }
 
 /// One `[[storage]]` instance.
@@ -34,6 +36,22 @@ pub struct StorageInstanceConfig {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
+    /// Remote mount URL for `fs` instances backed by SMB/NFS/WebDAV.
+    /// The OS mounts it; cachette sees a local filesystem path.
+    pub mount_url: Option<String>,
+    /// Direct WebDAV endpoint URL for `type = "webdav"` instances.
+    pub url: Option<String>,
+    /// WebDAV / copyparty credentials (optional; public endpoints need none).
+    pub username: Option<String>,
+    pub password_file: Option<PathBuf>,
+    /// Key prefix in an S3 bucket, or path prefix for other remote stores.
+    pub prefix: Option<String>,
+    /// TLS trust bundle for https remote endpoints. Required for https.
+    pub ca_pem: Option<PathBuf>,
+    /// S3 credentials (env wins). Copyparty file-ID salt (server `--wsalt`).
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub wsalt: Option<String>,
 }
 
 impl Default for StorageInstanceConfig {
@@ -46,6 +64,15 @@ impl Default for StorageInstanceConfig {
             bucket: None,
             region: None,
             endpoint: None,
+            mount_url: None,
+            url: None,
+            username: None,
+            password_file: None,
+            prefix: None,
+            ca_pem: None,
+            access_key: None,
+            secret_key: None,
+            wsalt: None,
         }
     }
 }

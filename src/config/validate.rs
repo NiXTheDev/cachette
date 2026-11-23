@@ -79,23 +79,54 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
             "[auth.runtime] is deprecated in v1.3; use [auth.<forge>] blocks with runtime_secret"
         );
     }
+    use crate::config::StorageKind;
     let mut names = HashSet::new();
     for instance in &config.storage.instances {
-        if instance.kind == crate::config::StorageKind::S3 {
-            if instance.bucket.as_deref().is_none_or(str::is_empty) {
-                return Err(ConfigError::InSection {
-                    section: String::from("storage.instances"),
-                    msg: format!("instance {:?} needs a bucket", instance.name),
-                });
+        // Capability-driven, not a switch on `type`: a backend that cannot
+        // store chunk manifests refuses CDC no matter how it is named.
+        if config.storage.cdc.enabled
+            && !crate::storage::blob::capabilities_for(instance.kind).chunked
+        {
+            return Err(ConfigError::InSection {
+                section: String::from("storage.cdc"),
+                msg: format!(
+                    "instance {:?} does not support content-defined chunking; \
+                     CDC needs an fs/network-mount instance",
+                    instance.name
+                ),
+            });
+        }
+        let missing = match instance.kind {
+            StorageKind::S3 if instance.bucket.as_deref().is_none_or(str::is_empty) => {
+                Some("bucket")
             }
-            if config.storage.cdc.enabled {
-                return Err(ConfigError::InSection {
-                    section: String::from("storage.cdc"),
-                    msg: String::from(
-                        "content-defined chunking is only supported on fs/network-mount instances",
-                    ),
-                });
+            StorageKind::WebDav | StorageKind::CopyParty
+                if instance.url.as_deref().is_none_or(str::is_empty) =>
+            {
+                Some("url")
             }
+            _ => None,
+        };
+        if let Some(field) = missing {
+            return Err(ConfigError::InSection {
+                section: String::from("storage.instances"),
+                msg: format!("instance {:?} needs a {field}", instance.name),
+            });
+        }
+        let uses_https = instance
+            .url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
+            || instance
+                .endpoint
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))
+            || (instance.kind == StorageKind::S3 && instance.endpoint.is_none());
+        if uses_https && instance.ca_pem.is_none() {
+            return Err(ConfigError::InSection {
+                section: String::from("storage.instances"),
+                msg: format!("instance {:?} uses https and needs ca_pem", instance.name),
+            });
         }
         if instance.name.is_empty() || !names.insert(instance.name.clone()) {
             return Err(ConfigError::StorageInstanceName {

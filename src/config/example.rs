@@ -52,12 +52,6 @@ pub static SECTIONS: &[Section] = &[
                 comment: "runner-visible base URL",
             },
             Field {
-                key: "min_free",
-                default: "0.2",
-                form: Form::Required,
-                comment: "default free-space floor for all instances",
-            },
-            Field {
                 key: "max_size",
                 default: "0",
                 form: Form::Required,
@@ -185,12 +179,12 @@ pub static SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        header: "auth.\"<forge>\"",
+        header: "auth.forge.\"<forge>\"",
         fields: &[
             Field {
                 key: "hmac_secret",
-                default: "\"secret\"",
-                form: Form::Optional,
+                default: "\"CHANGE_ME_MIN_16_CHARS\"",
+                form: Form::Required,
                 comment: "runner cache.secret; yields forge + signed repo tenant",
             },
             Field {
@@ -244,6 +238,23 @@ pub static SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        header: "storage.fs",
+        fields: &[
+            Field {
+                key: "path",
+                default: "\"/var/lib/cachette\"",
+                form: Form::Required,
+                comment: "legacy local root; also the default control-DB directory",
+            },
+            Field {
+                key: "min_free",
+                default: "0.2",
+                form: Form::Required,
+                comment: "default free-space floor for all instances",
+            },
+        ],
+    },
+    Section {
         header: "storage",
         fields: &[Field {
             key: "routes",
@@ -278,6 +289,124 @@ pub static SECTIONS: &[Section] = &[
                 default: "100",
                 form: Form::Optional,
                 comment: "pace between conversions",
+            },
+        ],
+    },
+    Section {
+        header: "[[storage.instances]]",
+        fields: &[
+            Field {
+                key: "name",
+                default: "\"default\"",
+                form: Form::Required,
+                comment: "routing target; repeat this block for more instances",
+            },
+            Field {
+                key: "type",
+                default: "\"fs\"",
+                form: Form::Required,
+                comment: "fs | s3 | webdav | copyparty",
+            },
+            Field {
+                key: "path",
+                default: "\"/var/lib/cachette\"",
+                form: Form::Required,
+                comment: "local root (also the mount point for mounted SMB/NFS/WebDAV)",
+            },
+            Field {
+                key: "mount_url",
+                default: "\"//nas.example.org/cache\"",
+                form: Form::Optional,
+                comment: "documentation only: what is mounted at path",
+            },
+            Field {
+                key: "bucket",
+                default: "\"cachette\"",
+                form: Form::Optional,
+                comment: "required for type = \"s3\"",
+            },
+            Field {
+                key: "region",
+                default: "\"us-east-1\"",
+                form: Form::Optional,
+                comment: "S3 region",
+            },
+            Field {
+                key: "endpoint",
+                default: "\"https://minio.example.org:9000\"",
+                form: Form::Optional,
+                comment: "custom S3 endpoint (path-style addressing)",
+            },
+            Field {
+                key: "url",
+                default: "\"https://copyparty.example.org/cachette/\"",
+                form: Form::Optional,
+                comment: "required for type = \"webdav\" and type = \"copyparty\"",
+            },
+            Field {
+                key: "prefix",
+                default: "\"blobs\"",
+                form: Form::Optional,
+                comment: "key prefix inside the remote store",
+            },
+            Field {
+                key: "username",
+                default: "\"cachette\"",
+                form: Form::Optional,
+                comment: "remote username / basic auth",
+            },
+            Field {
+                key: "password_file",
+                default: "\"/etc/cachette/remote.password\"",
+                form: Form::Optional,
+                comment: "file holding the remote password or copyparty PW header",
+            },
+            Field {
+                key: "ca_pem",
+                default: "\"/etc/ssl/certs/ca-certificates.crt\"",
+                form: Form::Optional,
+                comment: "trust roots; required whenever the endpoint is https",
+            },
+            Field {
+                key: "access_key",
+                default: "\"CHANGE_ME\"",
+                form: Form::Optional,
+                comment: "S3 access key fallback (AWS_ACCESS_KEY_ID wins)",
+            },
+            Field {
+                key: "secret_key",
+                default: "\"CHANGE_ME\"",
+                form: Form::Optional,
+                comment: "S3 secret key fallback (AWS_SECRET_ACCESS_KEY wins)",
+            },
+            Field {
+                key: "wsalt",
+                default: "\"hunter2\"",
+                form: Form::Optional,
+                comment: "copyparty file-ID salt (must match server --wsalt)",
+            },
+        ],
+    },
+    Section {
+        header: "[[quota]]",
+        fields: &[
+            Field {
+                key: "scope",
+                default: "\"namespace\"",
+                form: Form::Required,
+                comment: "namespace | instance",
+            },
+            Field {
+                key: "target",
+                default: "\"*\"",
+                form: Form::Required,
+                comment: "exact name or glob",
+            },
+            Field {
+                key: "limit",
+                default: "\"20GiB\"",
+                form: Form::Required,
+                comment: "positive bytesize",
             },
         ],
     },
@@ -370,7 +499,11 @@ pub fn render_example() -> String {
         "# cachette configuration - generated from the config schema.\n# Every knob is present; optional keys are commented out with their defaults.\n\n",
     );
     for section in SECTIONS {
-        out.push_str(&format!("[{}]\n", section.header));
+        if section.header.starts_with("[[") {
+            out.push_str(&format!("{}\n", section.header));
+        } else {
+            out.push_str(&format!("[{}]\n", section.header));
+        }
         for field in section.fields {
             match field.form {
                 Form::Required => {
@@ -400,7 +533,12 @@ mod tests {
     fn example_covers_every_section_and_parses() {
         let rendered = render_example();
         for section in SECTIONS {
-            assert!(rendered.contains(&format!("[{}]", section.header)));
+            let expected = if section.header.starts_with("[[") {
+                section.header.to_owned()
+            } else {
+                format!("[{}]", section.header)
+            };
+            assert!(rendered.contains(&expected), "missing header {expected}");
             for field in section.fields {
                 assert!(rendered.contains(field.key), "missing {}", field.key);
             }
@@ -409,5 +547,9 @@ mod tests {
             toml::from_str(&rendered).expect("generated example is valid TOML");
         assert!(table.contains_key("server"));
         assert!(table.contains_key("auth"));
+        // "Boots as-is" is part of the contract: run the generated text
+        // through the real loader (normalization, env merge, validation).
+        super::super::from_sources(Some(&rendered), &[])
+            .expect("generated example loads and validates");
     }
 }

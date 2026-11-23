@@ -307,6 +307,27 @@ pub fn render_masked(config: &Config) -> Result<String, ConfigError> {
             if let Some(jwt_secret) = auth.get_mut("jwt_secret") {
                 mask_string(jwt_secret);
             }
+            if let Some(forges) = auth.get_mut("forge").and_then(Value::as_object_mut) {
+                for block in forges.values_mut().filter_map(Value::as_object_mut) {
+                    if let Some(secret) = block.get_mut("hmac_secret") {
+                        mask_string(secret);
+                    }
+                }
+            }
+        }
+        if let Some(instances) = object
+            .get_mut("storage")
+            .and_then(Value::as_object_mut)
+            .and_then(|storage| storage.get_mut("instances"))
+            .and_then(Value::as_array_mut)
+        {
+            for instance in instances.iter_mut().filter_map(Value::as_object_mut) {
+                for key in ["access_key", "secret_key"] {
+                    if let Some(secret) = instance.get_mut(key) {
+                        mask_string(secret);
+                    }
+                }
+            }
         }
         if let Some(v2) = object.get_mut("v2").and_then(Value::as_object_mut)
             && let Some(jwt_secret) = v2.get_mut("jwt_secret")

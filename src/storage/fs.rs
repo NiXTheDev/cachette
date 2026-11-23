@@ -57,6 +57,7 @@ use tokio::sync::RwLock;
 
 use super::{
     BoxFuture, ByteStream, Chunk, ChunkOutcome, ChunkRange, EntryStat, StorageBackend,
+    blob::{BlobStore, FsBlobStore},
     cdc::{self, CdcParams},
     complete,
     digest::{self, DigestWriter},
@@ -192,6 +193,9 @@ pub struct FsStorage {
     /// derivation, so rows written before namespaces existed stay reachable;
     /// other namespaces get their own ids and their own accounting.
     namespace: String,
+    /// Where `whole`-layout payload bytes actually live. Local for `fs`, a
+    /// remote object behind a read-through cache for the v1.3 backends.
+    blob: Arc<dyn BlobStore>,
 }
 
 /// What one orphan-chunk sweep pass reclaimed (docs/cdc.md §GC).
@@ -271,6 +275,18 @@ impl FsStorage {
         db_path: impl AsRef<Path>,
         cdc: Option<CdcParams>,
     ) -> io::Result<Self> {
+        Self::open_with_store(root, db_path, cdc, Arc::new(FsBlobStore))
+    }
+
+    /// [`FsStorage::open_cdc_with_db`] with an explicit payload store. Remote
+    /// backends keep parts/chunks/tmp local but publish whole blobs through
+    /// `blob`; the index and its B5 ordering stay exactly the same.
+    pub fn open_with_store(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        cdc: Option<CdcParams>,
+        blob: Arc<dyn BlobStore>,
+    ) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         for dir in ["blobs", "chunks", "parts", "tmp"] {
             std::fs::create_dir_all(root.join(dir))?;
@@ -313,6 +329,7 @@ impl FsStorage {
             chunk_locks: Arc::new(Mutex::new(HashMap::new())),
             cdc,
             namespace: String::new(),
+            blob,
         };
         storage.reconcile()?;
         Ok(storage)
@@ -332,6 +349,7 @@ impl FsStorage {
             chunk_locks: Arc::clone(&self.chunk_locks),
             cdc: self.cdc,
             namespace: namespace.to_owned(),
+            blob: Arc::clone(&self.blob),
         }
     }
 
@@ -375,6 +393,10 @@ impl FsStorage {
             let recorded = u64::try_from(size).unwrap_or(0);
             let health = if layout == "chunked" {
                 self.verify_chunked(&id, recorded, &stored)?
+            } else if !self.blob.local_authoritative() && !self.blob_path(&id).exists() {
+                // Remote blobs are verified by their upload digest; their
+                // local cache file is disposable. An empty cache is healthy.
+                EntryHealth::Ok
             } else {
                 let blob = self.blob_path(&id);
                 match std::fs::metadata(&blob) {
@@ -856,6 +878,48 @@ impl FsStorage {
         self.root.join("tmp").join(format!("{id}.tmp"))
     }
 
+    /// Layout of a committed entry, used to decide whether a blob needs to be
+    /// published to a remote store (chunked entries have no blob).
+    async fn committed_layout(&self, id: &str) -> io::Result<Option<String>> {
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        blocking(move || {
+            let conn = lock(&conn)?;
+            conn.query_row(
+                "SELECT layout FROM entries WHERE id = ?1 AND complete = 1",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql)
+        })
+        .await
+    }
+
+    /// Push a just-committed whole blob to a remote store. Failure is
+    /// compensated by dropping the row, so a failed upload never leaves a
+    /// visible entry whose bytes are unavailable.
+    async fn publish_committed(&self, id: &str) -> io::Result<()> {
+        if self.committed_layout(id).await?.as_deref() != Some("whole") {
+            return Ok(());
+        }
+        let path = self.blob_path(id);
+        if let Err(err) = self.blob.publish(id, &path).await {
+            let conn = Arc::clone(&self.conn);
+            let id = id.to_owned();
+            let _ = blocking(move || {
+                let conn = lock(&conn)?;
+                conn.execute("DELETE FROM entries WHERE id = ?1", [&id])
+                    .map_err(sql)?;
+                Ok::<(), io::Error>(())
+            })
+            .await;
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Per-reservation async mutex serializing chunk staging for `key`.
     fn chunk_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.chunk_locks.lock().expect("chunk lock map poisoned");
@@ -904,8 +968,12 @@ impl FsStorage {
             // the files' refcounts and accounting stay truthful.
             let intact = if layout == "chunked" {
                 self.chunked_entry_intact(&conn, &id)?
-            } else {
+            } else if self.blob.local_authoritative() {
                 self.blob_path(&id).exists()
+            } else {
+                // A remote backend's local blob is only a read-through
+                // cache; absence says nothing about the authoritative copy.
+                true
             };
             if !intact {
                 release_entry_manifest(&conn, &id)?;
@@ -1024,6 +1092,10 @@ impl FsStorage {
 }
 
 impl StorageBackend for FsStorage {
+    fn capabilities(&self) -> super::blob::Capabilities {
+        self.blob.capabilities()
+    }
+
     fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend> {
         // The inherent `FsStorage::scoped` builds a cheap namespaced view
         // (shared connection/gate/locks); boxing it satisfies the trait's
@@ -1070,6 +1142,33 @@ impl StorageBackend for FsStorage {
             }
             let _gate = self.gate.read().await;
             let id = self.entry_id_for(key);
+            // Remote stores keep only a sparse read-through cache locally, so
+            // fill the requested window before the existing local read path.
+            if !self.blob.local_authoritative() {
+                let (size, layout) = {
+                    let conn = Arc::clone(&self.conn);
+                    let id = id.clone();
+                    blocking(move || {
+                        let conn = lock(&conn)?;
+                        conn.query_row(
+                            "SELECT size, layout FROM entries WHERE id = ?1 AND complete = 1",
+                            [&id],
+                            |row| Ok((sql_u64(row.get(0)?), row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(sql)
+                    })
+                    .await?
+                    .ok_or_else(|| not_found(key))?
+                };
+                if layout == "whole" {
+                    let len = range.end.min(size).saturating_sub(range.start);
+                    if len > 0 {
+                        let path = self.blob_path(&id);
+                        self.blob.fetch_range(&id, &path, range.start, len).await?;
+                    }
+                }
+            }
             let key = key.to_owned();
             let key_hint = key.clone();
             let blob = self.blob_path(&id);
@@ -1189,6 +1288,7 @@ impl StorageBackend for FsStorage {
             let namespace = self.namespace.clone();
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
+            let remote_id = id.clone();
             let blob = self.blob_path(&id);
             let part = self.part_path(&id);
             let chunks_dir = self.root.join("chunks");
@@ -1218,7 +1318,9 @@ impl StorageBackend for FsStorage {
                 }
                 Ok(())
             })
-            .await
+            .await?;
+            self.blob.remove(&remote_id).await?;
+            Ok(())
         })
     }
 
@@ -1284,6 +1386,7 @@ impl StorageBackend for FsStorage {
             let namespace = self.namespace.clone();
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
+            let publish_id = id.clone();
             let key = key.to_owned();
             let part = self.part_path(&id);
             let blob = self.blob_path(&id);
@@ -1426,7 +1529,9 @@ impl StorageBackend for FsStorage {
                 }
                 Ok(())
             })
-            .await
+            .await?;
+            self.publish_committed(&publish_id).await?;
+            Ok(())
         })
     }
 
@@ -1623,7 +1728,10 @@ impl StorageBackend for FsStorage {
             let res_id = entry_id_in(&namespace, cache_id);
             let cache_id = cache_id.to_owned();
             let cdc: Option<CdcParams> = self.cdc;
+            let published: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let publish_slot = Arc::clone(&published);
             blocking(move || {
+                let publish_slot = publish_slot;
                 let now = unix_now();
                 let reservation: Option<(String, String, Option<i64>)> = {
                     let conn = lock(&conn)?;
@@ -1764,9 +1872,15 @@ impl StorageBackend for FsStorage {
                 }
                 let _ = std::fs::remove_dir_all(&dir);
                 let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                *publish_slot.lock().expect("publish slot poisoned") = Some(blob_id);
                 Ok(())
             })
-            .await
+            .await?;
+            let maybe_id = published.lock().expect("publish slot poisoned").take();
+            if let Some(id) = maybe_id {
+                self.publish_committed(&id).await?;
+            }
+            Ok(())
         })
     }
 
@@ -1850,7 +1964,10 @@ impl StorageBackend for FsStorage {
             let cache_id = cache_id.to_owned();
             let ordered = ordered_block_ids.to_vec();
             let cdc: Option<CdcParams> = self.cdc;
-            blocking(move || {
+            let published: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let publish_slot = Arc::clone(&published);
+            let total = blocking(move || {
+                let publish_slot = publish_slot;
                 let now = unix_now();
                 let reservation: Option<(String, String, Option<i64>)> = {
                     let conn = lock(&conn)?;
@@ -1989,9 +2106,15 @@ impl StorageBackend for FsStorage {
                 }
                 let _ = std::fs::remove_dir_all(&blocks);
                 let _ = std::fs::remove_file(root.join("parts").join(format!("{res_id}.part")));
+                *publish_slot.lock().expect("publish slot poisoned") = Some(blob_id);
                 Ok(total)
             })
-            .await
+            .await?;
+            let maybe_id = published.lock().expect("publish slot poisoned").take();
+            if let Some(id) = maybe_id {
+                self.publish_committed(&id).await?;
+            }
+            Ok(total)
         })
     }
 }
@@ -6324,5 +6447,42 @@ mod storage_fs {
             at_rest_invariant(&storage),
             "accounting rests on the invariant after both writes"
         );
+    }
+
+    /// v1.3: a remote blob store publishes after the index commit, fetches
+    /// only requested ranges into the local cache, and is told to delete.
+    #[tokio::test]
+    async fn remote_blob_store_hooks_drive_the_whole_payload_lifecycle() {
+        use crate::storage::blob::test_support::RecordingBlobStore;
+
+        let dir = TestDir::new();
+        let store = Arc::new(RecordingBlobStore::default());
+        *store.bytes.lock().expect("poisoned") = b"hello remote".to_vec();
+        let storage = FsStorage::open_with_store(
+            dir.path().join("payload"),
+            dir.path().join("control.db"),
+            None,
+            store.clone(),
+        )
+        .expect("open");
+        assert!(!storage.capabilities().chunked);
+        assert!(storage.capabilities().ranged);
+
+        storage
+            .put_stream("k", bytes(b"hello remote"))
+            .await
+            .expect("put");
+        storage.finalize("k").await.expect("finalize");
+        assert_eq!(store.published.lock().expect("poisoned").len(), 1);
+
+        let data = read_all(storage.get_range("k", 0..5).await.expect("read")).await;
+        assert_eq!(data, b"hello");
+        assert_eq!(
+            store.fetched.lock().expect("poisoned").as_slice(),
+            &[(storage.entry_id_for("k"), 0, 5)]
+        );
+
+        storage.delete("k").await.expect("delete");
+        assert_eq!(store.removed.lock().expect("poisoned").len(), 1);
     }
 }

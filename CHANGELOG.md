@@ -2,6 +2,30 @@
 
 All notable changes to cachette are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semantic versioning with the major digit reserved for truly breaking silently-incompatible changes. Design contracts live in `docs/`. Dates are the release commits' dates (Hangar publish timestamps can differ by a day).
 
+## [1.3.0] - 2026-11-23
+
+*Stick it onto the ceiling for all I care!*
+
+v1.3 turns one cache into a storage plane. Several named instances sit behind one control database, namespaces route to them, and the backends advertise what they can do instead of pretending every store is a local disk.
+
+### Added
+
+- **Multiple storage instances.** `[[storage.instances]]` declares named `fs` roots, network mounts or remote stores. `[storage.routes]` maps resolved namespaces by exact match, longest glob, `"*"` and then `default`; routes and `[[quota]]` rules reload on SIGHUP while the instance set is boot-only. One server owns one SQLite control database at `server.data_path`.
+- **Storage backends with capabilities.** `fs` (including OS-mounted SMB/NFS/WebDAV) supports CDC and ranged reads. Native S3, direct WebDAV and copyparty up2k backends store whole blobs with a sparse local read-through cache; `StorageBackend::capabilities()` drives validation, so CDC is refused for stores that cannot hold chunk manifests. S3 signs requests in-process with credentials from the usual AWS environment variables. copyparty hashes with up2k's SHA-512 chunk scheme and uploads only the chunks the server is missing, benefiting from its hardlink dedup.
+- **Per-forge authentication.** `[auth.forge.<label>]` carries HMAC, runtime-token and OIDC settings together. A signed runner-repo header yields that forge and repository as the tenant, so `auth.mode = "merge"` is valid next to the OIDC and runtime planes; HMAC wins when both HMAC headers and a Bearer token are present. Legacy tables keep working with a boot-time deprecation warning.
+- **Offline migration tooling.** `doctor --migrate` and `doctor --migrate-config [--write]` plan or write a v1.3 config and move state with verified BLAKE3-manifest snapshots. `state migrate/restore/retag/delete-source` are separate explicit commands with NOTICE/CAUTION/DANGER/IRREVERSIBLE tiers and typed confirmations.
+- **Cluster protocol 3.** Quota rules and per-namespace usage ride on heartbeats; local rules win, otherwise a plurality vote per target supplies the fallback, abstentions are ignored and stale reports are discarded. v2 peers get `426 Upgrade Required`.
+- **Generated configuration example.** `cachette config example` and the checked-in example come from one declarative schema and renderer, so every knob and default is present. Secrets are masked in `--print-config`.
+
+### Changed
+
+- **State moved under `server.data_path`.** A `.db` final component is the database file verbatim; otherwise the database is `<dir>/cachette.db`. The control database, token store, identity and lock no longer live in a payload root.
+- **Release metadata.** Release bodies are generated from this changelog and a shared template at publish time; CI uses current buildx/actions pins and cross-builds the arm64 Windows legs on amd64 hosts.
+
+### Upgrading
+
+A legacy config still boots with one `default` instance, the old payload path, the old state path and the legacy namespace. Use `cachette doctor --migrate-config` to review the generated v1.3 config, then `doctor --migrate` for the state move; both are offline and explicitly confirmed. Payload-layout conversion stays a follow-up: the hashed `blobs/parts/chunks` layout is unchanged in v1.3. See `docs/multi-storage.md` for instances, routes and backends, and `docs/hmac-tenancy.md` for per-forge credentials.
+
 ## [1.2.0] - 2026-11-21
 
 *One cache, many forges: credentials choose namespaces, quotas bound them, and peers without protocol v2 get 426.*
@@ -51,4 +75,4 @@ Initial release (`cc76396`).
 - Self-signed Ed25519 node identity that survives restarts and storage wipes, plus `cachette doctor`, `gc`, `verify`, `cache`, and `identity` CLI commands.
 - TLS recipes and a Docker image; CI dogfoods a live cachette for its `docker buildx` layer cache.
 
-[1.2.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/pulls/13 [1.1.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.1.0 [1.0.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.0.0
+[1.3.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/pulls/18 [1.2.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/pulls/13 [1.1.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.1.0 [1.0.0]: https://hangar.nixthedev.ru/NiXTheDev/cachette/releases/tag/v1.0.0

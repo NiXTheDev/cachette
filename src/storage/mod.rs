@@ -33,10 +33,15 @@ use tokio::sync::RwLock;
 
 use crate::config::KeyCase;
 
+pub mod blob;
 pub mod cdc;
+pub mod copyparty;
 pub mod digest;
 pub mod eviction;
 pub mod fs;
+pub mod http;
+pub mod s3;
+pub mod webdav;
 
 /// Boxed future used by [`StorageBackend`] so the trait stays
 /// dyn-compatible (`Arc<dyn StorageBackend>`) without an `async-trait`
@@ -264,6 +269,10 @@ impl RelayTransport for LocalRelay {}
 /// `AppState` can hold `Arc<dyn StorageBackend>`.
 // TODO(plan m4): multipart/ETag convenience methods intentionally omitted.
 pub trait StorageBackend: Send + Sync {
+    /// What this backend can do with payloads. Validation and the route layer
+    /// ask this instead of switching on a config `type`.
+    fn capabilities(&self) -> blob::Capabilities;
+
     /// Stage `source`'s bytes under `key`. Cancel-safe: dropping the future
     /// leaves no staged or visible data for this put. Staged data replaces
     /// any previous staged data for `key` but stays invisible until
@@ -518,6 +527,11 @@ impl MemoryStorage {
 }
 
 impl StorageBackend for MemoryStorage {
+    fn capabilities(&self) -> blob::Capabilities {
+        // The in-memory double models the local backend's feature set.
+        blob::Capabilities::FS
+    }
+
     fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend> {
         Arc::new(MemoryStorage::scoped(self, namespace))
     }
