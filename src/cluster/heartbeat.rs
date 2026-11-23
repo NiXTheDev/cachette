@@ -25,6 +25,7 @@ use rustls::Error as RustlsError;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_rustls::TlsConnector;
 
@@ -229,14 +230,33 @@ async fn send_all(
         "ts": now,
     });
     let body = serde_json::to_string(&payload).expect("heartbeat JSON is a fixed shape");
-    for peer in config.peer_table.snapshot() {
-        if peer.addr.is_empty()
-            || peer.fingerprint == config.node_id
-            || peer.node_id == config.node_id
-        {
+    let peers: Vec<_> = config
+        .peer_table
+        .snapshot()
+        .into_iter()
+        .filter(|peer| {
+            !peer.addr.is_empty()
+                && peer.fingerprint != config.node_id
+                && peer.node_id != config.node_id
+        })
+        .collect();
+    // One dial budget for the whole tick, not per peer: a dead peer must not
+    // push the next heartbeat past its interval (`MissedTickBehavior::Delay`).
+    // This mirrors the bounded JoinSet fan-out used by the relay's `find`.
+    let mut set = JoinSet::new();
+    for peer in peers {
+        let client = Arc::clone(client);
+        let body = body.clone();
+        set.spawn(async move {
+            let attempt =
+                tokio::time::timeout(DIAL_BUDGET, exchange(&client, &peer.addr, &body)).await;
+            (peer, attempt)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        let Ok((peer, attempt)) = joined else {
             continue;
-        }
-        let attempt = tokio::time::timeout(DIAL_BUDGET, exchange(client, &peer.addr, &body)).await;
+        };
         match attempt {
             Ok(Ok(200)) => {
                 tracing::debug!(node = %peer.node_id, addr = %peer.addr, "heartbeat sent");

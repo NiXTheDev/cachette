@@ -1125,6 +1125,12 @@ impl<V> BoundedMap<V> {
     }
 
     fn remove(&mut self, key: &str) -> Option<V> {
+        // The FIFO queue is a hint for eviction, not an index into `inner`.
+        // Leaving a removed key in it makes `order` grow once per session for
+        // the life of the process: at capacity, remove+insert never trips the
+        // `len > capacity` eviction loop that would have popped the stale
+        // entry. Purge it here so both structures stay bounded.
+        self.order.retain(|queued| queued != key);
         self.inner.remove(key)
     }
 }
@@ -1272,6 +1278,28 @@ mod tests {
         assert_eq!(map.inner.len(), 2);
         assert_eq!(map.get("a"), Some(&2), "value is overwritten in place");
         assert_eq!(map.get("b"), Some(&3));
+    }
+
+    #[test]
+    fn bounded_map_remove_purges_the_fifo_queue() {
+        let mut map: BoundedMap<u64> = BoundedMap::new(3);
+        for index in 0..3 {
+            map.insert(format!("key-{index}"), index);
+        }
+        // Steady-state churn at capacity: each remove+insert used to leave one
+        // stale queue entry behind without ever tripping the eviction loop.
+        for index in 3..100_u64 {
+            let key = format!("key-{}", index - 3);
+            assert_eq!(map.remove(&key), Some(index - 3));
+            map.insert(format!("key-{index}"), index);
+            assert!(
+                map.order.len() <= map.capacity,
+                "order grew to {} at iteration {index}",
+                map.order.len()
+            );
+        }
+        assert_eq!(map.inner.len(), 3);
+        assert_eq!(map.order.len(), 3);
     }
 
     #[test]

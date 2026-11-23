@@ -44,6 +44,7 @@
 //! and call [`Placement::place`]. For advanced callers, the free [`place`]
 //! function takes the PRNG and cursor map explicitly.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -234,18 +235,31 @@ pub fn place(
     Some(admitted[chosen].0.clone())
 }
 
+/// Compare two fill ratios `used_a / total_a` and `used_b / total_b` exactly.
+/// u128 cross-multiplication cannot overflow: `u64::MAX² < u128::MAX`.
+/// Floating-point comparison is not safe here — `1/3` and `2/6` are the same
+/// load but different f64 bit patterns, which would exclude a peer from the
+/// tie set and break `Random`/`RoundRobin`.
+fn fill_cmp(a: &Capacity, b: &Capacity) -> Ordering {
+    let lhs = u128::from(a.used) * u128::from(b.total);
+    let rhs = u128::from(b.used) * u128::from(a.total);
+    lhs.cmp(&rhs)
+}
+
 /// Step 2 for the equality-based tiebreaks: the indices (into `admitted`) whose
-/// `fill_percent` equals the minimum. `admitted` is non-empty, so the result is
+/// fill ratio equals the minimum. `admitted` is non-empty, so the result is
 /// non-empty.
 fn tied_by_min_fill(admitted: &[(&PeerRecord, Capacity)]) -> Vec<usize> {
-    let min_fill = admitted
-        .iter()
-        .map(|(_, capacity)| capacity.fill_percent())
-        .fold(f64::INFINITY, f64::min);
+    let mut min = 0;
+    for index in 1..admitted.len() {
+        if fill_cmp(&admitted[index].1, &admitted[min].1) == Ordering::Less {
+            min = index;
+        }
+    }
     admitted
         .iter()
         .enumerate()
-        .filter(|(_, (_, capacity))| capacity.fill_percent() == min_fill)
+        .filter(|(_, (_, capacity))| fill_cmp(capacity, &admitted[min].1) == Ordering::Equal)
         .map(|(index, _)| index)
         .collect()
 }
@@ -537,6 +551,65 @@ mod tests {
         )
         .expect("admits at a zero floor");
         assert_eq!(picked.node_id, "UNKNOWN");
+    }
+
+    #[test]
+    fn equal_fill_ratios_are_tied_regardless_of_f64_rounding() {
+        // 1/3 and 2/6 are mathematically identical but different f64 values.
+        let a = peer("A", 1, 3);
+        let b = peer("B", 2, 6);
+        let c = peer("C", 2, 5);
+        let admitted = vec![
+            (
+                &a,
+                Capacity {
+                    total: 3,
+                    used: 1,
+                    min_free: 0,
+                    max_size: 0,
+                },
+            ),
+            (
+                &b,
+                Capacity {
+                    total: 6,
+                    used: 2,
+                    min_free: 0,
+                    max_size: 0,
+                },
+            ),
+            (
+                &c,
+                Capacity {
+                    total: 5,
+                    used: 2,
+                    min_free: 0,
+                    max_size: 0,
+                },
+            ),
+        ];
+        assert_eq!(tied_by_min_fill(&admitted), vec![0, 1]);
+
+        // End-to-end: round-robin must alternate between the two equal peers.
+        let peers = vec![a, b, c];
+        let mut rng = SeededRng::from_seed(9);
+        let mut cursors = HashMap::new();
+        let picked: Vec<String> = (0..6)
+            .map(|_| {
+                place(
+                    &peers,
+                    None,
+                    MinFree::Fraction(0.0),
+                    0,
+                    Tiebreak::RoundRobin,
+                    &mut rng,
+                    &mut cursors,
+                )
+                .expect("a peer admits")
+                .node_id
+            })
+            .collect();
+        assert_eq!(picked, vec!["A", "B", "A", "B", "A", "B"]);
     }
 
     #[test]
