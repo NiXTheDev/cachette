@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::Error as RustlsError;
@@ -144,6 +144,7 @@ async fn run(config: HeartbeatConfig, notify: Arc<tokio::sync::Notify>) {
     let mut ticker = tokio::time::interval(config.interval.max(Duration::from_secs(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let id = config.node_id.as_str();
+    let mut last_storage_warn: Option<Instant> = None;
     loop {
         // First iteration fires immediately via the interval's first tick; a
         // drain `announce()` wakes the loop ahead of the next tick.
@@ -152,7 +153,7 @@ async fn run(config: HeartbeatConfig, notify: Arc<tokio::sync::Notify>) {
             () = notify.notified() => {}
         }
         let now = auth::now_secs();
-        let stats = live_capacity(&config).await;
+        let stats = live_capacity(&config, &mut last_storage_warn).await;
         if let Some((used, total)) = stats {
             config.peer_table.heartbeat(
                 id,
@@ -183,20 +184,36 @@ async fn run(config: HeartbeatConfig, notify: Arc<tokio::sync::Notify>) {
 /// the B3 model (`[cache] max_size`, else the storage disk total). `None`
 /// (with a warning) when either query fails — the tick then skips the self
 /// refresh and the send rather than publishing zeros.
-async fn live_capacity(config: &HeartbeatConfig) -> Option<(u64, u64)> {
+async fn live_capacity(
+    config: &HeartbeatConfig,
+    last_warn: &mut Option<Instant>,
+) -> Option<(u64, u64)> {
     let used = match config.storage.used_bytes().await {
         Ok(used) => used,
         Err(err) => {
-            tracing::warn!(error = %err, "heartbeat: used_bytes unavailable");
+            warn_throttled(last_warn, "heartbeat: used_bytes unavailable", &err);
             return None;
         }
     };
     match Capacity::from_disk(config.min_free, config.max_size, &config.storage_path, used) {
-        Ok(capacity) => Some((used, capacity.total)),
+        Ok(capacity) => {
+            *last_warn = None;
+            Some((used, capacity.total))
+        }
         Err(err) => {
-            tracing::warn!(error = %err, "heartbeat: storage capacity unavailable");
+            warn_throttled(last_warn, "heartbeat: storage capacity unavailable", &err);
             None
         }
+    }
+}
+
+/// A persistently broken backend must not emit a WARN every tick. Log on
+/// transition and then at most once a minute; callers reset on success.
+fn warn_throttled<E: std::fmt::Display>(last: &mut Option<Instant>, message: &str, err: &E) {
+    let now = Instant::now();
+    if last.is_none_or(|when| now.duration_since(when) >= Duration::from_secs(60)) {
+        tracing::warn!(error = %err, "{message}");
+        *last = Some(now);
     }
 }
 

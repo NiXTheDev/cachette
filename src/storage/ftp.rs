@@ -224,13 +224,28 @@ impl RemoteOps for FtpOps {
             control
                 .expect_command(&format!("RETR {}", self.object_path(id)?), 150)
                 .await?;
-            let mut buf = vec![0_u8; len as usize];
-            data.read_exact(&mut buf).await?;
+            let mut writer = FileWriter::new(path, offset, 0, Some(len))?;
+            // Stream in bounded chunks; never allocate the requested range.
+            let mut buf = [0_u8; 64 * 1024];
+            let mut remaining = len;
+            while remaining > 0 {
+                let want = buf.len().min(remaining as usize);
+                let read = data.read(&mut buf[..want]).await?;
+                if read == 0 {
+                    break;
+                }
+                writer.write(&buf[..read])?;
+                remaining -= read as u64;
+            }
             data.shutdown().await?;
             drop(data);
             control.expect(226, "transfer complete").await?;
-            let mut writer = FileWriter::new(path, offset, 0, Some(len))?;
-            writer.write(&buf)?;
+            if writer.written() != len {
+                return Err(io::Error::other(format!(
+                    "FTP ranged GET wrote {} of {len} bytes",
+                    writer.written()
+                )));
+            }
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -247,9 +262,16 @@ impl RemoteOps for FtpOps {
     fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let (mut control, _, _) = self.login().await?;
-            control
-                .expect_command(&format!("DELE {}", self.object_path(id)?), 250)
-                .await?;
+            let path = self.object_path(id)?;
+            let (code, text) = control.command(&format!("DELE {path}")).await?;
+            if code == 550 && text.to_ascii_lowercase().contains("not found") {
+                return Ok(()); // already gone; storage deletes are idempotent
+            }
+            if code != 250 {
+                return Err(io::Error::other(format!(
+                    "FTP DELE failed ({code}): {text}"
+                )));
+            }
             Ok(())
         })
     }

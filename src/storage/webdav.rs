@@ -169,6 +169,9 @@ impl RemoteOps for WebDavOps {
             if response.status == 404 {
                 return Ok(()); // already gone; storage deletes are idempotent
             }
+            if response.status == 404 {
+                return Ok(()); // already gone; storage deletes are idempotent
+            }
             if !response.is_ok() {
                 return Err(io::Error::other(format!(
                     "WebDAV DELETE failed ({}): {}",

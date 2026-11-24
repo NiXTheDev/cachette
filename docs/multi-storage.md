@@ -270,8 +270,9 @@ configured rules and its usage in the heartbeat. For each `(scope, target)`:
 
 1. a server's own configured rule always wins;
 2. otherwise the value with the most votes becomes the fallback — one vote
-   per server per target, with **abstention** meaning "no rule configured",
-   and ties meaning no consensus;
+   per server per target, with **abstention** meaning "no rule configured".
+   At least **two agreeing peers** are required; a lone vote or a tie means
+   no consensus, so one bad peer cannot impose a quota;
 3. otherwise no quota applies.
 
 A single configured server among abstainers sets the cluster value for that

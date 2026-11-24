@@ -244,6 +244,35 @@ impl RemoteOps for CopyPartyOps {
                     )));
                 }
             }
+            // u2c.py re-handshakes after the chunk POSTs so the server
+            // finalizes the file. An empty missing set confirms it is stored;
+            // 409 is the server's "already exists" success case.
+            let finalize = self
+                .client
+                .send(
+                    "POST",
+                    &self.config.url,
+                    headers,
+                    Body::Bytes(request.as_bytes()),
+                )
+                .await?;
+            if finalize.status == 409 {
+                return Ok(());
+            }
+            if !finalize.is_ok() {
+                return Err(io::Error::other(format!(
+                    "copyparty finalize handshake failed ({}): {}",
+                    finalize.status,
+                    finalize.text()
+                )));
+            }
+            if let Ok(reply) = serde_json::from_slice::<Handshake>(&finalize.body)
+                && !reply.hash.is_empty()
+            {
+                return Err(io::Error::other(
+                    "copyparty did not finalize the uploaded file",
+                ));
+            }
             Ok(())
         })
     }

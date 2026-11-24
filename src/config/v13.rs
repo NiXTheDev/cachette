@@ -1,6 +1,6 @@
-//! v1.3 config shape: new fields plus a load-time normalization of legacy
-//! v1.2 documents. Nothing here changes runtime behavior yet — the legacy
-//! fields remain authoritative until later slices wire the new ones in.
+//! v1.3 config shape and load-time normalization of legacy v1.2 documents.
+//! The new sections drive runtime behavior; legacy tables stay accepted and
+//! authoritative only where a v1.3 block was not supplied.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -10,8 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::config::min_free::MinFree;
 
-/// Storage instance kind. Only `fs` is implemented; others are rejected at
-/// parse time so a typo cannot silently fall back to a local root.
+/// Storage instance kind. Unknown values are rejected at parse time so a typo
+/// cannot silently fall back to a local root; see `capabilities_for` for what
+/// each implemented kind supports.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageKind {

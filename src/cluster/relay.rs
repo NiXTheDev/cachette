@@ -31,7 +31,9 @@
 //!   `GET /_internal/peers/find?key=&version=` concurrently, under a hard
 //!   [`FANOUT_TIMEOUT`] budget, and returns the owners that hold a match. A
 //!   peer that is dead (unreachable, TLS error, timeout) simply contributes no
-//!   hit — the caller treats it as a plain miss (never a hang).
+//!   hit — the caller treats it as a plain miss (never a hang). Self is
+//!   excluded from the fan-out, so callers must check local storage before
+//!   calling `find`; otherwise an entry published locally looks like a miss.
 //! * [`ClusterRelay::v2_reserve`] stages a v2 reservation on the chosen owner B
 //!   so the runner's direct upload to B succeeds; the A-minted capability URLs
 //!   then point at B's runner-visible base (its configured `external_url`, else
@@ -785,16 +787,19 @@ impl ClusterRelay {
     }
 
     fn session(&self, client_cache_id: &str) -> Option<RelaySession> {
-        let session = lock(&self.sessions).get(client_cache_id).cloned()?;
-        // RAM-light: a relayed session older than the reservation TTL is dead
-        // (the owner's reaper has reclaimed its reservation), so drop it lazily
-        // on access rather than scanning the whole map.
+        // Check the TTL and clone under one lock: two concurrent callers must
+        // not both see a live session and then race a mark_committed with the
+        // lazy removal below.
+        let mut sessions = lock(&self.sessions);
         let ttl = Duration::from_secs(self.reservation_ttl_seconds.max(1));
-        if session.created_at.elapsed() >= ttl {
-            lock(&self.sessions).remove(client_cache_id);
+        let expired = sessions
+            .get(client_cache_id)
+            .is_some_and(|session| session.created_at.elapsed() >= ttl);
+        if expired {
+            sessions.remove(client_cache_id);
             return None;
         }
-        Some(session)
+        sessions.get(client_cache_id).cloned()
     }
 
     fn session_target(

@@ -356,6 +356,10 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             match reaper.sweep_once(&sweep_storage).await {
                 Ok(report) => {
                     sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+                    sweep_metrics.record_gc(
+                        report.orphan_chunks_swept + report.chunk_temps_swept,
+                        report.reservations_reaped,
+                    );
                     if report.reservations_reaped > 0 {
                         sweep_metrics.add_reservations(-(report.reservations_reaped as i64));
                     }

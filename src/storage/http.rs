@@ -34,6 +34,10 @@ pub enum Body<'a> {
 /// Request headers as `(name, value)` pairs.
 pub type Headers<'a> = Vec<(&'a str, String)>;
 
+/// Whole-request budget (connect + TLS + headers + body). Large blob uploads
+/// are streamed, so five minutes is generous without being unbounded.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Parsed response head. `body` is a short prefix kept for error messages and
 /// JSON replies; large bodies go straight to a [`BodyWriter`].
 #[derive(Debug)]
@@ -211,8 +215,31 @@ impl HttpClient {
         self.send_to(method, url, headers, body, &mut out).await
     }
 
-    /// Send one request, streaming the response into `writer`.
+    /// Send one request, streaming the response into `writer`. Every phase —
+    /// connect, TLS handshake, headers and body — shares one wall-clock
+    /// budget, so a dead storage server cannot wedge a request handler.
     pub async fn send_to(
+        &self,
+        method: &'static str,
+        url: &str,
+        headers: Headers<'_>,
+        body: Body<'_>,
+        writer: &mut (dyn BodyWriter + Send),
+    ) -> io::Result<Response> {
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.send_inner(method, url, headers, body, writer),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("storage HTTP request timed out after {:?}", REQUEST_TIMEOUT),
+            )
+        })?
+    }
+
+    async fn send_inner(
         &self,
         method: &'static str,
         url: &str,

@@ -9,6 +9,13 @@ A v1.2 configuration keeps working unchanged: a bare `[auth] secret` still
 means one anonymous forge and the legacy namespace. Per-forge namespacing starts
 as soon as a forge block exists.
 
+> **Trust boundary:** the signed repository claim comes from the runner proxy
+> and is only as trustworthy as the forge-wide `hmac_secret`. Anyone holding
+> that secret can assert `owner/victim-repo` and land in that repo's namespace.
+> Isolation between **forges** is real; isolation between **repositories within
+> one forge** is not. Treat the secret as a forge-wide credential and use OIDC
+> claim pins when per-repo isolation matters.
+
 ## Configuration
 
 Blocks are keyed by the forge label and live under `[auth.forge]`:

@@ -107,15 +107,24 @@ impl AzureOps {
         let parsed = Url::parse(url)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
         let date = http_date();
-        let mut canonical = format!(
-            "{method}\n\n\n{}\n\n\n\n\n\n{}\n",
-            content_length.map_or_else(String::new, |n| n.to_string()),
-            range.unwrap_or_default()
-        );
+        let mut canonical = String::new();
+        canonical.push_str(method);
+        canonical.push('\n');
+        canonical.push('\n'); // Content-Encoding
+        canonical.push('\n'); // Content-Language
+        canonical.push_str(&content_length.map_or_else(String::new, |n| n.to_string()));
+        canonical.push('\n');
+        // Content-MD5, Content-Type, Date, If-Modified-Since, If-Match,
+        // If-None-Match, If-Unmodified-Since — seven empty standard fields.
+        for _ in 0..7 {
+            canonical.push('\n');
+        }
+        canonical.push_str(range.unwrap_or_default());
+        canonical.push('\n');
         if blob_type {
             canonical.push_str("x-ms-blob-type:BlockBlob\n");
         }
-        canonical.push_str(&format!("x-ms-date:{date}\nx-ms-version:2021-08-06\n\n"));
+        canonical.push_str(&format!("x-ms-date:{date}\nx-ms-version:2021-08-06\n"));
         // Virtual-host addressing omits the account from the URL path; the
         // canonical resource always carries it.
         let resource = if self.config.endpoint.is_some() {

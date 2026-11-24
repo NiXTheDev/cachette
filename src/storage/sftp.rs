@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
 use super::blob::{BoxFuture, RemoteOps};
@@ -176,18 +176,36 @@ impl RemoteOps for SftpOps {
                 quote(&temp.to_string_lossy())
             ))
             .await?;
-            let data = tokio::fs::read(&temp).await?;
-            let _ = tokio::fs::remove_file(&temp).await;
-            let end = (offset as usize)
-                .saturating_add(len as usize)
-                .min(data.len());
-            if offset as usize >= end || end - offset as usize != len as usize {
+            let mut source = tokio::fs::File::open(&temp).await?;
+            let size = source.metadata().await?.len();
+            if size < offset.saturating_add(len) {
+                drop(source);
+                let _ = tokio::fs::remove_file(&temp).await;
                 return Err(io::Error::other(format!(
                     "SFTP object {id} is shorter than the requested range"
                 )));
             }
+            source.seek(std::io::SeekFrom::Start(offset)).await?;
             let mut writer = FileWriter::new(path, offset, 0, Some(len))?;
-            writer.write(&data[offset as usize..end])?;
+            let mut buf = [0_u8; 64 * 1024];
+            let mut remaining = len;
+            while remaining > 0 {
+                let want = buf.len().min(remaining as usize);
+                let read = source.read(&mut buf[..want]).await?;
+                if read == 0 {
+                    break;
+                }
+                writer.write(&buf[..read])?;
+                remaining -= read as u64;
+            }
+            drop(source);
+            let _ = tokio::fs::remove_file(&temp).await;
+            if writer.written() != len {
+                return Err(io::Error::other(format!(
+                    "SFTP ranged GET wrote {} of {len} bytes",
+                    writer.written()
+                )));
+            }
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)

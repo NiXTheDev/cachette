@@ -85,6 +85,12 @@ pub struct Metrics {
     bytes_out: AtomicU64,
     /// Cache evictions performed by the reaper.
     evictions_total: AtomicU64,
+    /// Chunks and scratch files reclaimed by GC sweeps.
+    gc_chunks_swept_total: AtomicU64,
+    /// Reservations reaped by GC sweeps.
+    gc_reservations_reaped_total: AtomicU64,
+    /// Unix seconds of the last completed GC sweep (0 = never).
+    gc_last_run_unix: AtomicU64,
     /// Currently active reservations.
     reservations_active: AtomicU64,
     /// Bytes currently occupied in storage.
@@ -130,6 +136,9 @@ impl Metrics {
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             evictions_total: AtomicU64::new(0),
+            gc_chunks_swept_total: AtomicU64::new(0),
+            gc_reservations_reaped_total: AtomicU64::new(0),
+            gc_last_run_unix: AtomicU64::new(0),
             reservations_active: AtomicU64::new(0),
             storage_used_bytes: AtomicU64::new(0),
             draining: AtomicU64::new(0),
@@ -204,6 +213,29 @@ impl Metrics {
     /// Increment `evictions_total` (called by the reaper).
     pub fn inc_evictions(&self) {
         self.evictions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed GC sweep so a stopped sweeper is distinguishable
+    /// from a healthy one that simply found nothing.
+    pub fn record_gc(&self, chunks: u64, reservations: u64) {
+        self.gc_chunks_swept_total
+            .fetch_add(chunks, Ordering::Relaxed);
+        self.gc_reservations_reaped_total
+            .fetch_add(reservations, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.gc_last_run_unix.store(now, Ordering::Relaxed);
+    }
+
+    /// Unix timestamp of the last GC sweep, or `None` if none has run.
+    #[must_use]
+    pub fn gc_last_run(&self) -> Option<u64> {
+        match self.gc_last_run_unix.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
     }
 
     /// Adjust `reservations_active` by `delta` (`+1` reserve, `-1` release).
@@ -312,6 +344,23 @@ impl Metrics {
         out.push_str("# HELP cachette_evictions_total Total cache evictions.\n");
         out.push_str("# TYPE cachette_evictions_total counter\n");
         out.push_str(&format!("cachette_evictions_total {evictions}\n"));
+
+        let gc_chunks = self.gc_chunks_swept_total.load(Ordering::Relaxed);
+        let gc_reservations = self.gc_reservations_reaped_total.load(Ordering::Relaxed);
+        let gc_last = self.gc_last_run_unix.load(Ordering::Relaxed);
+        out.push_str("# HELP cachette_gc_chunks_swept_total Chunks reclaimed by GC sweeps.\n");
+        out.push_str("# TYPE cachette_gc_chunks_swept_total counter\n");
+        out.push_str(&format!("cachette_gc_chunks_swept_total {gc_chunks}\n"));
+        out.push_str("# HELP cachette_gc_reservations_reaped_total Reservations reaped by GC.\n");
+        out.push_str("# TYPE cachette_gc_reservations_reaped_total counter\n");
+        out.push_str(&format!(
+            "cachette_gc_reservations_reaped_total {gc_reservations}\n"
+        ));
+        out.push_str("# HELP cachette_gc_last_run_timestamp_seconds Unix time of last GC sweep.\n");
+        out.push_str("# TYPE cachette_gc_last_run_timestamp_seconds gauge\n");
+        out.push_str(&format!(
+            "cachette_gc_last_run_timestamp_seconds {gc_last}\n"
+        ));
 
         out.push_str("# HELP cachette_reservations_active Currently active reservations.\n");
         out.push_str("# TYPE cachette_reservations_active gauge\n");
@@ -433,6 +482,18 @@ mod tests {
         m.record_request("/weird", 418); // teapot not in CODES
         let text = m.render_prometheus();
         assert!(text.contains(r#"cachette_requests_total{route="other",code="other"} 1"#));
+    }
+
+    #[test]
+    fn gc_metrics_record_last_run_and_totals() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.gc_last_run(), None);
+        metrics.record_gc(7, 3);
+        assert!(metrics.gc_last_run().is_some());
+        let text = metrics.render_prometheus();
+        assert!(text.contains("cachette_gc_chunks_swept_total 7"));
+        assert!(text.contains("cachette_gc_reservations_reaped_total 3"));
+        assert!(text.contains("cachette_gc_last_run_timestamp_seconds "));
     }
 
     #[test]

@@ -26,6 +26,11 @@ impl ClusterQuota {
     /// on every target, not a vote against quotas.
     pub fn observe(&mut self, node: &str, votes: Vec<RuleVote>, usage: Vec<UsageReport>) {
         self.votes.insert(node.to_owned(), votes);
+        // A namespace the node stopped reporting must not linger forever in
+        // the usage map; drop this node's old reports before inserting fresh.
+        for reports in self.usage.values_mut() {
+            reports.remove(node);
+        }
         let now = Instant::now();
         for (instance, namespace, bytes) in usage {
             self.usage
@@ -43,7 +48,9 @@ impl ClusterQuota {
     }
 
     /// Plurality value for a `(scope, target)` across all voting peers. Ties
-    /// mean no consensus; abstentions are simply absent from the counts.
+    /// and a lone vote mean no consensus — one misconfigured peer must not be
+    /// able to impose an eviction quota on the cluster. Abstentions are absent
+    /// from the counts.
     #[must_use]
     pub fn consensus(&self, scope: &str, target: &str) -> Option<u64> {
         let mut counts: HashMap<u64, usize> = HashMap::new();
@@ -66,27 +73,7 @@ impl ClusterQuota {
                 tied = true;
             }
         }
-        if tied { None } else { winner }
-    }
-
-    /// Sum of fresh usage reports for `(instance, namespace)`, plus the local
-    /// value supplied by the caller. Reports older than `max_age` are ignored.
-    #[must_use]
-    pub fn global_usage(
-        &self,
-        instance: &str,
-        namespace: &str,
-        max_age: std::time::Duration,
-    ) -> u64 {
-        let Some(reports) = self.usage.get(&(instance.to_owned(), namespace.to_owned())) else {
-            return 0;
-        };
-        let now = Instant::now();
-        reports
-            .values()
-            .filter(|(_, when)| now.duration_since(*when) <= max_age)
-            .map(|(bytes, _)| *bytes)
-            .sum()
+        if tied || top < 2 { None } else { winner }
     }
 }
 
@@ -103,7 +90,7 @@ mod tests {
             vec![],
         );
         quota.observe("b", vec![], vec![]); // abstains
-        assert_eq!(quota.consensus("namespace", "team/*"), Some(100));
+        assert_eq!(quota.consensus("namespace", "team/*"), None); // one vote is not consensus
 
         quota.observe(
             "c",
@@ -121,20 +108,16 @@ mod tests {
     }
 
     #[test]
-    fn fresh_usage_is_summed_and_stale_is_ignored() {
+    fn observe_and_forget_replace_a_peer_without_leaking_its_votes() {
         let mut quota = ClusterQuota::default();
         quota.observe(
             "a",
+            vec![("namespace".into(), "team/*".into(), 100)],
             vec![],
-            vec![("default".into(), "forge|repo".into(), 40)],
         );
-        assert_eq!(
-            quota.global_usage("default", "forge|repo", std::time::Duration::from_secs(30)),
-            40
-        );
-        assert_eq!(
-            quota.global_usage("default", "forge|repo", std::time::Duration::ZERO),
-            0
-        );
+        quota.observe("b", vec![], vec![]);
+        assert_eq!(quota.consensus("namespace", "team/*"), None);
+        quota.forget("a");
+        assert_eq!(quota.consensus("namespace", "team/*"), None);
     }
 }

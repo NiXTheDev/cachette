@@ -181,6 +181,9 @@ pub struct CachedRemoteStore {
     ops: Arc<dyn RemoteOps>,
     /// Per-id lock so two concurrent range reads cannot write one cache file.
     locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Byte ranges known to be present in each cache file. Length alone is
+    /// not enough: a mid-file write leaves sparse zeros before its offset.
+    coverage: std::sync::Mutex<HashMap<String, Vec<(u64, u64)>>>,
 }
 
 impl CachedRemoteStore {
@@ -189,6 +192,7 @@ impl CachedRemoteStore {
         Self {
             ops,
             locks: RwLock::new(HashMap::new()),
+            coverage: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -201,6 +205,41 @@ impl CachedRemoteStore {
         }
         let mut locks = self.locks.write().await;
         Arc::clone(locks.entry(id.to_owned()).or_default())
+    }
+
+    fn covers(ranges: &[(u64, u64)], offset: u64, end: u64) -> bool {
+        ranges
+            .iter()
+            .any(|&(start, stop)| start <= offset && end <= stop)
+    }
+
+    fn record_covered(&self, id: &str, start: u64, end: u64) {
+        let mut all = self.coverage.lock().expect("coverage poisoned");
+        let ranges = all.entry(id.to_owned()).or_default();
+        ranges.retain(|&(from, to)| to < start || from > end);
+        ranges.push((start, end));
+        ranges.sort_unstable();
+    }
+
+    async fn forget(&self, id: &str) {
+        self.coverage.lock().expect("coverage poisoned").remove(id);
+        // Drop the per-id lock once no one holds or waits on it, so the hint
+        // map cannot grow with the number of objects ever fetched.
+        let removable = {
+            let locks = self.locks.read().await;
+            locks
+                .get(id)
+                .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        };
+        if removable {
+            let mut locks = self.locks.write().await;
+            if locks
+                .get(id)
+                .is_some_and(|lock| Arc::strong_count(lock) == 1)
+            {
+                locks.remove(id);
+            }
+        }
     }
 }
 
@@ -227,12 +266,15 @@ impl BlobStore for CachedRemoteStore {
 
     fn publish<'a>(&'a self, id: &'a str, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let lock = self.lock_for(id).await;
-            let _guard = lock.lock().await;
-            self.ops.put(id, path).await?;
-            // The remote object is authoritative now; keeping the local copy
-            // would double the footprint and make `du` misleading.
-            let _ = tokio::fs::remove_file(path).await;
+            {
+                let lock = self.lock_for(id).await;
+                let _guard = lock.lock().await;
+                self.ops.put(id, path).await?;
+                // The remote object is authoritative now; keeping the local
+                // copy would double the footprint and make `du` misleading.
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            self.forget(id).await;
             Ok(())
         })
     }
@@ -245,30 +287,46 @@ impl BlobStore for CachedRemoteStore {
         len: u64,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let cached = tokio::fs::metadata(path)
-                .await
-                .is_ok_and(|meta| meta.len() >= offset.saturating_add(len));
-            if cached {
+            let end = offset.saturating_add(len);
+            let covered = {
+                let all = self.coverage.lock().expect("coverage poisoned");
+                all.get(id)
+                    .is_some_and(|ranges| Self::covers(ranges, offset, end))
+            };
+            if covered {
                 return Ok(());
             }
             let lock = self.lock_for(id).await;
             let _guard = lock.lock().await;
             // Re-check under the lock: another waiter may have filled it.
-            if tokio::fs::metadata(path)
-                .await
-                .is_ok_and(|meta| meta.len() >= offset.saturating_add(len))
-            {
+            let covered = {
+                let all = self.coverage.lock().expect("coverage poisoned");
+                all.get(id)
+                    .is_some_and(|ranges| Self::covers(ranges, offset, end))
+            };
+            if covered {
                 return Ok(());
             }
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            self.ops.get_range(id, path, offset, len).await
+            // Always fill from byte 0 through `end`. A mid-file fetch would
+            // otherwise leave a sparse hole before `offset`, and a later
+            // earlier-range read would serve those zeros as real bytes.
+            // Coverage is in-memory only, so after a restart the prefix is
+            // downloaded again rather than trusting a stale cache file.
+            self.ops.get_range(id, path, 0, end).await?;
+            self.record_covered(id, 0, end);
+            Ok(())
         })
     }
 
     fn remove<'a>(&'a self, id: &'a str) -> BoxFuture<'a, io::Result<()>> {
-        self.ops.delete(id)
+        Box::pin(async move {
+            self.ops.delete(id).await?;
+            self.forget(id).await;
+            Ok(())
+        })
     }
 }
 
@@ -355,6 +413,92 @@ pub fn from_config(instance: &StorageInstanceConfig) -> io::Result<Arc<dyn BlobS
         })),
     };
     Ok(Arc::new(CachedRemoteStore::new(remote)))
+}
+
+#[cfg(test)]
+mod cache_coverage {
+    use super::*;
+    use crate::storage::http::{BodyWriter, FileWriter};
+
+    #[derive(Default)]
+    struct RecordingOps {
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl RemoteOps for RecordingOps {
+        fn name(&self) -> &'static str {
+            "recording-coverage"
+        }
+
+        fn put<'a>(&'a self, id: &'a str, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
+            let _ = (id, path);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_range<'a>(
+            &'a self,
+            id: &'a str,
+            path: &'a Path,
+            offset: u64,
+            len: u64,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            let _ = id;
+            self.calls.lock().expect("poisoned").push((offset, len));
+            let path = path.to_owned();
+            Box::pin(async move {
+                let mut writer = FileWriter::new(&path, offset, 0, Some(len))?;
+                let bytes = vec![b'x'; len as usize];
+                writer.write(&bytes)?;
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .await?;
+                if file.metadata().await?.len() < offset + len {
+                    file.set_len(offset + len).await?;
+                }
+                Ok(())
+            })
+        }
+
+        fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, io::Result<()>> {
+            let _ = id;
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_file_fetch_fills_from_zero_and_tracks_coverage() {
+        let ops = Arc::new(RecordingOps::default());
+        let store = CachedRemoteStore::new(ops.clone());
+        let dir = std::env::temp_dir().join(format!("cachette-coverage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("blob");
+        let _ = std::fs::remove_file(&path);
+
+        store
+            .fetch_range("id", &path, 10, 5)
+            .await
+            .expect("first fetch");
+        assert_eq!(*ops.calls.lock().expect("poisoned"), vec![(0, 15)]);
+
+        // An earlier range is covered by the prefix fetched above: no holes.
+        store
+            .fetch_range("id", &path, 0, 5)
+            .await
+            .expect("covered fetch");
+        assert_eq!(*ops.calls.lock().expect("poisoned"), vec![(0, 15)]);
+
+        // A later range extends the prefix rather than leaving a hole.
+        store
+            .fetch_range("id", &path, 20, 5)
+            .await
+            .expect("extended fetch");
+        assert_eq!(*ops.calls.lock().expect("poisoned"), vec![(0, 15), (0, 25)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
