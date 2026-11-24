@@ -6,6 +6,8 @@ All notable changes to cachette are documented here. The format follows [Keep a 
 
 *Stick it to the ceiling for all I care! It's storage-a-nanza baby!*
 
+**Release name: Storage-a-nanza.**
+
 v1.3 turns one cache into a storage plane. Several named instances sit behind one control database, namespaces route to them, and the backends advertise what they can do instead of pretending every store is a local disk.
 
 ### Added
