@@ -21,7 +21,7 @@ section="$(awk -v v="$version" '
   $0 ~ "^## \\[" v "\\]" { found = 1; next }
   found && /^## \[/ { exit }
   found { print }
-' "$changelog")"
+' "$changelog" | tr -d '\r')"
 
 if [[ -z "$section" ]]; then
   echo "release-body.sh: no CHANGELOG section for $version" >&2
@@ -29,10 +29,12 @@ if [[ -z "$section" ]]; then
 fi
 
 tagline="$(printf '%s\n' "$section" | sed -n 's/^\*\([^*]*\)\*$/\1/p' | head -n1)"
+release_name="$(printf '%s\n' "$section" | sed -n 's/^\*\*Release name: \(.*\)\*\*$/\1/p' | head -n1)"
 
 lead="$(printf '%s\n' "$section" | awk '
   /^### / { exit }
   /^\*[^*]*\*$/ { next }
+  /^\*\*Release name:/ { next }
   /^$/ { next }
   { lead = lead (lead == "" ? "" : "\n") $0 }
   END { print lead }
@@ -53,7 +55,7 @@ upgrading="$(printf '%s\n' "$section" | awk '
   END { print up }
 ')"
 
-awk -v tag="$tagline" -v lead="$lead" -v notes="$notes" -v up="$upgrading" -v ver="$version" '
+awk -v name="$release_name" -v tag="$tagline" -v lead="$lead" -v notes="$notes" -v up="$upgrading" -v ver="$version" '
 function prefix(text, p,   n, arr, i, out) {
   if (text == "") return ""
   n = split(text, arr, "\n")
@@ -67,7 +69,9 @@ function replace(line, ph, val,   pos) {
 }
 {
   if (tag == "" && index($0, "{{TAGLINE}}") > 0) next
+  if (name == "" && index($0, "{{RELEASE_NAME}}") > 0) next
   line = $0
+  line = replace(line, "{{RELEASE_NAME}}", "# " name)
   line = replace(line, "{{TAGLINE}}", tag)
   line = replace(line, "{{LEAD}}", prefix(lead, "> "))
   line = replace(line, "{{NOTES}}", prefix(notes, "> "))
