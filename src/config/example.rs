@@ -305,7 +305,7 @@ pub static SECTIONS: &[Section] = &[
                 key: "type",
                 default: "\"fs\"",
                 form: Form::Required,
-                comment: "fs | s3 | webdav | copyparty",
+                comment: "fs | s3 | webdav | copyparty | azure | ftp | sftp",
             },
             Field {
                 key: "path",
@@ -341,7 +341,7 @@ pub static SECTIONS: &[Section] = &[
                 key: "url",
                 default: "\"https://copyparty.example.org/cachette/\"",
                 form: Form::Optional,
-                comment: "required for type = \"webdav\" and type = \"copyparty\"",
+                comment: "endpoint for webdav/copyparty/ftp/sftp instances",
             },
             Field {
                 key: "prefix",
@@ -384,6 +384,24 @@ pub static SECTIONS: &[Section] = &[
                 default: "\"hunter2\"",
                 form: Form::Optional,
                 comment: "copyparty file-ID salt (must match server --wsalt)",
+            },
+            Field {
+                key: "account",
+                default: "\"cachetteaccount\"",
+                form: Form::Optional,
+                comment: "Azure storage account (env AZURE_STORAGE_ACCOUNT wins)",
+            },
+            Field {
+                key: "container",
+                default: "\"cachette\"",
+                form: Form::Optional,
+                comment: "Azure blob container",
+            },
+            Field {
+                key: "private_key_file",
+                default: "\"/etc/cachette/id_sftp\"",
+                form: Form::Optional,
+                comment: "SSH key for type = \"sftp\" (agent/key auth only)",
             },
         ],
     },

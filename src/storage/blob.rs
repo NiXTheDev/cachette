@@ -56,7 +56,12 @@ impl Capabilities {
 pub const fn capabilities_for(kind: StorageKind) -> Capabilities {
     match kind {
         StorageKind::Fs => Capabilities::FS,
-        StorageKind::S3 | StorageKind::WebDav | StorageKind::CopyParty => Capabilities::REMOTE,
+        StorageKind::S3
+        | StorageKind::WebDav
+        | StorageKind::CopyParty
+        | StorageKind::Azure
+        | StorageKind::Ftp
+        | StorageKind::Sftp => Capabilities::REMOTE,
     }
 }
 
@@ -312,14 +317,14 @@ pub fn from_config(instance: &StorageInstanceConfig) -> io::Result<Arc<dyn BlobS
             super::webdav::WebDavConfig {
                 url: remote_url(instance.url.as_deref().unwrap_or_default()),
                 username: instance.username.clone(),
-                password,
+                password: password.clone(),
             },
             ca_pem,
         )?),
         StorageKind::CopyParty => Arc::new(super::copyparty::CopyPartyOps::new(
             super::copyparty::CopyPartyConfig {
                 url: remote_url(instance.url.as_deref().unwrap_or_default()),
-                password,
+                password: password.clone(),
                 username: instance.username.clone(),
                 wsalt: instance
                     .wsalt
@@ -328,6 +333,26 @@ pub fn from_config(instance: &StorageInstanceConfig) -> io::Result<Arc<dyn BlobS
             },
             ca_pem,
         )?),
+        StorageKind::Azure => Arc::new(super::azure::AzureOps::new(
+            super::azure::AzureConfig {
+                account: instance.account.clone().unwrap_or_default(),
+                container: instance.container.clone().unwrap_or_default(),
+                endpoint: instance.endpoint.clone(),
+                prefix: instance.prefix.clone(),
+                key: instance.access_key.clone().unwrap_or_default(),
+            },
+            ca_pem,
+        )?),
+        StorageKind::Ftp => Arc::new(super::ftp::FtpOps::new(super::ftp::FtpConfig {
+            url: remote_url(instance.url.as_deref().unwrap_or_default()),
+            username: instance.username.clone(),
+            password: password.clone(),
+        })),
+        StorageKind::Sftp => Arc::new(super::sftp::SftpOps::new(super::sftp::SftpConfig {
+            url: remote_url(instance.url.as_deref().unwrap_or_default()),
+            username: instance.username.clone(),
+            private_key_file: instance.private_key_file.clone(),
+        })),
     };
     Ok(Arc::new(CachedRemoteStore::new(remote)))
 }

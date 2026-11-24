@@ -100,10 +100,16 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
             StorageKind::S3 if instance.bucket.as_deref().is_none_or(str::is_empty) => {
                 Some("bucket")
             }
-            StorageKind::WebDav | StorageKind::CopyParty
+            StorageKind::WebDav | StorageKind::CopyParty | StorageKind::Ftp | StorageKind::Sftp
                 if instance.url.as_deref().is_none_or(str::is_empty) =>
             {
                 Some("url")
+            }
+            StorageKind::Azure if instance.account.as_deref().is_none_or(str::is_empty) => {
+                Some("account")
+            }
+            StorageKind::Azure if instance.container.as_deref().is_none_or(str::is_empty) => {
+                Some("container")
             }
             _ => None,
         };
@@ -121,7 +127,8 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
                 .endpoint
                 .as_deref()
                 .is_some_and(|url| url.starts_with("https://"))
-            || (instance.kind == StorageKind::S3 && instance.endpoint.is_none());
+            || ((instance.kind == StorageKind::S3 || instance.kind == StorageKind::Azure)
+                && instance.endpoint.is_none());
         if uses_https && instance.ca_pem.is_none() {
             return Err(ConfigError::InSection {
                 section: String::from("storage.instances"),
@@ -1153,6 +1160,28 @@ mod tests {
             validate(&config),
             Err(ConfigError::StorageRouteTarget { .. })
         ));
+    }
+
+    #[test]
+    fn v13_new_remote_kinds_need_their_own_fields() {
+        use crate::config::StorageKind;
+
+        for (kind, field) in [
+            (StorageKind::Azure, "account"),
+            (StorageKind::Ftp, "url"),
+            (StorageKind::Sftp, "url"),
+        ] {
+            let mut config = Config::default();
+            config.storage.instances = vec![StorageInstanceConfig {
+                kind,
+                ..StorageInstanceConfig::default()
+            }];
+            let err = validate(&config).expect_err("missing required field");
+            assert!(
+                err.to_string().contains(field),
+                "expected a message naming {field}, got {err}"
+            );
+        }
     }
 
     #[test]

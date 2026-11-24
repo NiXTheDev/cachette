@@ -54,13 +54,13 @@ enabled = false # content-defined chunking
 
 [[storage.instances]]
 name = "default" # routing target; repeat this block for more instances
-type = "fs" # fs | s3 | webdav | copyparty
+type = "fs" # fs | s3 | webdav | copyparty | azure | ftp | sftp
 path = "/var/lib/cachette" # local root (also the mount point for mounted SMB/NFS/WebDAV)
 # mount_url = "//nas.example.org/cache" # documentation only: what is mounted at path
 # bucket = "cachette" # required for type = "s3"
 # region = "us-east-1" # S3 region
 # endpoint = "https://minio.example.org:9000" # custom S3 endpoint (path-style addressing)
-# url = "https://copyparty.example.org/cachette/" # required for type = "webdav" and type = "copyparty"
+# url = "https://copyparty.example.org/cachette/" # endpoint for webdav/copyparty/ftp/sftp instances
 # prefix = "blobs" # key prefix inside the remote store
 # username = "cachette" # remote username / basic auth
 # password_file = "/etc/cachette/remote.password" # file holding the remote password or copyparty PW header
@@ -68,6 +68,9 @@ path = "/var/lib/cachette" # local root (also the mount point for mounted SMB/NF
 # access_key = "CHANGE_ME" # S3 access key fallback (AWS_ACCESS_KEY_ID wins)
 # secret_key = "CHANGE_ME" # S3 secret key fallback (AWS_SECRET_ACCESS_KEY wins)
 # wsalt = "hunter2" # copyparty file-ID salt (must match server --wsalt)
+# account = "cachetteaccount" # Azure storage account (env AZURE_STORAGE_ACCOUNT wins)
+# container = "cachette" # Azure blob container
+# private_key_file = "/etc/cachette/id_sftp" # SSH key for type = "sftp" (agent/key auth only)
 
 [[quota]]
 scope = "namespace" # namespace | instance

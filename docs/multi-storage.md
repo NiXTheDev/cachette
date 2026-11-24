@@ -127,6 +127,9 @@ go through a payload store, chosen by `type`:
 | `s3` | one bucket, keys under `prefix/{id}` | no | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, config fallback |
 | `webdav` | `url/prefix/{id}` over PUT/GET/DELETE | no | optional `username` + `password_file` |
 | `copyparty` | `url/prefix/{id}` via up2k | no | optional `username` + `password_file` (the `PW` header) |
+| `azure` | one container, blobs under `prefix/{id}` | no | `AZURE_STORAGE_ACCOUNT`/`AZURE_STORAGE_KEY`, config fallback |
+| `ftp` | `ftp://host/base/prefix/{id}`, passive mode | no | optional `username` + `password_file` |
+| `sftp` | `sftp://host/base/prefix/{id}` via the system `sftp` client | no | SSH key or agent (`private_key_file`) |
 
 **fs** needs nothing beyond a writable root. Mounted network filesystems are
 ordinary `fs` instances: `mount_url` records what is mounted at `path` so
@@ -154,9 +157,26 @@ the server, so cachette keeps its own local CDC manifests while treating the
 copyparty copy as one blob. Set `wsalt` to the server's `--wsalt` when file
 IDs matter.
 
-All three remote stores require `ca_pem` for `https` endpoints: the same
-explicit-trust posture as OIDC's `jwks_ca_pem`. Config secrets are masked in
-`--print-config`.
+**Azure Blob** signs requests in-process with Shared Key (HMAC-SHA256 over the
+canonical request). One container holds the instance's blobs under a key
+prefix. Environment credentials win over `account`/`access_key` in the config;
+a custom `endpoint` selects an emulator such as Azurite with path-style
+addressing.
+
+**FTP** is a plain passive-mode client (`USER`/`PASS`/`TYPE I`/`PASV`/`STOR`/
+`RETR`/`DELE`). Ranged reads use `REST <offset>`; servers without `REST` are
+reported rather than silently downloading the wrong bytes. FTPS is not
+implemented — mount an FTPS endpoint through rclone and use an `fs` instance.
+
+**SFTP** uses the system `sftp` client in batch mode with `BatchMode=yes`, so
+only key/agent authentication is supported (`private_key_file` is passed as
+`-i`). Each operation is one short-lived process, and a ranged read downloads
+the object to a temporary file before slicing it. For high-traffic caches,
+mount the remote filesystem (sshfs/rclone) and use an `fs` instance instead.
+
+All remote stores require `ca_pem` for `https` endpoints (and Azure's default
+public endpoint is https): the same explicit-trust posture as OIDC's
+`jwks_ca_pem`. Config secrets are masked in `--print-config`.
 
 ### Capabilities and the adapter seam
 

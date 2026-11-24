@@ -33,14 +33,17 @@ use tokio::sync::RwLock;
 
 use crate::config::KeyCase;
 
+pub mod azure;
 pub mod blob;
 pub mod cdc;
 pub mod copyparty;
 pub mod digest;
 pub mod eviction;
 pub mod fs;
+pub mod ftp;
 pub mod http;
 pub mod s3;
+pub mod sftp;
 pub mod webdav;
 
 /// Boxed future used by [`StorageBackend`] so the trait stays

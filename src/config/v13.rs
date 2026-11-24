@@ -20,6 +20,9 @@ pub enum StorageKind {
     S3,
     WebDav,
     CopyParty,
+    Azure,
+    Ftp,
+    Sftp,
 }
 
 /// One `[[storage]]` instance.
@@ -48,10 +51,16 @@ pub struct StorageInstanceConfig {
     pub prefix: Option<String>,
     /// TLS trust bundle for https remote endpoints. Required for https.
     pub ca_pem: Option<PathBuf>,
-    /// S3 credentials (env wins). Copyparty file-ID salt (server `--wsalt`).
+    /// S3 credentials (env wins). Azure account key fallback.
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+    /// Copyparty file-ID salt (server `--wsalt`).
     pub wsalt: Option<String>,
+    /// Azure storage account and container.
+    pub account: Option<String>,
+    pub container: Option<String>,
+    /// SSH private key for `type = "sftp"` (agent/key auth; no password auth).
+    pub private_key_file: Option<PathBuf>,
 }
 
 impl Default for StorageInstanceConfig {
@@ -73,6 +82,9 @@ impl Default for StorageInstanceConfig {
             access_key: None,
             secret_key: None,
             wsalt: None,
+            account: None,
+            container: None,
+            private_key_file: None,
         }
     }
 }
