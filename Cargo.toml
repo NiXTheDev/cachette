@@ -5,27 +5,27 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-aws-lc-rs = "^1.18.2"
-axum = "^0.8.9"
+aws-lc-rs = "^1.18"
+axum = "^0.8"
 base64 = "^0.23"
-blake3 = "^1.8.7"
-clap = { version = "^4.6.7", features = ["derive"] }
-fs2 = "^0.4.3"
-hmac = "^0.13.0"
-mdns-sd = "^0.22.0"
+blake3 = "^1.8"
+clap = { version = "^4.6", features = ["derive"] }
+fs2 = "^0.4"
+hmac = "^0.13"
+mdns-sd = "^0.22"
 rcgen = { version = "^0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rusqlite = { version = "^0.43", features = ["bundled"] }
 rustls = "^0.23"
-rustls-pemfile = "^2.2.0"
-serde = { version = "^1.0.229", features = ["derive"] }
-serde_json = "^1.0.151"
-sha2 = "^0.11.0"
+rustls-pemfile = "^2.2"
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = "^1.0"
+sha2 = "^0.11"
 thiserror = "^2"
-tokio = { version = "^1.53.2", features = ["full"] }
+tokio = { version = "^1.53", features = ["full"] }
 tokio-rustls = "^0.26"
 toml = "^1"
-tower = "^0.5.3"
+tower = "^0.5"
 tower-http = { version = "^0.7", features = ["trace", "catch-panic"] }
-tracing = "^0.1.44"
-tracing-subscriber = { version = "^0.3.23", features = ["env-filter", "json"] }
-url = "^2.5.8"
+tracing = "^0.1"
+tracing-subscriber = { version = "^0.3", features = ["env-filter", "json"] }
+url = "^2.5"

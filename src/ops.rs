@@ -135,13 +135,15 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
                 let_me_edit,
                 ack_caution,
                 confirm,
-            }) => block_on(migrate::full(
-                file,
-                *let_me_edit,
-                *ack_caution,
-                confirm,
-                config,
-            )),
+            }) => locked_migrate(config, || {
+                block_on(migrate::full(
+                    file,
+                    *let_me_edit,
+                    *ack_caution,
+                    confirm,
+                    config,
+                ))
+            }),
             Some(DoctorCommand::MigrateConfig {
                 file,
                 write,
@@ -149,28 +151,30 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
             }) => block_on(migrate::config_only(file, *write, *ack_caution)),
         },
         Command::State { action } => match action {
-            StateCommand::Migrate { from, to, confirm } => {
+            StateCommand::Migrate { from, to, confirm } => locked_migrate(config, || {
                 block_on(migrate::state_copy(from, to, confirm.as_deref()))
-            }
-            StateCommand::Restore { archive, to, force } => {
+            }),
+            StateCommand::Restore { archive, to, force } => locked_migrate(config, || {
                 block_on(migrate::state_restore(archive, to, *force))
-            }
-            StateCommand::Layout { confirm } => {
+            }),
+            StateCommand::Layout { confirm } => locked_migrate(config, || {
                 block_on(migrate::layout(config, confirm.as_deref()))
-            }
+            }),
             StateCommand::Retag {
                 retag,
                 file,
                 confirm,
-            } => block_on(migrate::retag(
-                config,
-                retag,
-                file.as_deref(),
-                confirm.as_deref(),
-            )),
-            StateCommand::DeleteSource { backup, confirm } => {
+            } => locked_migrate(config, || {
+                block_on(migrate::retag(
+                    config,
+                    retag,
+                    file.as_deref(),
+                    confirm.as_deref(),
+                ))
+            }),
+            StateCommand::DeleteSource { backup, confirm } => locked_migrate(config, || {
                 block_on(migrate::delete_source(backup, confirm.as_deref()))
-            }
+            }),
         },
         Command::Config { action } => match action {
             ConfigCommand::Example => {
@@ -187,14 +191,25 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
 /// control DB. All instances share the DB; only the payload root differs.
 fn open_named_storage(config: &Config, name: Option<&str>) -> io::Result<FsStorage> {
     let name = name.unwrap_or("default");
-    let root = config
+    let instance = config
         .storage
         .instances
         .iter()
         .find(|instance| instance.name == name)
-        .map(|instance| instance.path.clone())
-        .unwrap_or_else(|| config.storage.fs.path.clone());
-    FsStorage::open_cdc_with_db(root, &config.data_path, None)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown storage instance {name:?}"),
+            )
+        })?;
+    let blob = crate::storage::blob::from_config(instance)?;
+    FsStorage::open_instance_with_store(
+        &instance.path,
+        &config.data_path,
+        None,
+        blob,
+        instance.name.clone(),
+    )
 }
 
 /// Build a small current-thread runtime for the async ops bodies (the server's
@@ -231,6 +246,20 @@ fn identity(action: Option<&IdentityCommand>, config: &Config) -> Result<i32, Bo
 
 /// Acquire the data-dir lock or return the exit code to use. The error is
 /// printed here so every caller gets the same clear message.
+/// Offline migration commands mutate or copy the live SQLite index. They must
+/// hold the same exclusive data-dir lock as `verify`/`cache`/`gc`, otherwise a
+/// running server can write mid-copy and leave torn accounting.
+fn locked_migrate(
+    config: &Config,
+    action: impl FnOnce() -> Result<i32, Box<dyn Error>>,
+) -> Result<i32, Box<dyn Error>> {
+    let _lock = match acquire(&config.state_dir()) {
+        Ok(lock) => lock,
+        Err(code) => return Ok(code),
+    };
+    action()
+}
+
 fn acquire(dir: &Path) -> Result<DataDirLock, i32> {
     DataDirLock::acquire(dir).map_err(|err| {
         eprintln!("cachette: {err}");

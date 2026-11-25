@@ -45,18 +45,35 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(copied)
 }
 
-fn manifest_for(files: &[PathBuf], root: &Path) -> String {
+fn manifest_for(files: &[PathBuf], root: &Path) -> Result<String, Box<dyn Error>> {
     let mut lines = Vec::new();
     let mut sorted: Vec<&PathBuf> = files.iter().collect();
     sorted.sort();
     for file in sorted {
-        let Ok(rel) = file.strip_prefix(root) else {
-            continue;
-        };
-        let Ok(hash) = hash_file(file) else { continue };
+        let rel = file
+            .strip_prefix(root)
+            .map_err(|_| format!("file outside snapshot root: {}", file.display()))?;
+        // An unreadable/corrupt source must fail the snapshot, not silently
+        // drop out of its manifest and still "verify" successfully.
+        let hash = hash_file(file)?;
         lines.push(format!("{}  {}", hash, rel.display()));
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
+}
+
+/// Verify a directory copy file by file against its source, not just the
+/// snapshot taken before the copy.
+fn verify_copy(from: &Path, to: &Path, copied: &[PathBuf]) -> Result<(), Box<dyn Error>> {
+    for dst in copied {
+        let rel = dst
+            .strip_prefix(to)
+            .map_err(|_| format!("copied file outside destination: {}", dst.display()))?;
+        let src = from.join(rel);
+        if hash_file(&src)? != hash_file(dst)? {
+            return Err(format!("copy verification failed for {}", rel.display()).into());
+        }
+    }
+    Ok(())
 }
 
 /// Verified snapshot: a sibling directory copy plus a BLAKE3 manifest.
@@ -68,7 +85,7 @@ fn snapshot(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("state");
     let archive = parent.join(format!("{name}.{}.snapshot", now_tag()));
     let files = copy_tree(dir, &archive)?;
-    let manifest = manifest_for(&files, &archive);
+    let manifest = manifest_for(&files, &archive)?;
     fs::write(archive.join(MANIFEST), manifest)?;
     // Verify by recomputing every hash from the archive itself.
     let reread = fs::read_to_string(archive.join(MANIFEST))?;
@@ -167,6 +184,12 @@ pub async fn full(
     if backup.exists() {
         return Err(format!("refusing to overwrite existing backup {}", backup.display()).into());
     }
+    // Snapshot state BEFORE touching the config: the old config is the only
+    // description of where that state lives.
+    let old_dir = _config.state_dir();
+    let archive = snapshot(&old_dir)?;
+    println!("state snapshot verified: {}", archive.display());
+
     fs::copy(path, &backup)?;
     fs::write(path, &rendered)?;
     println!("config written in place; backup: {}", backup.display());
@@ -181,14 +204,12 @@ pub async fn full(
     }
 
     let migrated = config::load(Some(path.to_path_buf()))?;
-    let old_dir = _config.state_dir();
     let new_dir = migrated.state_dir();
-    let archive = snapshot(&old_dir)?;
-    println!("state snapshot verified: {}", archive.display());
     if old_dir != new_dir {
         let copied = copy_tree(&old_dir, &new_dir)?;
+        verify_copy(&old_dir, &new_dir, &copied)?;
         println!(
-            "control plane copied: {} files -> {}",
+            "control plane copied and verified: {} files -> {}",
             copied.len(),
             new_dir.display()
         );
@@ -205,6 +226,7 @@ pub async fn state_copy(
     confirm("migrate-state", supplied)?;
     let archive = snapshot(from)?;
     let copied = copy_tree(from, to)?;
+    verify_copy(from, to, &copied)?;
     println!("snapshot: {}", archive.display());
     println!("copied {} files to {}", copied.len(), to.display());
     Ok(0)

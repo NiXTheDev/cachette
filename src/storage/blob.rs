@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::config::{StorageInstanceConfig, StorageKind};
 
@@ -93,6 +93,12 @@ pub trait BlobStore: Send + Sync {
         offset: u64,
         len: u64,
     ) -> BoxFuture<'a, io::Result<()>>;
+
+    /// Drop idle per-object hint state. Remote stores use this to keep their
+    /// lock map from growing with every object ever fetched.
+    fn sweep_locks(&self) -> u64 {
+        0
+    }
 
     /// Remove the authoritative copy (the local cache file is removed by the
     /// caller). No-op for local stores.
@@ -180,7 +186,7 @@ pub trait RemoteOps: Send + Sync {
 pub struct CachedRemoteStore {
     ops: Arc<dyn RemoteOps>,
     /// Per-id lock so two concurrent range reads cannot write one cache file.
-    locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    locks: std::sync::RwLock<HashMap<String, Arc<Mutex<()>>>>,
     /// Byte ranges known to be present in each cache file. Length alone is
     /// not enough: a mid-file write leaves sparse zeros before its offset.
     coverage: std::sync::Mutex<HashMap<String, Vec<(u64, u64)>>>,
@@ -191,19 +197,19 @@ impl CachedRemoteStore {
     pub fn new(ops: Arc<dyn RemoteOps>) -> Self {
         Self {
             ops,
-            locks: RwLock::new(HashMap::new()),
+            locks: std::sync::RwLock::new(HashMap::new()),
             coverage: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    async fn lock_for(&self, id: &str) -> Arc<Mutex<()>> {
+    fn lock_for(&self, id: &str) -> Arc<Mutex<()>> {
         {
-            let locks = self.locks.read().await;
+            let locks = self.locks.read().expect("lock map poisoned");
             if let Some(lock) = locks.get(id) {
                 return Arc::clone(lock);
             }
         }
-        let mut locks = self.locks.write().await;
+        let mut locks = self.locks.write().expect("lock map poisoned");
         Arc::clone(locks.entry(id.to_owned()).or_default())
     }
 
@@ -226,13 +232,13 @@ impl CachedRemoteStore {
         // Drop the per-id lock once no one holds or waits on it, so the hint
         // map cannot grow with the number of objects ever fetched.
         let removable = {
-            let locks = self.locks.read().await;
+            let locks = self.locks.read().expect("lock map poisoned");
             locks
                 .get(id)
                 .is_some_and(|lock| Arc::strong_count(lock) == 1)
         };
         if removable {
-            let mut locks = self.locks.write().await;
+            let mut locks = self.locks.write().expect("lock map poisoned");
             if locks
                 .get(id)
                 .is_some_and(|lock| Arc::strong_count(lock) == 1)
@@ -267,7 +273,7 @@ impl BlobStore for CachedRemoteStore {
     fn publish<'a>(&'a self, id: &'a str, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             {
-                let lock = self.lock_for(id).await;
+                let lock = self.lock_for(id);
                 let _guard = lock.lock().await;
                 self.ops.put(id, path).await?;
                 // The remote object is authoritative now; keeping the local
@@ -296,7 +302,7 @@ impl BlobStore for CachedRemoteStore {
             if covered {
                 return Ok(());
             }
-            let lock = self.lock_for(id).await;
+            let lock = self.lock_for(id);
             let _guard = lock.lock().await;
             // Re-check under the lock: another waiter may have filled it.
             let covered = {
@@ -319,6 +325,13 @@ impl BlobStore for CachedRemoteStore {
             self.record_covered(id, 0, end);
             Ok(())
         })
+    }
+
+    fn sweep_locks(&self) -> u64 {
+        let mut locks = self.locks.write().expect("lock map poisoned");
+        let before = locks.len();
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        (before - locks.len()) as u64
     }
 
     fn remove<'a>(&'a self, id: &'a str) -> BoxFuture<'a, io::Result<()>> {

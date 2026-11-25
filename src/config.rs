@@ -195,6 +195,14 @@ pub fn load(cli_config: Option<PathBuf>) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+/// Runtime quota rules: the legacy table plus the v1.3 `[[quota]]` rules.
+/// Both forms are validated at load time, so this only merges them.
+pub fn runtime_quotas(config: &Config) -> Result<Quotas, ConfigError> {
+    let mut quotas = config.storage.quotas.parse()?;
+    quotas.apply_v13(&config.quota)?;
+    Ok(quotas)
+}
+
 /// Pure loader core: TOML text + env pairs in, resolved `Config` out.
 /// Injecting env pairs (instead of reading the process environment) keeps
 /// the unit tests race-free.

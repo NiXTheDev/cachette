@@ -77,8 +77,10 @@ limit = "5GiB"
 Rules:
 
 - `[storage.fs].min_free` is the default free-space floor. An instance's
-  `min_free` overrides it; `server.max_size` accepts bytesize strings as well
-  as raw integers.
+  `min_free` overrides it for that instance's **eviction sweep**;
+  reserve-time admission still uses the server-wide floor, and heartbeat
+  capacity advertising reports the default instance. `server.max_size`
+  accepts bytesize strings as well as raw integers.
 - Every instance has a stable `name`; the legacy instance is `default`.
 - `[storage.namespaces]` keeps its meaning from the multi-tenant model:
   identity → namespace name. `[storage.routes]` then maps the **resolved
@@ -250,11 +252,13 @@ moves on upgrade. A `data_path` that equals or contains a storage root logs a
 warning — state and payloads in one tree make `du` misleading and let a sweep
 reach state. The legacy case is the expected exception.
 
-The control database has an `instance` column (schema v4): key derivation is
-`hash(instance || namespace || key)`, accounting is keyed by `(instance,
-namespace)`, and all pre-v1.3 rows belong to `default`. One server owns one
-database; peers never share a database file or connection. Moving an existing
-state directory is an offline operation, never an automatic copy at boot.
+One server owns one control database; peers never share a file or connection.
+Named instances are isolated inside it by derivation: their entry ids hash the
+instance together with the namespace and key, and their accounting/chunk rows
+use an instance-prefixed namespace key. The legacy `default` instance keeps the
+v1.1/v1.2 derivation verbatim, so pre-v1.3 rows stay reachable without a
+rewrite. Moving an existing state directory is an offline operation, never an
+automatic copy at boot.
 
 ## Quotas
 

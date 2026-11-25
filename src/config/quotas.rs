@@ -114,6 +114,40 @@ impl Quotas {
         })
     }
 
+    /// Apply v1.3 `[[quota]]` namespace rules on top of the legacy table.
+    /// Instance-scoped rules are parsed and validated but still need a
+    /// per-instance eviction pass; they are deliberately ignored here rather
+    /// than misapplied to a namespace of the same name.
+    pub fn apply_v13(
+        &mut self,
+        rules: &[crate::config::QuotaRuleConfig],
+    ) -> Result<(), ConfigError> {
+        for rule in rules {
+            if rule.scope != crate::config::QuotaScope::Namespace {
+                continue;
+            }
+            let limit = parse_limit(&rule.target, &rule.limit)?;
+            if rule.target == "*" || rule.target == "default" {
+                self.default = Some(limit);
+            } else if let Some(existing) = self
+                .rules
+                .iter_mut()
+                .find(|existing| existing.key == rule.target)
+            {
+                existing.limit = limit;
+                existing.pattern = parse_pattern(&rule.target)?;
+            } else {
+                self.rules.push(Rule {
+                    key: rule.target.clone(),
+                    limit,
+                    pattern: parse_pattern(&rule.target)?,
+                });
+            }
+        }
+        self.rules.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(())
+    }
+
     /// Whether any quota is configured (a present table always has a
     /// `default`).
     #[must_use]

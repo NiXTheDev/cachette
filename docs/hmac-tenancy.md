@@ -54,6 +54,10 @@ Rules:
 - The block key is the forge identity used by `[storage.namespaces]` and
   `[storage.routes]`, whichever plane authenticated the request. Keep it
   stable: renaming a block changes the derived namespace.
+- `hmac_secret` is a **forge-wide** credential. Its signed repo field is
+  client-asserted: any holder can claim `owner/victim-repo`. Treat the
+  namespace as forge-scoped unless you use OIDC claim pins for per-repo
+  isolation.
 - `oidc_issuer` is required if any `oidc_*` key is present. The label is a
   human name, not the issuer, so `iss` is still matched byte-exactly.
 - Each block needs at least one plane. Public forges that cannot share our

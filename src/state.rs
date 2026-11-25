@@ -513,7 +513,7 @@ impl AppState {
         self.set_cache_limits(CacheLimits::from_config(config));
         self.set_routes(config.storage.routes.clone().into_iter().collect());
         // Validation at load time guarantees the rules parse.
-        if let Ok(quotas) = config.storage.quotas.parse() {
+        if let Ok(quotas) = crate::config::runtime_quotas(config) {
             self.set_quotas(quotas);
         }
         let reloaded_signature = config

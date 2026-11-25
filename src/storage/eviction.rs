@@ -570,6 +570,8 @@ pub struct ReapReport {
     pub zero_ref_chunk_rows_purged: u64,
     /// Idle per-key chunk locks dropped (T52): unbounded otherwise.
     pub chunk_locks_swept: u64,
+    /// Idle remote-cache object locks dropped.
+    pub blob_locks_swept: u64,
 }
 
 impl Reaper {
@@ -597,6 +599,7 @@ impl Reaper {
         let orphan_blobs_swept = storage.sweep_orphan_blobs(cutoff).await?;
         let chunks = storage.sweep_orphan_chunks(cutoff).await?;
         let chunk_locks_swept = storage.sweep_chunk_locks();
+        let blob_locks_swept = storage.sweep_blob_locks();
         Ok(ReapReport {
             reservations_reaped,
             orphan_blobs_swept,
@@ -604,6 +607,7 @@ impl Reaper {
             chunk_temps_swept: chunks.temps,
             zero_ref_chunk_rows_purged: chunks.rows,
             chunk_locks_swept,
+            blob_locks_swept,
         })
     }
 }

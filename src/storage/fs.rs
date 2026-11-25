@@ -196,6 +196,10 @@ pub struct FsStorage {
     /// Where `whole`-layout payload bytes actually live. Local for `fs`, a
     /// remote object behind a read-through cache for the v1.3 backends.
     blob: Arc<dyn BlobStore>,
+    /// Owning storage instance. The legacy `default` keeps the v1.1/v1.2 id
+    /// derivation; named instances are hashed into ids and namespace keys so
+    /// two instances sharing a control DB cannot see each other's rows.
+    instance: String,
 }
 
 /// What one orphan-chunk sweep pass reclaimed (docs/cdc.md §GC).
@@ -287,6 +291,17 @@ impl FsStorage {
         cdc: Option<CdcParams>,
         blob: Arc<dyn BlobStore>,
     ) -> io::Result<Self> {
+        Self::open_instance_with_store(root, db_path, cdc, blob, String::from("default"))
+    }
+
+    /// [`Self::open_with_store`] with an explicit owning instance name.
+    pub fn open_instance_with_store(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        cdc: Option<CdcParams>,
+        blob: Arc<dyn BlobStore>,
+        instance: String,
+    ) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         for dir in ["blobs", "chunks", "parts", "tmp"] {
             std::fs::create_dir_all(root.join(dir))?;
@@ -330,6 +345,7 @@ impl FsStorage {
             cdc,
             namespace: String::new(),
             blob,
+            instance,
         };
         storage.reconcile()?;
         Ok(storage)
@@ -350,12 +366,20 @@ impl FsStorage {
             cdc: self.cdc,
             namespace: namespace.to_owned(),
             blob: Arc::clone(&self.blob),
+            instance: self.instance.clone(),
         }
     }
 
     /// The id of the entry `key` resolves to in this view's namespace.
     fn entry_id_for(&self, key: &str) -> String {
-        entry_id_in(&self.namespace, key)
+        entry_id_in_instance(&self.instance, &self.namespace, key)
+    }
+
+    /// Namespace key as stored in the shared index. `default` keeps legacy
+    /// values verbatim; named instances are prefixed so accounting, chunk
+    /// manifests and quota usage stay instance-local.
+    fn scoped_namespace(&self, namespace: &str) -> String {
+        scoped_namespace(&self.instance, namespace)
     }
 
     /// Re-hash every published blob and compare it with the digest recorded
@@ -369,14 +393,15 @@ impl FsStorage {
     pub fn verify_all(&self) -> io::Result<Vec<VerifyReport>> {
         let rows: Vec<(String, String, i64, String, String)> = {
             let conn = lock(&self.conn)?;
+            let namespace = self.scoped_namespace(&self.namespace);
             let mut stmt = conn
                 .prepare(
                     "SELECT id, key, size, digest, layout FROM entries \
-                     WHERE complete = 1 ORDER BY key",
+                     WHERE complete = 1 AND namespace = ?1 ORDER BY key",
                 )
                 .map_err(sql)?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map([&namespace], |row| {
                     Ok((
                         row.get(0)?,
                         row.get(1)?,
@@ -728,7 +753,7 @@ impl FsStorage {
         loop {
             let picked = {
                 let conn = lock(&self.conn)?;
-                pick_whole_entry(&conn, skip)?
+                pick_whole_entry(&conn, &self.scoped_namespace(&self.namespace), skip)?
             };
             let Some((id, blob_bytes, digest, namespace)) = picked else {
                 return Ok(BackfillStep::Exhausted);
@@ -806,13 +831,14 @@ impl FsStorage {
     /// rows carrying a content digest (docs/cdc.md, Migration).
     pub async fn pending_whole_entries(&self) -> io::Result<u64> {
         let conn = Arc::clone(&self.conn);
+        let namespace = self.scoped_namespace(&self.namespace);
         blocking(move || {
             let conn = lock(&conn)?;
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries \
-                     WHERE complete = 1 AND layout = 'whole' AND digest != ''",
-                    [],
+                     WHERE complete = 1 AND layout = 'whole' AND digest != '' AND namespace = ?1",
+                    [&namespace],
                     |row| row.get(0),
                 )
                 .map_err(sql)?;
@@ -835,7 +861,7 @@ impl FsStorage {
         let tmp = self.tmp_path(&id);
         let part = self.part_path(&id);
         let conn = Arc::clone(&self.conn);
-        let namespace = self.namespace.clone();
+        let namespace = self.scoped_namespace(&self.namespace);
         let key = key.to_owned();
         let bytes = bytes.to_vec();
         let _gate = self.gate.write().await;
@@ -936,6 +962,11 @@ impl FsStorage {
     /// has no other clones, and this check, like [`Self::chunk_lock`]'s clone,
     /// happens under the map mutex, so a sweep can never remove a lock that a
     /// task is holding or waiting on.
+    /// Sweep idle per-object locks held by a remote payload store.
+    pub fn sweep_blob_locks(&self) -> u64 {
+        self.blob.sweep_locks()
+    }
+
     pub fn sweep_chunk_locks(&self) -> u64 {
         let mut locks = self.chunk_locks.lock().expect("chunk lock map poisoned");
         let before = locks.len();
@@ -1285,7 +1316,7 @@ impl StorageBackend for FsStorage {
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
             let remote_id = id.clone();
@@ -1357,16 +1388,17 @@ impl StorageBackend for FsStorage {
         Box::pin(async move {
             let _gate = self.gate.read().await;
             let conn = Arc::clone(&self.conn);
+            let namespace = self.scoped_namespace(&self.namespace);
             blocking(move || {
                 let conn = lock(&conn)?;
                 let mut stmt = conn
                     .prepare(
                         "SELECT key, size, created_at, accessed_at FROM entries \
-                         WHERE complete = 1 ORDER BY key",
+                         WHERE complete = 1 AND namespace = ?1 ORDER BY key",
                     )
                     .map_err(sql)?;
                 let rows = stmt
-                    .query_map([], |row| {
+                    .query_map([&namespace], |row| {
                         Ok(EntryStat {
                             key: row.get(0)?,
                             size: sql_u64(row.get(1)?),
@@ -1383,7 +1415,7 @@ impl StorageBackend for FsStorage {
 
     fn finalize<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             let _gate = self.gate.write().await;
             let id = self.entry_id_for(key);
             let publish_id = id.clone();
@@ -1554,7 +1586,11 @@ impl StorageBackend for FsStorage {
             let conn = Arc::clone(&self.conn);
             blocking(move || {
                 let conn = lock(&conn)?;
-                all_namespace_used_bytes(&conn)
+                let all = all_namespace_used_bytes(&conn)?;
+                Ok(all
+                    .into_iter()
+                    .map(|(namespace, used)| (unscoped_namespace(&namespace), used))
+                    .collect())
             })
             .await
         })
@@ -1563,7 +1599,7 @@ impl StorageBackend for FsStorage {
     fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>> {
         Box::pin(async move {
             let conn = Arc::clone(&self.conn);
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             blocking(move || {
                 let conn = lock(&conn)?;
                 let used = namespace_used_bytes(&conn, &namespace)?;
@@ -1581,7 +1617,7 @@ impl StorageBackend for FsStorage {
         expires_at: u64,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             let id = self.entry_id_for(cache_id);
             let tmp = self.tmp_path(&id);
             let part = self.part_path(&id);
@@ -1627,6 +1663,7 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.read().await;
             let conn = Arc::clone(&self.conn);
             let key = key.to_owned();
+            let namespace = self.scoped_namespace(&self.namespace);
             let now = i64::try_from(now_unix).unwrap_or(i64::MAX);
             blocking(move || {
                 let conn = lock(&conn)?;
@@ -1634,8 +1671,9 @@ impl StorageBackend for FsStorage {
                     .query_row(
                         "SELECT COUNT(*) FROM entries \
                          WHERE artifact_key = ?1 AND complete = 0 \
+                         AND namespace = ?3 \
                          AND (reservation_expires_at IS NULL OR reservation_expires_at > ?2)",
-                        params![key, now],
+                        params![key, now, namespace],
                         |row| row.get(0),
                     )
                     .map_err(sql)?;
@@ -1724,7 +1762,7 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.write().await;
             let root = self.root.clone();
             let conn = Arc::clone(&self.conn);
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             let res_id = entry_id_in(&namespace, cache_id);
             let cache_id = cache_id.to_owned();
             let cdc: Option<CdcParams> = self.cdc;
@@ -1959,7 +1997,7 @@ impl StorageBackend for FsStorage {
             let _gate = self.gate.write().await;
             let root = self.root.clone();
             let conn = Arc::clone(&self.conn);
-            let namespace = self.namespace.clone();
+            let namespace = self.scoped_namespace(&self.namespace);
             let res_id = entry_id_in(&namespace, cache_id);
             let cache_id = cache_id.to_owned();
             let ordered = ordered_block_ids.to_vec();
@@ -2498,15 +2536,21 @@ fn acquire_chunk_manifest(
 /// a caller-owned corruption park passed in as a dynamic `NOT IN`.
 fn pick_whole_entry(
     conn: &Connection,
+    namespace: &str,
     skip: &HashSet<String>,
 ) -> io::Result<Option<(String, u64, String, String)>> {
     let mut query = String::from(
         "SELECT id, size, digest, namespace FROM entries \
-         WHERE complete = 1 AND layout = 'whole' AND digest != ''",
+         WHERE complete = 1 AND layout = 'whole' AND digest != '' AND namespace = ?1",
     );
-    let mut values: Vec<String> = Vec::new();
+    let mut values: Vec<String> = vec![namespace.to_owned()];
     if !skip.is_empty() {
-        let placeholders = skip.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let placeholders = skip
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
         values.extend(skip.iter().cloned());
         let _ = write!(query, " AND id NOT IN ({placeholders})");
     }
@@ -2601,6 +2645,45 @@ fn total_used_bytes(conn: &Connection) -> io::Result<i64> {
 #[cfg(test)]
 fn entry_id(key: &str) -> String {
     entry_id_in("", key)
+}
+
+/// Namespace key in the shared index. The legacy instance keeps v1.2 values
+/// so existing rows and accounting stay reachable; every other instance gets
+/// a prefixed key that cannot collide with another instance's namespace.
+fn scoped_namespace(instance: &str, namespace: &str) -> String {
+    if instance == "default" {
+        namespace.to_owned()
+    } else {
+        format!("{instance}\u{0}{namespace}")
+    }
+}
+
+/// Strip the internal instance prefix before a namespace leaves the storage
+/// layer (quota rules and the cluster wire speak public namespace names).
+fn unscoped_namespace(raw: &str) -> String {
+    raw.split_once('\u{0}')
+        .map_or_else(|| raw.to_owned(), |(_, namespace)| namespace.to_owned())
+}
+
+/// Instance-aware id. `default` preserves the v1.1/v1.2 derivation verbatim;
+/// named instances hash the instance prefix into the id so the same namespace
+/// and key in two instances are two distinct rows in one control DB.
+fn entry_id_in_instance(instance: &str, namespace: &str, key: &str) -> String {
+    if instance == "default" {
+        entry_id_in(namespace, key)
+    } else {
+        let scoped = scoped_namespace(instance, namespace);
+        let mut hasher = Sha256::new();
+        hasher.update(scoped.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(key.as_bytes());
+        let digest = hasher.finalize();
+        let mut id = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(id, "{byte:02x}");
+        }
+        id
+    }
 }
 
 /// The namespaced form of [`entry_id`].
@@ -6446,6 +6529,46 @@ mod storage_fs {
             used_of(&storage).await,
             at_rest_invariant(&storage),
             "accounting rests on the invariant after both writes"
+        );
+    }
+
+    /// v1.3: two instances sharing one control DB must not collide on the
+    /// same namespace and key.
+    #[tokio::test]
+    async fn named_instances_are_isolated_in_one_control_db() {
+        use crate::storage::blob::FsBlobStore;
+
+        let dir = TestDir::new();
+        let db = dir.path().join("control.db");
+        let a = FsStorage::open_instance_with_store(
+            dir.path().join("payload-a"),
+            &db,
+            None,
+            Arc::new(FsBlobStore),
+            String::from("a"),
+        )
+        .expect("instance a");
+        let b = FsStorage::open_instance_with_store(
+            dir.path().join("payload-b"),
+            &db,
+            None,
+            Arc::new(FsBlobStore),
+            String::from("b"),
+        )
+        .expect("instance b");
+
+        a.put_stream("k", bytes(b"from-a")).await.expect("put a");
+        a.finalize("k").await.expect("finalize a");
+        b.put_stream("k", bytes(b"from-b")).await.expect("put b");
+        b.finalize("k").await.expect("finalize b");
+
+        assert_eq!(
+            read_all(a.get_range("k", 0..6).await.expect("read a")).await,
+            b"from-a"
+        );
+        assert_eq!(
+            read_all(b.get_range("k", 0..6).await.expect("read b")).await,
+            b"from-b"
         );
     }
 

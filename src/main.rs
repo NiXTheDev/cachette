@@ -165,7 +165,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // Per-namespace byte limits (v1.2 workstream F, `docs/shared-cache.md`
     // §5): parsed once at boot, like the namespace mapping; validation has
     // already proven the table parses, so this cannot fail late.
-    state.set_quotas(config.storage.quotas.parse()?);
+    state.set_quotas(config::runtime_quotas(&config)?);
     // OIDC bearer verification (v1.1 workstream A): when `[auth.oidc]`
     // enabled, build the JWKS cache + verifier and hang them on the state.
     // A failure is boot-fatal; a disabled/absent table is a silent no-op, so
@@ -212,18 +212,21 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
     // Every instance shares the one control DB but owns its own payload root.
     let mut backends: BTreeMap<String, Arc<dyn StorageBackend>> = BTreeMap::new();
+    let mut fs_backends: Vec<Arc<FsStorage>> = Vec::new();
     let mut default_fs: Option<Arc<FsStorage>> = None;
     for instance in &config.storage.instances {
         let blob = cachette::storage::blob::from_config(instance)?;
-        let fs = Arc::new(FsStorage::open_with_store(
+        let fs = Arc::new(FsStorage::open_instance_with_store(
             &instance.path,
             &config.data_path,
             cdc,
             blob,
+            instance.name.clone(),
         )?);
         if instance.name == "default" {
             default_fs = Some(fs.clone());
         }
+        fs_backends.push(fs.clone());
         backends.insert(instance.name.clone(), fs as Arc<dyn StorageBackend>);
     }
     if backends.is_empty() {
@@ -235,6 +238,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
             cdc,
         )?);
         default_fs = Some(fs.clone());
+        fs_backends.push(fs.clone());
         backends.insert(String::from("default"), fs as Arc<dyn StorageBackend>);
     }
     let default_name = if backends.contains_key("default") {
@@ -260,23 +264,24 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     // Startup sweep, before the listener binds: rowless blobs older than the
     // 1h grace and reservations whose TTL has passed (plan task 34).
-    match reaper.sweep_once(&storage).await {
-        Ok(report) => {
-            state.set_storage_ok(true);
-            tracing::info!(
+    let mut startup_ok = true;
+    for instance_storage in &fs_backends {
+        match reaper.sweep_once(instance_storage).await {
+            Ok(report) => tracing::info!(
                 reservations = report.reservations_reaped,
                 orphans = report.orphan_blobs_swept,
                 orphan_chunks = report.orphan_chunks_swept,
                 chunk_temps = report.chunk_temps_swept,
                 zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
                 "startup sweep complete"
-            );
-        }
-        Err(err) => {
-            state.set_storage_ok(false);
-            tracing::warn!(error = %err, "startup sweep failed");
+            ),
+            Err(err) => {
+                startup_ok = false;
+                tracing::warn!(error = %err, "startup sweep failed");
+            }
         }
     }
+    state.set_storage_ok(startup_ok);
 
     // Heartbeat + health (plan task 29 / M15): self-record with live B3
     // values, peer timeout sweep, and mTLS heartbeat sends to every peer. The
@@ -344,7 +349,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // Periodic sweep (plan task 34): `reservation_ttl / 4` (>= 1s), the cadence
     // the reaper documents. The first tick is immediate and skipped — the
     // startup sweep already ran.
-    let sweep_storage = storage.clone();
+    let sweep_storages = fs_backends.clone();
     let sweep_metrics = state.metrics.clone();
     let sweep_storage_ok = state.storage_ok.clone();
     let sweep_interval = reaper.interval();
@@ -353,42 +358,46 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match reaper.sweep_once(&sweep_storage).await {
-                Ok(report) => {
-                    sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
-                    sweep_metrics.record_gc(
-                        report.orphan_chunks_swept + report.chunk_temps_swept,
-                        report.reservations_reaped,
-                    );
-                    if report.reservations_reaped > 0 {
-                        sweep_metrics.add_reservations(-(report.reservations_reaped as i64));
-                    }
-                    if let Ok(used) = sweep_storage.used_bytes().await {
-                        sweep_metrics.set_storage_used(used);
-                    }
-                    if report.reservations_reaped > 0
-                        || report.orphan_blobs_swept > 0
-                        || report.orphan_chunks_swept > 0
-                        || report.chunk_temps_swept > 0
-                        || report.zero_ref_chunk_rows_purged > 0
-                        || report.chunk_locks_swept > 0
-                    {
-                        tracing::info!(
-                            reservations = report.reservations_reaped,
-                            orphans = report.orphan_blobs_swept,
-                            orphan_chunks = report.orphan_chunks_swept,
-                            chunk_temps = report.chunk_temps_swept,
-                            zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
-                            chunk_locks = report.chunk_locks_swept,
-                            "periodic sweep reclaimed storage"
+            for sweep_storage in &sweep_storages {
+                match reaper.sweep_once(sweep_storage).await {
+                    Ok(report) => {
+                        sweep_metrics.record_gc(
+                            report.orphan_chunks_swept + report.chunk_temps_swept,
+                            report.reservations_reaped,
                         );
+                        if report.reservations_reaped > 0 {
+                            sweep_metrics.add_reservations(-(report.reservations_reaped as i64));
+                        }
+                        if let Ok(used) = sweep_storage.used_bytes().await {
+                            sweep_metrics.set_storage_used(used);
+                        }
+                        if report.reservations_reaped > 0
+                            || report.orphan_blobs_swept > 0
+                            || report.orphan_chunks_swept > 0
+                            || report.chunk_temps_swept > 0
+                            || report.zero_ref_chunk_rows_purged > 0
+                            || report.chunk_locks_swept > 0
+                            || report.blob_locks_swept > 0
+                        {
+                            tracing::info!(
+                                reservations = report.reservations_reaped,
+                                orphans = report.orphan_blobs_swept,
+                                orphan_chunks = report.orphan_chunks_swept,
+                                chunk_temps = report.chunk_temps_swept,
+                                zero_ref_chunk_rows = report.zero_ref_chunk_rows_purged,
+                                chunk_locks = report.chunk_locks_swept,
+                                blob_locks = report.blob_locks_swept,
+                                "periodic sweep reclaimed storage"
+                            );
+                        }
                     }
-                }
-                Err(err) => {
-                    sweep_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(error = %err, "periodic sweep failed");
+                    Err(err) => {
+                        sweep_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(error = %err, "periodic sweep failed");
+                    }
                 }
             }
+            sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
@@ -403,10 +412,24 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     )
     .with_metrics(state.metrics.clone())
     .with_quotas(state.quotas_snapshot());
-    let eviction_storage = storage.clone();
+    let mut eviction_targets: Vec<(Arc<FsStorage>, config::MinFree)> = fs_backends
+        .iter()
+        .zip(config.storage.instances.iter())
+        .map(|(fs, instance)| {
+            (
+                fs.clone(),
+                instance.min_free.unwrap_or(config.storage.fs.min_free),
+            )
+        })
+        .collect();
+    if eviction_targets.is_empty() {
+        eviction_targets = fs_backends
+            .iter()
+            .map(|fs| (fs.clone(), config.storage.fs.min_free))
+            .collect();
+    }
     let eviction_metrics = state.metrics.clone();
     let eviction_storage_ok = state.storage_ok.clone();
-    let eviction_min_free = config.storage.fs.min_free;
     let eviction_max_size = config.cache.max_size;
     let eviction_total = state.capacity_total;
     let eviction_task = tokio::spawn(async move {
@@ -416,35 +439,37 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let used = match eviction_storage.used_bytes().await {
-                Ok(used) => used,
-                Err(err) => {
-                    eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(error = %err, "periodic eviction: usage accounting failed");
-                    continue;
-                }
-            };
-            let mut capacity =
-                Capacity::resolve(eviction_min_free, eviction_max_size, eviction_total, used);
-            match eviction.sweep(&*eviction_storage, &mut capacity).await {
-                Ok(report) => {
-                    eviction_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eviction_metrics.set_storage_used(capacity.used);
-                    if !report.evicted.is_empty() {
-                        tracing::info!(
-                            evicted = report.evicted.len(),
-                            bytes_freed = report.bytes_freed,
-                            quota_namespaces = report.quota_freed.len(),
-                            outcome = ?report.outcome,
-                            "periodic eviction reclaimed storage"
-                        );
+            for (eviction_storage, eviction_min_free) in &eviction_targets {
+                let used = match eviction_storage.used_bytes().await {
+                    Ok(used) => used,
+                    Err(err) => {
+                        eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(error = %err, "periodic eviction: usage accounting failed");
+                        continue;
+                    }
+                };
+                let mut capacity =
+                    Capacity::resolve(*eviction_min_free, eviction_max_size, eviction_total, used);
+                match eviction.sweep(&**eviction_storage, &mut capacity).await {
+                    Ok(report) => {
+                        eviction_metrics.set_storage_used(capacity.used);
+                        if !report.evicted.is_empty() {
+                            tracing::info!(
+                                evicted = report.evicted.len(),
+                                bytes_freed = report.bytes_freed,
+                                quota_namespaces = report.quota_freed.len(),
+                                outcome = ?report.outcome,
+                                "periodic eviction reclaimed storage"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(error = %err, "periodic eviction failed");
                     }
                 }
-                Err(err) => {
-                    eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(error = %err, "periodic eviction failed");
-                }
             }
+            eviction_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
@@ -629,13 +654,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     if let Some(handle) = cluster_handle {
         handle.abort();
     }
-    match reaper.sweep_once(&storage).await {
-        Ok(report) => tracing::info!(
-            reservations = report.reservations_reaped,
-            orphans = report.orphan_blobs_swept,
-            "shutdown: final sweep complete"
-        ),
-        Err(err) => tracing::warn!(error = %err, "shutdown: final sweep failed"),
+    for instance_storage in &fs_backends {
+        match reaper.sweep_once(instance_storage).await {
+            Ok(report) => tracing::info!(
+                reservations = report.reservations_reaped,
+                orphans = report.orphan_blobs_swept,
+                "shutdown: final sweep complete"
+            ),
+            Err(err) => tracing::warn!(error = %err, "shutdown: final sweep failed"),
+        }
     }
     drop(serve);
     drop(storage);
