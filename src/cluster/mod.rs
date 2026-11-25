@@ -174,10 +174,10 @@ impl PeerTable {
     /// Timeout sweep (plan task 29 / M15): mark every fresh peer whose
     /// `last_hello` is at least `timeout_seconds` old unhealthy. Records with
     /// `last_hello == 0` are pre-hello seeds with no freshness yet and are
-    /// never touched; already-unhealthy peers are not recounted. Returns how
-    /// many peers were newly marked.
-    pub fn sweep_timeouts(&self, now: u64, timeout_seconds: u64) -> usize {
-        let mut marked = 0;
+    /// never touched; already-unhealthy peers are not recounted. Returns the
+    /// ids of peers newly marked, so quota gossip can forget their votes.
+    pub fn sweep_timeouts(&self, now: u64, timeout_seconds: u64) -> Vec<String> {
+        let mut marked = Vec::new();
         for record in self.snapshot() {
             if record.last_hello == 0 || !record.healthy {
                 continue;
@@ -185,7 +185,7 @@ impl PeerTable {
             if now.saturating_sub(record.last_hello) >= timeout_seconds
                 && self.mark_unhealthy(&record.node_id, &record.fingerprint)
             {
-                marked += 1;
+                marked.push(record.node_id);
             }
         }
         marked

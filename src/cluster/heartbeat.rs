@@ -167,12 +167,19 @@ async fn run(config: HeartbeatConfig, notify: Arc<tokio::sync::Notify>) {
         let marked = config
             .peer_table
             .sweep_timeouts(now as u64, config.timeout.as_secs());
-        if marked > 0 {
+        if !marked.is_empty() {
             tracing::info!(
-                marked,
+                marked = marked.len(),
                 timeout_s = config.timeout.as_secs(),
                 "peer heartbeat timed out; marked unhealthy"
             );
+            let mut quota = config
+                .quota_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for node in &marked {
+                quota.forget(node);
+            }
         }
         if let (Some(client), Some((used, total))) = (&client, stats) {
             send_all(client, &config, now, used, total).await;

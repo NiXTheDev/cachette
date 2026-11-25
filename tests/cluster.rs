@@ -391,9 +391,17 @@ fn sweep_timeouts_marks_stale_peers_and_spares_fresh_and_seed_records() {
     table.observe_discovered("node-b", "FBBB", "127.0.0.1:9001", 100);
     table.observe_addr("127.0.0.1:9009");
 
-    assert_eq!(table.sweep_timeouts(114, 15), 0, "age 14 < timeout 15");
-    assert_eq!(table.sweep_timeouts(115, 15), 1, "age 15 >= timeout 15");
-    assert_eq!(table.sweep_timeouts(300, 15), 0, "not recounted");
+    assert_eq!(
+        table.sweep_timeouts(114, 15).len(),
+        0,
+        "age 14 < timeout 15"
+    );
+    assert_eq!(
+        table.sweep_timeouts(115, 15),
+        vec!["node-b"],
+        "age 15 >= timeout 15"
+    );
+    assert_eq!(table.sweep_timeouts(300, 15).len(), 0, "not recounted");
 
     let peers = table.snapshot();
     let stale = peers
@@ -426,7 +434,7 @@ async fn a_restarted_peer_is_healthy_again_after_its_next_heartbeat() {
         .peer_table
         .observe_discovered("node-b", "FBBB", "127.0.0.1:9001", 100);
     // C's heartbeats stop (killed): the sweep marks it unhealthy...
-    assert_eq!(state.peer_table.sweep_timeouts(10_000, 15), 1);
+    assert_eq!(state.peer_table.sweep_timeouts(10_000, 15).len(), 1);
     assert!(state.peer_table.healthy_sorted().is_empty());
 
     // ...then C restarts and heartbeats again — healthy within one interval.
