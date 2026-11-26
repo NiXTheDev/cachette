@@ -358,6 +358,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
+            let mut all_ok = true;
             for sweep_storage in &sweep_storages {
                 match reaper.sweep_once(sweep_storage).await {
                     Ok(report) => {
@@ -392,12 +393,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(err) => {
+                        all_ok = false;
                         sweep_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(error = %err, "periodic sweep failed");
                     }
                 }
             }
-            sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+            if all_ok {
+                sweep_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     });
 
@@ -412,22 +416,30 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     )
     .with_metrics(state.metrics.clone())
     .with_quotas(state.quotas_snapshot());
-    let mut eviction_targets: Vec<(Arc<FsStorage>, config::MinFree)> = fs_backends
+    let mut eviction_targets: Vec<(Arc<FsStorage>, config::MinFree, String)> = fs_backends
         .iter()
         .zip(config.storage.instances.iter())
         .map(|(fs, instance)| {
             (
                 fs.clone(),
                 instance.min_free.unwrap_or(config.storage.fs.min_free),
+                instance.name.clone(),
             )
         })
         .collect();
     if eviction_targets.is_empty() {
         eviction_targets = fs_backends
             .iter()
-            .map(|fs| (fs.clone(), config.storage.fs.min_free))
+            .map(|fs| {
+                (
+                    fs.clone(),
+                    config.storage.fs.min_free,
+                    String::from("default"),
+                )
+            })
             .collect();
     }
+    let eviction_quotas = state.quotas_snapshot();
     let eviction_metrics = state.metrics.clone();
     let eviction_storage_ok = state.storage_ok.clone();
     let eviction_max_size = config.cache.max_size;
@@ -439,7 +451,8 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            for (eviction_storage, eviction_min_free) in &eviction_targets {
+            let mut all_ok = true;
+            for (eviction_storage, eviction_min_free, instance_name) in &eviction_targets {
                 let used = match eviction_storage.used_bytes().await {
                     Ok(used) => used,
                     Err(err) => {
@@ -448,8 +461,16 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 };
+                let limit = eviction_quotas
+                    .limit_for_instance(instance_name)
+                    .unwrap_or(eviction_max_size);
+                let effective_max = if eviction_max_size == 0 {
+                    limit
+                } else {
+                    eviction_max_size.min(limit)
+                };
                 let mut capacity =
-                    Capacity::resolve(*eviction_min_free, eviction_max_size, eviction_total, used);
+                    Capacity::resolve(*eviction_min_free, effective_max, eviction_total, used);
                 match eviction.sweep(&**eviction_storage, &mut capacity).await {
                     Ok(report) => {
                         eviction_metrics.set_storage_used(capacity.used);
@@ -464,12 +485,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(err) => {
+                        all_ok = false;
                         eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(error = %err, "periodic eviction failed");
                     }
                 }
             }
-            eviction_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+            if all_ok {
+                eviction_storage_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     });
 

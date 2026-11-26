@@ -60,6 +60,8 @@ pub struct Quotas {
     default: Option<u64>,
     /// Override rules, ordered by key (the source `BTreeMap` order).
     rules: Vec<Rule>,
+    /// v1.3 `scope = "instance"` limits, keyed by instance name.
+    instances: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +113,7 @@ impl Quotas {
         Ok(Self {
             default: Some(default),
             rules,
+            instances: BTreeMap::new(),
         })
     }
 
@@ -123,10 +126,11 @@ impl Quotas {
         rules: &[crate::config::QuotaRuleConfig],
     ) -> Result<(), ConfigError> {
         for rule in rules {
-            if rule.scope != crate::config::QuotaScope::Namespace {
+            let limit = parse_limit(&rule.target, &rule.limit)?;
+            if rule.scope == crate::config::QuotaScope::Instance {
+                self.instances.insert(rule.target.clone(), limit);
                 continue;
             }
-            let limit = parse_limit(&rule.target, &rule.limit)?;
             if rule.target == "*" || rule.target == "default" {
                 self.default = Some(limit);
             } else if let Some(existing) = self
@@ -152,7 +156,7 @@ impl Quotas {
     /// `default`).
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        self.default.is_some()
+        self.default.is_some() || !self.rules.is_empty() || !self.instances.is_empty()
     }
 
     /// One `(target, limit)` vote per configured rule, with `*` carrying the
@@ -167,12 +171,21 @@ impl Quotas {
         votes
     }
 
+    /// v1.3 instance-scoped limit for a named instance.
+    #[must_use]
+    pub fn limit_for_instance(&self, instance: &str) -> Option<u64> {
+        self.instances.get(instance).copied()
+    }
+
     /// The configured total (bytes) of `namespace`, or `None` when quotas
     /// are off. The namespace is the RESOLVED one (after
     /// `[storage.namespaces]` mapping).
     #[must_use]
     pub fn limit_for(&self, namespace: &str) -> Option<u64> {
-        let default = self.default?;
+        if !self.is_configured() {
+            return None;
+        }
+        let default = self.default;
         let tenant = namespace
             .split_once('|')
             .map_or(namespace, |(_forge, tenant)| tenant);
@@ -196,7 +209,7 @@ impl Quotas {
                 best = Some(rule);
             }
         }
-        Some(best.map_or(default, |rule| rule.limit))
+        best.map(|rule| rule.limit).or(default)
     }
 }
 

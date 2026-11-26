@@ -6570,6 +6570,27 @@ mod storage_fs {
             read_all(b.get_range("k", 0..6).await.expect("read b")).await,
             b"from-b"
         );
+
+        // Shared-index reads must not leak across the instance boundary.
+        assert_eq!(a.list().await.expect("list a").len(), 1);
+        assert_eq!(b.list().await.expect("list b").len(), 1);
+        assert_eq!(a.verify_all().expect("verify a").len(), 1);
+        assert_eq!(b.verify_all().expect("verify b").len(), 1);
+
+        let expiry = u64::try_from(unix_now() + 3600).expect("expiry");
+        a.reserve("r", "shared", "2", expiry)
+            .await
+            .expect("reserve in a");
+        assert!(
+            a.reservation_exists("shared", 0)
+                .await
+                .expect("a reservation")
+        );
+        assert!(
+            !b.reservation_exists("shared", 0)
+                .await
+                .expect("b reservation")
+        );
     }
 
     /// v1.3: a remote blob store publishes after the index commit, fetches

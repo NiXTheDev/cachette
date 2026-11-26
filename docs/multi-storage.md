@@ -182,13 +182,13 @@ public endpoint is https): the same explicit-trust posture as OIDC's
 
 ### Capabilities and the adapter seam
 
-`StorageBackend::capabilities()` reports what an instance can actually do:
-`chunked` (CDC manifests), `ranged` (byte-range reads) and `atomic_commit`
-(publish in one store-level step). Validation asks these flags rather than
-switching on `type`, so an instance that cannot store chunk manifests refuses
-`[storage.cdc] enabled = true` with a message naming the instance. Adding a
-backend means providing a payload store and its capability set; the index,
-quota and route layers do not change.
+`StorageBackend::capabilities()` reports what an instance can do: `chunked`
+(CDC manifests), `ranged` (byte-range reads) and `atomic_commit` (publish in
+one store-level step). `[storage.cdc] enabled` is still a **global** flag:
+validation refuses to boot if any configured instance lacks `chunked`, so a
+single remote instance disables CDC for the mixed fleet. A per-instance CDC
+flag is a follow-up. Adding a backend means providing a payload store and its
+capability set; the index, quota and route layers do not change.
 
 Remote stores keep a read-through cache under `<root>/blobs/{id}.blob`:
 publishing uploads the local blob after the index commit (a failed upload
@@ -280,12 +280,13 @@ configured rules and its usage in the heartbeat. For each `(scope, target)`:
 3. otherwise no quota applies.
 
 A single configured server among abstainers sets the cluster value for that
-target. The limit applies to **cluster-wide** usage: each peer reports usage
-per `(instance, namespace)`, including active reservations, and every server
-sums the reports before admitting a request. Adding instances therefore does
-not multiply the budget. Eventually-consistent gossip allows a small
-overshoot window; stale peer reports are ignored with a warning, and a server
-that loses its consensus view falls back to its own rules (or none).
+target. In this release the heartbeat still publishes one aggregate usage row
+for the default instance; peer usage is stored by `(instance, namespace)` but
+is **not** summed into admission control, and key-bearing v3 requests do not
+carry an instance name. Treat cluster quotas as rule consensus only, not as
+an enforced shared budget. Adding instances can therefore multiply capacity,
+and eventual gossip convergence allows a small overshoot. A server that loses
+its consensus view falls back to its own rules (or none).
 
 Quota rules and usage piggyback on the existing heartbeat. A dedicated gossip
 protocol is planned as a follow-up. Peer protocol version 3 carries the
