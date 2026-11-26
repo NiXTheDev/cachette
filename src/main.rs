@@ -415,18 +415,20 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         Arc::new(LeaseSet::new(DEFAULT_BORROW_TTL)),
     )
     .with_metrics(state.metrics.clone())
-    .with_quotas(state.quotas_snapshot());
-    let mut eviction_targets: Vec<(Arc<FsStorage>, config::MinFree, String)> = fs_backends
-        .iter()
-        .zip(config.storage.instances.iter())
-        .map(|(fs, instance)| {
-            (
-                fs.clone(),
-                instance.min_free.unwrap_or(config.storage.fs.min_free),
-                instance.name.clone(),
-            )
-        })
-        .collect();
+    .with_quotas(Arc::clone(&state.quotas));
+    let mut eviction_targets: Vec<(Arc<FsStorage>, config::MinFree, String, std::path::PathBuf)> =
+        fs_backends
+            .iter()
+            .zip(config.storage.instances.iter())
+            .map(|(fs, instance)| {
+                (
+                    fs.clone(),
+                    instance.min_free.unwrap_or(config.storage.fs.min_free),
+                    instance.name.clone(),
+                    instance.path.clone(),
+                )
+            })
+            .collect();
     if eviction_targets.is_empty() {
         eviction_targets = fs_backends
             .iter()
@@ -435,15 +437,15 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                     fs.clone(),
                     config.storage.fs.min_free,
                     String::from("default"),
+                    config.storage.fs.path.clone(),
                 )
             })
             .collect();
     }
-    let eviction_quotas = state.quotas_snapshot();
+    let eviction_quotas = Arc::clone(&state.quotas);
     let eviction_metrics = state.metrics.clone();
     let eviction_storage_ok = state.storage_ok.clone();
     let eviction_max_size = config.cache.max_size;
-    let eviction_total = state.capacity_total;
     let eviction_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(EVICTION_INTERVAL);
         // The first tick is immediate; nothing has accrued between the
@@ -452,8 +454,8 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         loop {
             ticker.tick().await;
             let mut all_ok = true;
-            for (eviction_storage, eviction_min_free, instance_name) in &eviction_targets {
-                let used = match eviction_storage.used_bytes().await {
+            for (eviction_storage, eviction_min_free, instance_name, root) in &eviction_targets {
+                let used = match eviction_storage.instance_used_bytes().await {
                     Ok(used) => used,
                     Err(err) => {
                         eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -461,16 +463,29 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 };
-                let limit = eviction_quotas
-                    .limit_for_instance(instance_name)
-                    .unwrap_or(eviction_max_size);
+                let limit = {
+                    let quotas = eviction_quotas
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    quotas
+                        .limit_for_instance(instance_name)
+                        .unwrap_or(eviction_max_size)
+                };
                 let effective_max = if eviction_max_size == 0 {
                     limit
                 } else {
                     eviction_max_size.min(limit)
                 };
                 let mut capacity =
-                    Capacity::resolve(*eviction_min_free, effective_max, eviction_total, used);
+                    match Capacity::from_disk(*eviction_min_free, effective_max, root, used) {
+                        Ok(capacity) => capacity,
+                        Err(err) => {
+                            all_ok = false;
+                            eviction_storage_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(error = %err, "periodic eviction: capacity unavailable");
+                            continue;
+                        }
+                    };
                 match eviction.sweep(&**eviction_storage, &mut capacity).await {
                     Ok(report) => {
                         eviction_metrics.set_storage_used(capacity.used);

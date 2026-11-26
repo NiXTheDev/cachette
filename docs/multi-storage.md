@@ -77,10 +77,11 @@ limit = "5GiB"
 Rules:
 
 - `[storage.fs].min_free` is the default free-space floor. An instance's
-  `min_free` overrides it for that instance's **eviction sweep**;
-  reserve-time admission still uses the server-wide floor, and heartbeat
-  capacity advertising reports the default instance. `server.max_size`
-  accepts bytesize strings as well as raw integers.
+  `min_free` overrides it for that instance's **eviction sweep**, which uses
+  that instance's own accounted usage and root capacity; reserve-time
+  admission still uses the server-wide floor, and heartbeat capacity
+  advertising reports the default instance. `server.max_size` accepts
+  bytesize strings as well as raw integers.
 - Every instance has a stable `name`; the legacy instance is `default`.
 - `[storage.namespaces]` keeps its meaning from the multi-tenant model:
   identity → namespace name. `[storage.routes]` then maps the **resolved

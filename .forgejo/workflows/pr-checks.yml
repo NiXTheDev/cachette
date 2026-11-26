@@ -242,7 +242,7 @@ jobs:
       - name: Install Go
         uses: https://hangar.nixthedev.ru/actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27"
       - name: Cache cargo registry
         # Plain actions/cache@v6, NOT rust-cache@v2 - rationale in the cache
         # NOTE of release.yml's header. This key is IDENTICAL in push-checks

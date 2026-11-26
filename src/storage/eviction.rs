@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{Eviction, MinFree, Quotas};
@@ -290,7 +290,8 @@ pub struct EvictionService {
     metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Optional per-namespace limits (v1.2 workstream F,
     /// `docs/shared-cache.md` §5); the default enforces none.
-    quotas: Arc<Quotas>,
+    /// Shared handle so SIGHUP quota reloads reach the background sweep.
+    quotas: Arc<RwLock<Arc<Quotas>>>,
 }
 
 impl EvictionService {
@@ -303,7 +304,7 @@ impl EvictionService {
             leases,
             budget: DEFAULT_SWEEP_BUDGET,
             metrics: None,
-            quotas: Arc::new(Quotas::default()),
+            quotas: Arc::new(RwLock::new(Arc::new(Quotas::default()))),
         }
     }
 
@@ -318,7 +319,7 @@ impl EvictionService {
     /// swept before the global floor on every sweep (v1.2 workstream F,
     /// `docs/shared-cache.md` §5).
     #[must_use]
-    pub fn with_quotas(mut self, quotas: Arc<Quotas>) -> Self {
+    pub fn with_quotas(mut self, quotas: Arc<RwLock<Arc<Quotas>>>) -> Self {
         self.quotas = quotas;
         self
     }
@@ -361,7 +362,13 @@ impl EvictionService {
         };
         // Quotas need eviction to be enforceable; `none` leaves them as
         // advisory limits (the admin chose "never delete").
-        if self.policy != Eviction::None && self.quotas.is_configured() {
+        let quotas = Arc::clone(
+            &self
+                .quotas
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if self.policy != Eviction::None && quotas.is_configured() {
             let unmet = self.sweep_quotas(storage, capacity, &mut report).await?;
             if report.outcome == SweepOutcome::BudgetExhausted {
                 return Ok(report);
@@ -428,12 +435,18 @@ impl EvictionService {
         report: &mut SweepReport,
     ) -> std::io::Result<bool> {
         let started = Instant::now();
+        let quotas = Arc::clone(
+            &self
+                .quotas
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let mut over: Vec<(String, u64, u64)> = storage
-            .usage_by_namespace()
+            .instance_usage_by_namespace()
             .await?
             .into_iter()
             .filter_map(|(namespace, used)| {
-                let limit = self.quotas.limit_for(&namespace)?;
+                let limit = quotas.limit_for(&namespace)?;
                 (used > limit).then_some((namespace, used, limit))
             })
             .collect();
@@ -994,8 +1007,8 @@ mod tests {
         assert_eq!(report.outcome, SweepOutcome::FloorReached);
     }
 
-    fn quotas(pairs: &[(&str, &str)]) -> Arc<Quotas> {
-        Arc::new(
+    fn quotas(pairs: &[(&str, &str)]) -> Arc<RwLock<Arc<Quotas>>> {
+        Arc::new(RwLock::new(Arc::new(
             QuotasConfig(
                 pairs
                     .iter()
@@ -1004,7 +1017,7 @@ mod tests {
             )
             .parse()
             .expect("valid quotas"),
-        )
+        )))
     }
 
     /// `docs/shared-cache.md` §5: an over-quota namespace is swept down to

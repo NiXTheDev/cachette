@@ -322,6 +322,12 @@ pub trait StorageBackend: Send + Sync {
     /// eviction sweeps. Independent of the view this is called on.
     fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>>;
 
+    /// Instance-local usage for eviction. Defaults to the global view for
+    /// backends that do not share an index across instances.
+    fn instance_usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
+        self.usage_by_namespace()
+    }
+
     /// Accounted bytes of THIS view's namespace only (quota math and the v1
     /// `cacheSize` remaining-budget report).
     fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>>;

@@ -962,6 +962,37 @@ impl FsStorage {
     /// has no other clones, and this check, like [`Self::chunk_lock`]'s clone,
     /// happens under the map mutex, so a sweep can never remove a lock that a
     /// task is holding or waiting on.
+    /// Bytes accounted to this instance's scoped namespace only. The
+    /// trait-level `used_bytes()` is the global shared-index total.
+    pub async fn instance_used_bytes(&self) -> io::Result<u64> {
+        let conn = Arc::clone(&self.conn);
+        let namespace = self.scoped_namespace(&self.namespace);
+        blocking(move || {
+            let conn = lock(&conn)?;
+            let used = namespace_used_bytes(&conn, &namespace)?;
+            Ok(used.max(0) as u64)
+        })
+        .await
+    }
+
+    /// Namespace usage for this instance only, with the public namespace name.
+    /// Eviction uses this instead of the global trait view.
+    pub async fn instance_usage_by_namespace(&self) -> io::Result<Vec<(String, u64)>> {
+        let conn = Arc::clone(&self.conn);
+        let namespace = self.scoped_namespace(&self.namespace);
+        let public = self.namespace.clone();
+        blocking(move || {
+            let conn = lock(&conn)?;
+            let used = namespace_used_bytes(&conn, &namespace)?.max(0) as u64;
+            Ok(if used == 0 {
+                Vec::new()
+            } else {
+                vec![(public, used)]
+            })
+        })
+        .await
+    }
+
     /// Sweep idle per-object locks held by a remote payload store.
     pub fn sweep_blob_locks(&self) -> u64 {
         self.blob.sweep_locks()
@@ -1579,6 +1610,10 @@ impl StorageBackend for FsStorage {
             })
             .await
         })
+    }
+
+    fn instance_usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
+        Box::pin(FsStorage::instance_usage_by_namespace(self))
     }
 
     fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {

@@ -158,6 +158,11 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
                 limit: rule.limit.clone(),
             });
         }
+        if rule.scope == crate::config::QuotaScope::Instance && !names.contains(&rule.target) {
+            return Err(ConfigError::StorageRouteTarget {
+                target: rule.target.clone(),
+            });
+        }
     }
     for (forge, block) in &config.auth.forge {
         if forge.is_empty() || forge.contains('|') {
