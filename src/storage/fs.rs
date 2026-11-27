@@ -997,38 +997,40 @@ impl FsStorage {
     /// floor-eviction candidate walk.
     pub fn instance_entries(&self) -> io::Result<Vec<EntryStat>> {
         let conn = lock(&self.conn)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT key, size, created_at, accessed_at, namespace FROM entries \
-                 WHERE complete = 1 ORDER BY key",
+        // Use hex() for the prefix test: SQLite string functions treat a
+        // literal NUL as a terminator, but hex() encodes it as `00`.
+        let (query, values): (&str, Vec<String>) = if self.instance == "default" {
+            (
+                "SELECT key, size, created_at, accessed_at FROM entries \
+                 WHERE complete = 1 AND instr(hex(namespace), '00') = 0 ORDER BY key",
+                Vec::new(),
             )
-            .map_err(sql)?;
+        } else {
+            let prefix = format!("{}\u{0}", self.instance);
+            let hex = prefix
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            let length = hex.len().to_string();
+            (
+                "SELECT key, size, created_at, accessed_at FROM entries \
+                 WHERE complete = 1 AND substr(hex(namespace), 1, ?2) = ?1 ORDER BY key",
+                vec![hex, length],
+            )
+        };
+        let mut stmt = conn.prepare(query).map_err(sql)?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    EntryStat {
-                        key: row.get(0)?,
-                        size: sql_u64(row.get(1)?),
-                        created_at: sql_u64(row.get(2)?),
-                        accessed_at: sql_u64(row.get(3)?),
-                    },
-                    row.get::<_, String>(4)?,
-                ))
+            .query_map(params_from_iter(values), |row| {
+                Ok(EntryStat {
+                    key: row.get(0)?,
+                    size: sql_u64(row.get(1)?),
+                    created_at: sql_u64(row.get(2)?),
+                    accessed_at: sql_u64(row.get(3)?),
+                })
             })
             .map_err(sql)?;
-        let mut entries = Vec::new();
-        for row in rows {
-            let (stat, namespace) = row.map_err(sql)?;
-            let owned = if self.instance == "default" {
-                !namespace.contains('\u{0}')
-            } else {
-                namespace.starts_with(&format!("{}\u{0}", self.instance))
-            };
-            if owned {
-                entries.push(stat);
-            }
-        }
-        Ok(entries)
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
     }
 
     /// Sweep idle per-object locks held by a remote payload store.

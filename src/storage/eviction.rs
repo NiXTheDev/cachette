@@ -460,7 +460,9 @@ impl EvictionService {
             // A scoped view reads and deletes exactly this namespace's
             // rows; the key alone is not unique across namespaces.
             let view = storage.scoped(&namespace);
-            let entries = view.instance_entries().await?;
+            // Namespace-scoped: this view deletes by key, so the candidates
+            // must come from the same namespace the view addresses.
+            let entries = view.list().await?;
             let candidates: Vec<&EntryStat> = eviction_order(self.policy, &entries)
                 .into_iter()
                 .filter(|entry| !self.leases.is_leased(&entry.key))
@@ -508,17 +510,19 @@ impl EvictionService {
         Ok(unmet)
     }
 
-    /// Eviction candidates from every namespace, unleased, in policy
-    /// order. The namespace is part of a row's identity, so it is the
-    /// first tie-break before the key.
+    /// Eviction candidates from every namespace of this instance, unleased,
+    /// in policy order. Both the usage list and the candidate views are
+    /// instance/namespace scoped; the global trait views would let one
+    /// instance's sweep address another's rows. The namespace is part of a
+    /// row's identity, so it is the first tie-break before the key.
     async fn global_candidates<S: StorageBackend + ?Sized>(
         &self,
         storage: &S,
     ) -> std::io::Result<Vec<(String, EntryStat)>> {
         let mut entries = Vec::new();
-        for (namespace, _) in storage.usage_by_namespace().await? {
+        for (namespace, _) in storage.instance_usage_by_namespace().await? {
             let view = storage.scoped(&namespace);
-            for entry in view.instance_entries().await? {
+            for entry in view.list().await? {
                 if !self.leases.is_leased(&entry.key) {
                     entries.push((namespace.clone(), entry));
                 }
@@ -642,6 +646,7 @@ mod tests {
     use crate::config::QuotasConfig;
     use crate::storage::ByteStream;
     use crate::storage::MemoryStorage;
+    use crate::storage::fs::FsStorage;
 
     static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1275,5 +1280,68 @@ mod tests {
             .expect("stat")
             .expect("indexed entry survives");
         assert_eq!(stat.size, 4);
+    }
+
+    /// Regression: a quota sweep for namespace `a` must not touch the same
+    /// key in namespace `b`, even in a shared control DB.
+    #[tokio::test]
+    async fn quota_sweep_evicts_only_the_over_quota_namespace() {
+        let dir = TestDir::new();
+        let db = dir.path().join("control.db");
+        let storage = FsStorage::open_cdc_with_db(dir.path().join("payload"), &db, None)
+            .expect("open storage");
+
+        for namespace in ["a", "b"] {
+            let view = storage.scoped(namespace);
+            view.put_stream("k", Box::pin(Cursor::new(vec![7_u8; 2048])))
+                .await
+                .expect("put");
+            view.finalize("k").await.expect("finalize");
+        }
+
+        let quotas = Arc::new(RwLock::new(Arc::new(
+            QuotasConfig(
+                [
+                    (String::from("default"), String::from("10KiB")),
+                    (String::from("a"), String::from("1KiB")),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .parse()
+            .expect("valid quotas"),
+        )));
+        let service =
+            EvictionService::new(Eviction::Lru, Arc::new(LeaseSet::new(DEFAULT_BORROW_TTL)))
+                .with_quotas(quotas);
+        let mut capacity = Capacity {
+            total: 10000,
+            used: 4096,
+            min_free: 0,
+            max_size: 10000,
+        };
+        service
+            .sweep(&storage, &mut capacity)
+            .await
+            .expect("quota sweep");
+
+        assert!(
+            storage
+                .scoped("a")
+                .stat("k")
+                .await
+                .expect("stat a")
+                .is_none(),
+            "over-quota namespace entry was removed"
+        );
+        assert!(
+            storage
+                .scoped("b")
+                .stat("k")
+                .await
+                .expect("stat b")
+                .is_some(),
+            "other namespace must keep its same-key entry"
+        );
     }
 }
