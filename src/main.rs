@@ -205,11 +205,13 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // CDC `[storage.cdc]` (v1.1 workstream B): the flag only shapes new
     // finalizations; reads stay layout-aware regardless of it, so flipping it
     // off never orphans already-chunked at-rest data (docs/cdc.md).
-    let cdc = config
-        .storage
-        .cdc
-        .enabled
-        .then(|| cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes));
+    let cdc_for = |instance: &config::StorageInstanceConfig| {
+        let enabled = instance.cdc.unwrap_or(config.storage.cdc.enabled);
+        let avg = instance
+            .avg_chunk_bytes
+            .unwrap_or(config.storage.cdc.avg_chunk_bytes);
+        enabled.then(|| cachette::storage::cdc::CdcParams::new(avg))
+    };
     // Every instance shares the one control DB but owns its own payload root.
     let mut backends: BTreeMap<String, Arc<dyn StorageBackend>> = BTreeMap::new();
     let mut fs_backends: Vec<Arc<FsStorage>> = Vec::new();
@@ -219,7 +221,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         let fs = Arc::new(FsStorage::open_instance_with_store(
             &instance.path,
             &config.data_path,
-            cdc,
+            cdc_for(instance),
             blob,
             instance.name.clone(),
         )?);
@@ -235,7 +237,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         let fs = Arc::new(FsStorage::open_cdc_with_db(
             &config.storage.fs.path,
             &config.data_path,
-            cdc,
+            config.storage.cdc.enabled.then(|| {
+                cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes)
+            }),
         )?);
         default_fs = Some(fs.clone());
         fs_backends.push(fs.clone());
@@ -251,7 +255,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         None => Arc::new(FsStorage::open_cdc_with_db(
             &config.storage.fs.path,
             &config.data_path,
-            cdc,
+            config.storage.cdc.enabled.then(|| {
+                cachette::storage::cdc::CdcParams::new(config.storage.cdc.avg_chunk_bytes)
+            }),
         )?),
     };
     let backend: Arc<dyn StorageBackend> = storage.clone();
@@ -351,7 +357,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     // startup sweep already ran.
     let sweep_storages = fs_backends.clone();
     let sweep_metrics = state.metrics.clone();
-    let sweep_storage_ok = state.storage_ok.clone();
+    let sweep_storage_ok = state.sweep_ok.clone();
     let sweep_interval = reaper.interval();
     let sweep_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(sweep_interval);
@@ -444,7 +450,7 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     let eviction_quotas = Arc::clone(&state.quotas);
     let eviction_metrics = state.metrics.clone();
-    let eviction_storage_ok = state.storage_ok.clone();
+    let eviction_storage_ok = state.eviction_ok.clone();
     let eviction_max_size = config.cache.max_size;
     let eviction_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(EVICTION_INTERVAL);

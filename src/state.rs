@@ -234,6 +234,11 @@ pub struct AppState {
     /// storage error and back on the next success. Tests flip it directly to
     /// exercise the `/readyz` storage-fault branch.
     pub storage_ok: Arc<AtomicBool>,
+    /// Health of the periodic sweep and eviction loops separately. Keeping
+    /// one atomic for both lets a successful tick from one mask a failure in
+    /// the other; `storage_ok()` combines them.
+    pub sweep_ok: Arc<AtomicBool>,
+    pub eviction_ok: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -262,6 +267,8 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             draining: Arc::new(AtomicBool::new(false)),
             storage_ok: Arc::new(AtomicBool::new(true)),
+            sweep_ok: Arc::new(AtomicBool::new(true)),
+            eviction_ok: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -490,11 +497,14 @@ impl AppState {
     /// 49 readiness signal).
     #[must_use]
     pub fn storage_ok(&self) -> bool {
-        self.storage_ok.load(Ordering::Relaxed)
+        self.sweep_ok.load(Ordering::Relaxed) && self.eviction_ok.load(Ordering::Relaxed)
     }
 
-    /// Record the storage backend's health (readiness signal).
+    /// Record overall storage health (used by tests and boot). The background
+    /// loops update their own flags separately.
     pub fn set_storage_ok(&self, ok: bool) {
+        self.sweep_ok.store(ok, Ordering::Relaxed);
+        self.eviction_ok.store(ok, Ordering::Relaxed);
         self.storage_ok.store(ok, Ordering::Relaxed);
     }
 

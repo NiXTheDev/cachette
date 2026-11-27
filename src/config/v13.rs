@@ -62,6 +62,10 @@ pub struct StorageInstanceConfig {
     pub container: Option<String>,
     /// SSH private key for `type = "sftp"` (agent/key auth; no password auth).
     pub private_key_file: Option<PathBuf>,
+    /// Per-instance CDC override. `true`/`false` overrides the global
+    /// `[storage.cdc] enabled`; `avg_chunk_bytes` overrides the global target.
+    pub cdc: Option<bool>,
+    pub avg_chunk_bytes: Option<u64>,
 }
 
 impl Default for StorageInstanceConfig {
@@ -86,6 +90,8 @@ impl Default for StorageInstanceConfig {
             account: None,
             container: None,
             private_key_file: None,
+            cdc: None,
+            avg_chunk_bytes: None,
         }
     }
 }

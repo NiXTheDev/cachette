@@ -9,6 +9,7 @@
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -29,6 +30,9 @@ pub struct SftpConfig {
 /// SFTP remote operations.
 pub struct SftpOps {
     config: SftpConfig,
+    /// Parsed key for the native russh backend. When absent, the system
+    /// `sftp` client is used as a fallback (agent auth only).
+    native_key: Option<Arc<russh::keys::PrivateKey>>,
 }
 
 impl std::fmt::Debug for SftpOps {
@@ -40,9 +44,16 @@ impl std::fmt::Debug for SftpOps {
 }
 
 impl SftpOps {
+    /// Build a backend. A readable OpenSSH key enables the native russh
+    /// client; otherwise the system `sftp` binary is used.
     #[must_use]
     pub fn new(config: SftpConfig) -> Self {
-        Self { config }
+        let native_key = config.private_key_file.as_ref().and_then(|path| {
+            russh::keys::PrivateKey::read_openssh_file(path)
+                .ok()
+                .map(Arc::new)
+        });
+        Self { config, native_key }
     }
 
     fn endpoint(&self) -> io::Result<(String, u16, String, Option<String>)> {
@@ -136,6 +147,58 @@ fn quote(path: &str) -> String {
     )
 }
 
+struct SshHandler;
+
+impl russh::client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    // TOFU, matching the cluster peer model; host-key pinning is a follow-up.
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+impl SftpOps {
+    async fn native_session(&self) -> io::Result<russh_sftp::client::SftpSession> {
+        let (host, port, _, user) = self.endpoint()?;
+        let key = self
+            .native_key
+            .as_ref()
+            .ok_or_else(|| io::Error::other("native SFTP needs a private key"))?;
+        let config = Arc::new(russh::client::Config::default());
+        let mut session = russh::client::connect(config, (host.as_str(), port), SshHandler)
+            .await
+            .map_err(io::Error::other)?;
+        let user = user.unwrap_or_default();
+        let auth = session
+            .authenticate_publickey(
+                user,
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::clone(key), None),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        if auth != russh::client::AuthResult::Success {
+            return Err(io::Error::other(format!(
+                "SFTP authentication failed: {auth:?}"
+            )));
+        }
+        let channel = session
+            .channel_open_session()
+            .await
+            .map_err(io::Error::other)?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(io::Error::other)?;
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
 impl RemoteOps for SftpOps {
     fn name(&self) -> &'static str {
         "sftp"
@@ -143,8 +206,22 @@ impl RemoteOps for SftpOps {
 
     fn put<'a>(&'a self, id: &'a str, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let local = path.to_string_lossy();
             let remote = self.object_path(id)?;
+            if self.native_key.is_some() {
+                let sftp = self.native_session().await?;
+                let mut dst = sftp.create(&remote).await.map_err(io::Error::other)?;
+                let mut src = tokio::fs::File::open(path).await?;
+                let mut buf = [0_u8; 64 * 1024];
+                loop {
+                    let read = src.read(&mut buf).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    dst.write_all(&buf[..read]).await?;
+                }
+                return dst.close().await;
+            }
+            let local = path.to_string_lossy();
             self.batch(&format!("put {} {}\n", quote(&local), quote(&remote)))
                 .await
         })
@@ -159,6 +236,41 @@ impl RemoteOps for SftpOps {
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             if len == 0 {
+                return Ok(());
+            }
+            let remote = self.object_path(id)?;
+            if self.native_key.is_some() {
+                let sftp = self.native_session().await?;
+                let mut src = sftp.open(&remote).await.map_err(io::Error::other)?;
+                src.seek(std::io::SeekFrom::Start(offset)).await?;
+                let mut writer = FileWriter::new(path, offset, 0, Some(len))?;
+                let mut buf = [0_u8; 64 * 1024];
+                let mut remaining = len;
+                while remaining > 0 {
+                    let want = buf.len().min(remaining as usize);
+                    let read = src.read(&mut buf[..want]).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    writer.write(&buf[..read])?;
+                    remaining -= read as u64;
+                }
+                src.close().await?;
+                if writer.written() != len {
+                    return Err(io::Error::other(format!(
+                        "SFTP ranged GET wrote {} of {len} bytes",
+                        writer.written()
+                    )));
+                }
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(path)
+                    .await?;
+                if file.metadata().await?.len() < offset.saturating_add(len) {
+                    file.set_len(offset.saturating_add(len)).await?;
+                }
                 return Ok(());
             }
             let unique = SystemTime::now()
@@ -222,6 +334,11 @@ impl RemoteOps for SftpOps {
     fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let remote = self.object_path(id)?;
+            if self.native_key.is_some() {
+                let sftp = self.native_session().await?;
+                sftp.remove_file(remote).await.map_err(io::Error::other)?;
+                return Ok(());
+            }
             self.batch(&format!("rm {}\n", quote(&remote))).await
         })
     }

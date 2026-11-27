@@ -83,10 +83,17 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
     let mut names = HashSet::new();
     for instance in &config.storage.instances {
         // Capability-driven, not a switch on `type`: a backend that cannot
-        // store chunk manifests refuses CDC no matter how it is named.
-        if config.storage.cdc.enabled
-            && !crate::storage::blob::capabilities_for(instance.kind).chunked
+        // store chunk manifests refuses CDC no matter how it is named. The
+        // per-instance flag overrides the global one.
+        let cdc_enabled = instance.cdc.unwrap_or(config.storage.cdc.enabled);
+        if let Some(avg) = instance.avg_chunk_bytes
+            && !(crate::storage::cdc::MIN_AVG_CHUNK_BYTES
+                ..=crate::storage::cdc::MAX_AVG_CHUNK_BYTES)
+                .contains(&avg)
         {
+            return Err(ConfigError::CdcAvgRange { value: avg });
+        }
+        if cdc_enabled && !crate::storage::blob::capabilities_for(instance.kind).chunked {
             return Err(ConfigError::InSection {
                 section: String::from("storage.cdc"),
                 msg: format!(

@@ -403,6 +403,18 @@ pub static SECTIONS: &[Section] = &[
                 form: Form::Optional,
                 comment: "SSH key for type = \"sftp\" (agent/key auth only)",
             },
+            Field {
+                key: "cdc",
+                default: "true",
+                form: Form::Optional,
+                comment: "override the global [storage.cdc] enabled for this instance",
+            },
+            Field {
+                key: "avg_chunk_bytes",
+                default: "131072",
+                form: Form::Optional,
+                comment: "per-instance CDC target chunk size",
+            },
         ],
     },
     Section {

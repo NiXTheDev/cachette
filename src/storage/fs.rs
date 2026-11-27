@@ -993,46 +993,6 @@ impl FsStorage {
             .collect())
     }
 
-    /// Finalized entries across all namespaces of this instance, for the
-    /// floor-eviction candidate walk.
-    pub fn instance_entries(&self) -> io::Result<Vec<EntryStat>> {
-        let conn = lock(&self.conn)?;
-        // Use hex() for the prefix test: SQLite string functions treat a
-        // literal NUL as a terminator, but hex() encodes it as `00`.
-        let (query, values): (&str, Vec<String>) = if self.instance == "default" {
-            (
-                "SELECT key, size, created_at, accessed_at FROM entries \
-                 WHERE complete = 1 AND instr(hex(namespace), '00') = 0 ORDER BY key",
-                Vec::new(),
-            )
-        } else {
-            let prefix = format!("{}\u{0}", self.instance);
-            let hex = prefix
-                .as_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<String>();
-            let length = hex.len().to_string();
-            (
-                "SELECT key, size, created_at, accessed_at FROM entries \
-                 WHERE complete = 1 AND substr(hex(namespace), 1, ?2) = ?1 ORDER BY key",
-                vec![hex, length],
-            )
-        };
-        let mut stmt = conn.prepare(query).map_err(sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(values), |row| {
-                Ok(EntryStat {
-                    key: row.get(0)?,
-                    size: sql_u64(row.get(1)?),
-                    created_at: sql_u64(row.get(2)?),
-                    accessed_at: sql_u64(row.get(3)?),
-                })
-            })
-            .map_err(sql)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
-    }
-
     /// Sweep idle per-object locks held by a remote payload store.
     pub fn sweep_blob_locks(&self) -> u64 {
         self.blob.sweep_locks()
@@ -1654,10 +1614,6 @@ impl StorageBackend for FsStorage {
 
     fn instance_usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
         Box::pin(FsStorage::instance_usage_by_namespace(self))
-    }
-
-    fn instance_entries(&self) -> BoxFuture<'_, io::Result<Vec<EntryStat>>> {
-        Box::pin(async move { FsStorage::instance_entries(self) })
     }
 
     fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
@@ -6700,8 +6656,16 @@ mod storage_fs {
                 .any(|(namespace, _)| namespace == "acme|repo"),
             "named namespaces must be counted: {usage_a:?}"
         );
-        assert_eq!(a.instance_entries().expect("entries a").len(), 2);
-        assert_eq!(b.instance_entries().expect("entries b").len(), 1);
+        assert_eq!(a.list().await.expect("list a after tenant").len(), 1);
+        assert_eq!(
+            a.scoped("acme|repo")
+                .list()
+                .await
+                .expect("list tenant")
+                .len(),
+            1
+        );
+        assert_eq!(b.list().await.expect("list b after tenant").len(), 1);
         let usage_b = b.instance_usage_by_namespace().await.expect("usage b");
         assert!(
             usage_b

@@ -328,12 +328,6 @@ pub trait StorageBackend: Send + Sync {
         self.usage_by_namespace()
     }
 
-    /// Finalized entries across this instance's namespaces, for the eviction
-    /// candidate walk. Defaults to the view's global `list()`.
-    fn instance_entries(&self) -> BoxFuture<'_, io::Result<Vec<EntryStat>>> {
-        self.list()
-    }
-
     /// Accounted bytes of THIS view's namespace only (quota math and the v1
     /// `cacheSize` remaining-budget report).
     fn namespace_bytes(&self) -> BoxFuture<'_, io::Result<u64>>;

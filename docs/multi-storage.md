@@ -185,11 +185,12 @@ public endpoint is https): the same explicit-trust posture as OIDC's
 
 `StorageBackend::capabilities()` reports what an instance can do: `chunked`
 (CDC manifests), `ranged` (byte-range reads) and `atomic_commit` (publish in
-one store-level step). `[storage.cdc] enabled` is still a **global** flag:
-validation refuses to boot if any configured instance lacks `chunked`, so a
-single remote instance disables CDC for the mixed fleet. A per-instance CDC
-flag is a follow-up. Adding a backend means providing a payload store and its
-capability set; the index, quota and route layers do not change.
+one store-level step). `[storage.cdc] enabled` is the fleet default; an
+instance's `cdc = true|false` and `avg_chunk_bytes` override it, so each
+instance keeps its own CDC content and chunking decisions. Validation only
+refuses an instance that enables CDC without the `chunked` capability. Adding
+a backend means providing a payload store and its capability set; the index,
+quota and route layers do not change.
 
 Remote stores keep a read-through cache under `<root>/blobs/{id}.blob`:
 publishing uploads the local blob after the index commit (a failed upload
