@@ -90,8 +90,11 @@ pub fn start(
         &properties[..],
     )
     .map(|info| {
-        let mut info = info;
-        info.set_link_local_only(true);
+        let info = info;
+        // Do NOT restrict the advertised addresses to link-local ones:
+        // `fe80::` addresses are per-interface and cannot be dialled from a
+        // peer on another host. mDNS itself uses link-local multicast; the
+        // service record must carry a routable address.
         info.enable_addr_auto()
     });
     let info = match info {
@@ -158,23 +161,43 @@ fn on_resolved(table: &PeerTable, self_id: &str, self_fp: &str, resolved: &Resol
     tracing::debug!(node_id, fingerprint, addr = %endpoint, "mDNS peer discovered");
 }
 
-/// Prefer a usable IPv4 address, then any IPv4, then any address at all.
+/// Prefer a routable IPv4 address, then routable IPv6, then anything that is
+/// at least dialable. Link-local `fe80::` and `169.254.x.x` addresses are
+/// skipped: they are scoped to one interface and cannot be reached from the
+/// other host even though the mDNS packet itself arrived.
 fn pick_address(resolved: &ResolvedService) -> Option<IpAddr> {
-    let mut fallback = None;
-    let mut ipv4_fallback = None;
+    let mut routable_v6_addr = None;
+    let mut dialable = None;
     for scoped in &resolved.addresses {
         let ip = scoped.to_ip_addr();
-        if ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified() {
-            return Some(ip);
-        }
-        if ip.is_ipv4() && ipv4_fallback.is_none() {
-            ipv4_fallback = Some(ip);
-        }
-        if fallback.is_none() {
-            fallback = Some(ip);
+        match ip {
+            IpAddr::V4(v4) if routable_v4(v4) => return Some(ip),
+            IpAddr::V6(v6) if routable_v6(v6) => {
+                routable_v6_addr.get_or_insert(ip);
+            }
+            IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() => {
+                dialable.get_or_insert(ip);
+            }
+            _ => {}
         }
     }
-    ipv4_fallback.or(fallback)
+    routable_v6_addr.or(dialable)
+}
+
+/// Stable equivalent of the still-unstable `is_global` for the address
+/// classes a peer can actually dial on a LAN.
+fn routable_v4(v4: std::net::Ipv4Addr) -> bool {
+    !v4.is_loopback()
+        && !v4.is_unspecified()
+        && !v4.is_multicast()
+        && !v4.is_broadcast()
+        && !v4.is_link_local()
+}
+
+fn routable_v6(v6: std::net::Ipv6Addr) -> bool {
+    // fe80::/10 is link-local and scoped to one interface.
+    let link_local = v6.segments()[0] & 0xffc0 == 0xfe80;
+    !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast() && !link_local
 }
 
 /// `ip:port` dial target; IPv6 literals are bracketed.
@@ -202,5 +225,22 @@ fn sanitize(raw: &str, fallback: &str) -> String {
         fallback.to_owned()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn link_local_addresses_are_not_peer_endpoints() {
+        assert!(routable_v4("192.168.1.2".parse::<Ipv4Addr>().unwrap()));
+        assert!(!routable_v4("169.254.3.4".parse().unwrap()));
+        assert!(!routable_v4("127.0.0.1".parse().unwrap()));
+        assert!(!routable_v6(
+            "fe80::e73e:6db6:7837:cc16".parse::<Ipv6Addr>().unwrap()
+        ));
+        assert!(routable_v6("2001:db8::1".parse().unwrap()));
     }
 }

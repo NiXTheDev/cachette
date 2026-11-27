@@ -22,7 +22,7 @@ if (Get-Command fnm -ErrorAction SilentlyContinue) {
     # `fnm env` puts the default Node on PATH. Only pin a project version when
     # the repo actually declares one; `fnm use` without a dotfile errors.
     fnm env --use-on-cd | Out-String | Invoke-Expression
-    if (Test-Path .node-version -or Test-Path .nvmrc) {
+    if ((Test-Path .node-version) -or (Test-Path .nvmrc)) {
         fnm use | Out-Null
     }
 }
