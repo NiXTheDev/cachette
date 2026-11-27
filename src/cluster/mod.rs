@@ -45,6 +45,30 @@ pub const PEER_PROTOCOL_VERSION: u32 = 3;
 /// [`PEER_PROTOCOL_VERSION`].
 pub const PEER_PROTOCOL_HEADER: &str = "x-cachette-peer-protocol";
 
+/// How this peer first became known to the local node.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PeerSource {
+    /// Configured `[cluster] seeds` address; identity unknown until hello.
+    #[default]
+    Seed,
+    /// Resolved through `_cachette._tcp.local.` mDNS browsing.
+    Mdns,
+    /// Identity learned from a direct hello/heartbeat (including a seed that
+    /// has since identified itself).
+    Direct,
+}
+
+impl PeerSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Mdns => "mdns",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 /// One cluster peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerRecord {
@@ -65,6 +89,8 @@ pub struct PeerRecord {
     pub draining: bool,
     /// Unix seconds of the last hello/heartbeat; 0 = never identified.
     pub last_hello: u64,
+    /// Discovery source, preserved across merges.
+    pub source: PeerSource,
 }
 
 impl PeerRecord {
@@ -78,6 +104,7 @@ impl PeerRecord {
             healthy: true,
             draining: false,
             last_hello: 0,
+            source: PeerSource::Seed,
         }
     }
 }
@@ -111,6 +138,7 @@ impl PeerTable {
         record.node_id = node_id.to_owned();
         record.fingerprint = fingerprint.to_owned();
         record.last_hello = now;
+        record.source = PeerSource::Mdns;
         self.merge(record);
     }
 
@@ -121,6 +149,7 @@ impl PeerTable {
         record.node_id = node_id.to_owned();
         record.fingerprint = fingerprint.to_owned();
         record.last_hello = now;
+        record.source = PeerSource::Direct;
         self.merge(record)
     }
 
@@ -289,6 +318,13 @@ fn merge_into(existing: &mut PeerRecord, incoming: PeerRecord) {
         existing.used_bytes = incoming.used_bytes;
         existing.total_bytes = incoming.total_bytes;
     }
+    // mDNS is the most specific provenance; a plain seed upgraded by a hello
+    // becomes direct. An mDNS peer that later heartbeats stays mDNS.
+    if incoming.source == PeerSource::Mdns {
+        existing.source = PeerSource::Mdns;
+    } else if existing.source == PeerSource::Seed && incoming.source == PeerSource::Direct {
+        existing.source = PeerSource::Direct;
+    }
     existing.healthy |= incoming.healthy;
     if incoming.last_hello > existing.last_hello {
         existing.last_hello = incoming.last_hello;
@@ -382,6 +418,18 @@ mod tests {
         assert_eq!(peers[0].node_id, "node-b");
         assert_eq!(peers[0].fingerprint, "FBBB");
         assert_eq!(peers[0].addr, "127.0.0.1:9001");
+        assert_eq!(peers[0].source, PeerSource::Mdns, "mDNS provenance wins");
+    }
+
+    #[test]
+    fn seed_upgraded_by_hello_becomes_direct() {
+        let table = PeerTable::new();
+        table.observe_addr("127.0.0.1:9001");
+        assert_eq!(table.snapshot()[0].source, PeerSource::Seed);
+        table.hello("node-b", "FBBB", "127.0.0.1:9001", 100);
+        assert_eq!(table.snapshot()[0].source, PeerSource::Direct);
+        table.heartbeat("node-b", "FBBB", 10, 100, 101, false);
+        assert_eq!(table.snapshot()[0].source, PeerSource::Direct);
     }
 
     #[test]

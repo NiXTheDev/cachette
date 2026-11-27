@@ -497,6 +497,7 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
                 "used_bytes": peer.used_bytes,
                 "total_bytes": peer.total_bytes,
                 "draining": peer.draining,
+                "source": peer.source.as_str(),
             })
         })
         .collect();

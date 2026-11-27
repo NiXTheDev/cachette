@@ -27,6 +27,7 @@ fn peer(node_id: &str, used: u64, total: u64) -> PeerRecord {
         healthy: true,
         draining: false,
         last_hello: 1,
+        source: cachette::cluster::PeerSource::Seed,
     }
 }
 

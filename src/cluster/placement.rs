@@ -352,6 +352,7 @@ mod tests {
             healthy: true,
             draining: false,
             last_hello: 1,
+            source: crate::cluster::PeerSource::Seed,
         }
     }
 

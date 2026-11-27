@@ -249,11 +249,12 @@ pub enum MintKind {
 /// `cachette cluster <action>`.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ClusterCommand {
-    /// Print the member table once, or follow it with `--watch`.
+    /// Print the member table once, or follow it with `--watch[=INTERVAL]`.
     Status {
-        /// Refresh every few seconds until interrupted.
-        #[arg(long)]
-        watch: bool,
+        /// Refresh until interrupted; accepts `2`, `2s`, `2m`, `1h`, `7d`.
+        /// `--watch` alone refreshes every 2 seconds.
+        #[arg(long, num_args = 0..=1, default_missing_value = "2s", value_name = "INTERVAL")]
+        watch: Option<String>,
     },
 }
 
@@ -349,7 +350,19 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Cluster {
-                action: ClusterCommand::Status { watch: true }
+                action: ClusterCommand::Status {
+                    watch: Some(String::from("2s")),
+                }
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["cachette", "cluster", "status", "--watch", "2m"])
+                .unwrap()
+                .command,
+            Some(Command::Cluster {
+                action: ClusterCommand::Status {
+                    watch: Some(String::from("2m")),
+                }
             })
         );
     }

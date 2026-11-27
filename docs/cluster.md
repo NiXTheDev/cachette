@@ -51,7 +51,7 @@ The node fingerprint is the uppercase hex SHA-256 of the certificate's public ke
 # cert_path: /var/lib/cachette/identity
 ```
 
-Use `cachette identity` on each node to collect the fingerprints you put in `cluster.seed_fingerprints`.
+Use `cachette identity` on each node to collect the fingerprints you put in `cluster.seed_fingerprints`. `cachette cluster status` lists the live peer table with a `source` column: `seed` (configured address, no identity yet), `mdns` (resolved through service discovery), or `direct` (identity learned from a hello/heartbeat). `--watch` alone refreshes every 2 seconds; `--watch 2m`, `--watch 1h` and bare integers are also accepted.
 
 ### Certificate rotation
 
@@ -74,7 +74,7 @@ When cluster mode is off, TOFU is disabled and only seeded fingerprints are acce
 
 ## mDNS and the VPS warning
 
-`cluster.mdns` defaults to `true`, which advertises this node as `_cachette._tcp.local.` and browses for peers on the local link. mDNS is link-local by nature.
+`cluster.mdns` defaults to `true`, which advertises this node as `_cachette._tcp.local.` and browses for peers on the local link. mDNS is link-local by nature: multicast queries use TTL 1 and are not routed between IP subnets (for example `192.168.1.0/24` and `192.168.2.0/24`), and Docker's default bridge does not forward them. Use one shared L2 segment (host networking or macvlan) or configure `seeds`; a multicast repeater/mDNS gateway is needed otherwise. Discovery on the same link is usually immediate (the daemon emits `ServiceResolved` events as answers arrive); if no answers arrive, none ever do.
 
 On a typical VPS there is no usable multicast interface, so no mDNS events arrive. That is **not an error**: cachette logs nothing fatal and continues with `seeds` only. If your hosts are not on the same LAN segment, set `mdns = false` and rely on `seeds` and pinned fingerprints.
 

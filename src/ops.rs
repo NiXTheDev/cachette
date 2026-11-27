@@ -661,6 +661,13 @@ fn mint_buildx_jwt(secret: &str, ttl_seconds: u64, now_unix: i64) -> Result<Stri
 /// subcommand that requires a live server.
 async fn cluster_status(action: &ClusterCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
     let ClusterCommand::Status { watch } = action;
+    let interval = match watch {
+        None => None,
+        Some(raw) => {
+            let seconds = parse_duration(raw).map_err(invalid_input)?;
+            Some(Duration::from_secs(seconds.max(1)))
+        }
+    };
     loop {
         match fetch_cluster(config).await {
             Ok(body) => print_member_table(&body),
@@ -669,10 +676,10 @@ async fn cluster_status(action: &ClusterCommand, config: &Config) -> Result<i32,
                 return Ok(FAILED);
             }
         }
-        if !*watch {
+        let Some(interval) = interval else {
             return Ok(0);
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -782,8 +789,8 @@ fn print_member_table(body: &str) {
         .cloned()
         .unwrap_or_default();
     println!(
-        "{:<24} {:<28} {:>8} {:>10} {:>10}",
-        "node_id", "addr", "health", "age(s)", "used"
+        "{:<24} {:<28} {:<7} {:>8} {:>10} {:>10}",
+        "node_id", "addr", "source", "health", "age(s)", "used"
     );
     let now = u64::try_from(crate::auth::now_secs()).unwrap_or(0);
     for peer in &peers {
@@ -801,13 +808,17 @@ fn print_member_table(body: &str) {
             .get("used_bytes")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
+        let source = peer
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("seed");
         let age = if last_hello == 0 {
             String::from("-")
         } else {
             now.saturating_sub(last_hello).to_string()
         };
         println!(
-            "{id:<24} {addr:<28} {:>8} {age:>10} {used:>10}",
+            "{id:<24} {addr:<28} {source:<7} {:>8} {age:>10} {used:>10}",
             if healthy { "ok" } else { "unhealthy" }
         );
     }
