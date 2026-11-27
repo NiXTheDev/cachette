@@ -179,6 +179,12 @@ pub enum ConfigError {
     #[error("storage.routes target {target:?} is not a configured storage instance")]
     StorageRouteTarget { target: String },
 
+    /// v1.3: an instance-scope quota naming an unknown instance.
+    #[error(
+        "[[quota]] scope = \"instance\" target {target:?} is not a configured storage instance"
+    )]
+    QuotaInstanceTarget { target: String },
+
     /// v1.3: a `[[quota]]` limit is not a positive bytesize.
     #[error(
         "invalid [[quota]] limit for {target:?}: {limit:?} (expected a bytesize such as \"20GiB\")"

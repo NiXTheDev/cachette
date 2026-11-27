@@ -460,7 +460,7 @@ impl EvictionService {
             // A scoped view reads and deletes exactly this namespace's
             // rows; the key alone is not unique across namespaces.
             let view = storage.scoped(&namespace);
-            let entries = view.list().await?;
+            let entries = view.instance_entries().await?;
             let candidates: Vec<&EntryStat> = eviction_order(self.policy, &entries)
                 .into_iter()
                 .filter(|entry| !self.leases.is_leased(&entry.key))
@@ -518,7 +518,7 @@ impl EvictionService {
         let mut entries = Vec::new();
         for (namespace, _) in storage.usage_by_namespace().await? {
             let view = storage.scoped(&namespace);
-            for entry in view.list().await? {
+            for entry in view.instance_entries().await? {
                 if !self.leases.is_leased(&entry.key) {
                     entries.push((namespace.clone(), entry));
                 }

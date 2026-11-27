@@ -962,35 +962,73 @@ impl FsStorage {
     /// has no other clones, and this check, like [`Self::chunk_lock`]'s clone,
     /// happens under the map mutex, so a sweep can never remove a lock that a
     /// task is holding or waiting on.
-    /// Bytes accounted to this instance's scoped namespace only. The
-    /// trait-level `used_bytes()` is the global shared-index total.
+    /// All accounting rows belonging to this instance, with the public
+    /// namespace name. A named instance owns keys under `name\0`; the legacy
+    /// `default` instance owns every key without an instance prefix.
+    fn instance_accounting(&self, conn: &Connection) -> io::Result<Vec<(String, i64)>> {
+        accounting_for_instance(conn, &self.instance)
+    }
+
+    /// Bytes accounted to all namespaces of this instance. The trait-level
+    /// `used_bytes()` is the global shared-index total.
     pub async fn instance_used_bytes(&self) -> io::Result<u64> {
         let conn = Arc::clone(&self.conn);
-        let namespace = self.scoped_namespace(&self.namespace);
+        let instance = self.instance.clone();
         blocking(move || {
             let conn = lock(&conn)?;
-            let used = namespace_used_bytes(&conn, &namespace)?;
-            Ok(used.max(0) as u64)
+            let rows = accounting_for_instance(&conn, &instance)?;
+            Ok(rows.into_iter().map(|(_, used)| used.max(0) as u64).sum())
         })
         .await
     }
 
-    /// Namespace usage for this instance only, with the public namespace name.
-    /// Eviction uses this instead of the global trait view.
+    /// Namespace usage for every namespace of this instance, with public
+    /// names. Eviction uses this instead of the global trait view.
     pub async fn instance_usage_by_namespace(&self) -> io::Result<Vec<(String, u64)>> {
-        let conn = Arc::clone(&self.conn);
-        let namespace = self.scoped_namespace(&self.namespace);
-        let public = self.namespace.clone();
-        blocking(move || {
-            let conn = lock(&conn)?;
-            let used = namespace_used_bytes(&conn, &namespace)?.max(0) as u64;
-            Ok(if used == 0 {
-                Vec::new()
-            } else {
-                vec![(public, used)]
+        let conn = lock(&self.conn)?;
+        let rows = self.instance_accounting(&conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|(namespace, used)| (namespace, used.max(0) as u64))
+            .collect())
+    }
+
+    /// Finalized entries across all namespaces of this instance, for the
+    /// floor-eviction candidate walk.
+    pub fn instance_entries(&self) -> io::Result<Vec<EntryStat>> {
+        let conn = lock(&self.conn)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, size, created_at, accessed_at, namespace FROM entries \
+                 WHERE complete = 1 ORDER BY key",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    EntryStat {
+                        key: row.get(0)?,
+                        size: sql_u64(row.get(1)?),
+                        created_at: sql_u64(row.get(2)?),
+                        accessed_at: sql_u64(row.get(3)?),
+                    },
+                    row.get::<_, String>(4)?,
+                ))
             })
-        })
-        .await
+            .map_err(sql)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (stat, namespace) = row.map_err(sql)?;
+            let owned = if self.instance == "default" {
+                !namespace.contains('\u{0}')
+            } else {
+                namespace.starts_with(&format!("{}\u{0}", self.instance))
+            };
+            if owned {
+                entries.push(stat);
+            }
+        }
+        Ok(entries)
     }
 
     /// Sweep idle per-object locks held by a remote payload store.
@@ -1614,6 +1652,10 @@ impl StorageBackend for FsStorage {
 
     fn instance_usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
         Box::pin(FsStorage::instance_usage_by_namespace(self))
+    }
+
+    fn instance_entries(&self) -> BoxFuture<'_, io::Result<Vec<EntryStat>>> {
+        Box::pin(async move { FsStorage::instance_entries(self) })
     }
 
     fn usage_by_namespace(&self) -> BoxFuture<'_, io::Result<Vec<(String, u64)>>> {
@@ -2625,6 +2667,35 @@ fn namespace_used_bytes(conn: &Connection, namespace: &str) -> io::Result<i64> {
     .optional()
     .map_err(sql)
     .map(|used| used.unwrap_or(0))
+}
+
+/// Accounting rows owned by one instance, with public namespace names.
+/// Named instances store `name\0namespace`; legacy `default` rows have no
+/// instance prefix at all.
+fn accounting_for_instance(conn: &Connection, instance: &str) -> io::Result<Vec<(String, i64)>> {
+    let mut stmt = conn
+        .prepare("SELECT namespace, used_bytes FROM accounting ORDER BY namespace")
+        .map_err(sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql)?;
+    let all = rows.collect::<Result<Vec<_>, _>>().map_err(sql)?;
+    Ok(if instance == "default" {
+        all.into_iter()
+            .filter(|(namespace, _)| !namespace.contains('\u{0}'))
+            .collect()
+    } else {
+        let prefix = format!("{instance}\u{0}");
+        all.into_iter()
+            .filter_map(|(namespace, used)| {
+                namespace
+                    .strip_prefix(&prefix)
+                    .map(|public| (public.to_owned(), used))
+            })
+            .collect()
+    })
 }
 
 /// The accounted bytes of every namespace, sorted by name (v1.2 workstream
@@ -6611,6 +6682,31 @@ mod storage_fs {
         assert_eq!(b.list().await.expect("list b").len(), 1);
         assert_eq!(a.verify_all().expect("verify a").len(), 1);
         assert_eq!(b.verify_all().expect("verify b").len(), 1);
+
+        // A named namespace on instance a must be visible to instance-local
+        // eviction accounting, and never to instance b.
+        let tenant = a.scoped("acme|repo");
+        tenant
+            .put_stream("k", bytes(b"tenant"))
+            .await
+            .expect("put tenant");
+        tenant.finalize("k").await.expect("finalize tenant");
+        let usage_a = a.instance_usage_by_namespace().await.expect("usage a");
+        assert!(
+            usage_a
+                .iter()
+                .any(|(namespace, _)| namespace == "acme|repo"),
+            "named namespaces must be counted: {usage_a:?}"
+        );
+        assert_eq!(a.instance_entries().expect("entries a").len(), 2);
+        assert_eq!(b.instance_entries().expect("entries b").len(), 1);
+        let usage_b = b.instance_usage_by_namespace().await.expect("usage b");
+        assert!(
+            usage_b
+                .iter()
+                .all(|(namespace, _)| namespace != "acme|repo"),
+            "instance b must not see a's tenant namespace"
+        );
 
         let expiry = u64::try_from(unix_now() + 3600).expect("expiry");
         a.reserve("r", "shared", "2", expiry)

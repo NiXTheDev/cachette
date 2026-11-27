@@ -159,7 +159,7 @@ fn validate_v13(config: &Config) -> Result<(), ConfigError> {
             });
         }
         if rule.scope == crate::config::QuotaScope::Instance && !names.contains(&rule.target) {
-            return Err(ConfigError::StorageRouteTarget {
+            return Err(ConfigError::QuotaInstanceTarget {
                 target: rule.target.clone(),
             });
         }
