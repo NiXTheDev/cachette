@@ -189,7 +189,11 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
 
 /// Open the named storage instance (default: `default`) against the one
 /// control DB. All instances share the DB; only the payload root differs.
-fn open_named_storage(config: &Config, name: Option<&str>) -> io::Result<FsStorage> {
+fn open_named_storage(
+    config: &Config,
+    name: Option<&str>,
+    readonly: bool,
+) -> io::Result<FsStorage> {
     let name = name.unwrap_or("default");
     let instance = config
         .storage
@@ -203,6 +207,14 @@ fn open_named_storage(config: &Config, name: Option<&str>) -> io::Result<FsStora
             )
         })?;
     let blob = crate::storage::blob::from_config(instance)?;
+    if readonly {
+        return FsStorage::open_readonly_instance_with_store(
+            &instance.path,
+            &config.data_path,
+            blob,
+            instance.name.clone(),
+        );
+    }
     FsStorage::open_instance_with_store(
         &instance.path,
         &config.data_path,
@@ -270,11 +282,8 @@ fn acquire(dir: &Path) -> Result<DataDirLock, i32> {
 /// `cachette verify` — recompute every published entry's digest (plan task 50)
 /// and report the ones that no longer match. Non-zero exit on any finding.
 async fn verify(config: &Config, storage_name: Option<&str>) -> Result<i32, Box<dyn Error>> {
-    let _lock = match acquire(&config.state_dir()) {
-        Ok(lock) => lock,
-        Err(code) => return Ok(code),
-    };
-    let storage = open_named_storage(config, storage_name)?;
+    // Read-only: WAL readers can inspect the live index while the server runs.
+    let storage = open_named_storage(config, storage_name, true)?;
     let reports = storage.verify_all()?;
     let mut bad = 0usize;
     for report in &reports {
@@ -323,11 +332,19 @@ async fn cache(
     config: &Config,
     storage_name: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
-    let _lock = match acquire(&config.state_dir()) {
-        Ok(lock) => lock,
-        Err(code) => return Ok(code),
+    // Listing and dry-run pruning only read the WAL snapshot, so they work
+    // while the server is running. Real pruning still needs the data-dir lock.
+    let readonly = matches!(action, CacheCommand::List { .. })
+        || matches!(action, CacheCommand::Prune { dry_run: true, .. });
+    let _lock = if readonly {
+        None
+    } else {
+        match acquire(&config.state_dir()) {
+            Ok(lock) => Some(lock),
+            Err(code) => return Ok(code),
+        }
     };
-    let storage = open_named_storage(config, storage_name)?;
+    let storage = open_named_storage(config, storage_name, readonly)?;
     match action {
         CacheCommand::List { json } => {
             let entries = storage.list().await?;
@@ -413,7 +430,7 @@ async fn gc(config: &Config, storage_name: Option<&str>) -> Result<i32, Box<dyn 
         Ok(lock) => lock,
         Err(code) => return Ok(code),
     };
-    let storage = open_named_storage(config, storage_name)?;
+    let storage = open_named_storage(config, storage_name, false)?;
     let reaper = Reaper::new(Duration::from_secs(config.cache.reservation_ttl_seconds));
     let report = reaper.sweep_once(&storage).await?;
     println!("reservations_reaped: {}", report.reservations_reaped);

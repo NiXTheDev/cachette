@@ -50,7 +50,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::RwLock;
@@ -280,6 +280,51 @@ impl FsStorage {
         cdc: Option<CdcParams>,
     ) -> io::Result<Self> {
         Self::open_with_store(root, db_path, cdc, Arc::new(FsBlobStore))
+    }
+
+    /// Open an existing index read-only for offline inspection commands that
+    /// must work while the server is running. No directories are created and
+    /// boot reconciliation (which writes) is skipped.
+    pub fn open_readonly_with_db(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let conn =
+            Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql)?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            conn: Arc::new(Mutex::new(conn)),
+            gate: Arc::new(RwLock::new(())),
+            chunk_locks: Arc::new(Mutex::new(HashMap::new())),
+            cdc: None,
+            namespace: String::new(),
+            blob: Arc::new(crate::storage::blob::FsBlobStore),
+            instance: String::from("default"),
+        })
+    }
+
+    /// [`Self::open_readonly_with_db`] for a named instance with an explicit
+    /// payload store.
+    pub fn open_readonly_instance_with_store(
+        root: impl AsRef<Path>,
+        db_path: impl AsRef<Path>,
+        blob: Arc<dyn BlobStore>,
+        instance: String,
+    ) -> io::Result<Self> {
+        let conn =
+            Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql)?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            conn: Arc::new(Mutex::new(conn)),
+            gate: Arc::new(RwLock::new(())),
+            chunk_locks: Arc::new(Mutex::new(HashMap::new())),
+            cdc: None,
+            namespace: String::new(),
+            blob,
+            instance,
+        })
     }
 
     /// [`FsStorage::open_cdc_with_db`] with an explicit payload store. Remote

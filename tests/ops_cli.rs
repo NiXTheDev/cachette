@@ -413,8 +413,15 @@ fn offline_commands_refuse_while_the_server_holds_the_lock() {
     let config = write_config(dir.path(), &format!("127.0.0.1:{port}"), false);
     let server = Server::start(&config, port);
 
+    // Read-only inspection works against the server's WAL snapshot.
     let (code, out) = run_cli(&config, &["verify"]);
-    assert_eq!(code, 1, "verify refused: {out}");
+    assert_eq!(code, 0, "verify runs alongside the server: {out}");
+    let (code, out) = run_cli(&config, &["cache", "list"]);
+    assert_eq!(code, 0, "cache list runs alongside the server: {out}");
+
+    // Mutating GC still requires the exclusive data-dir lock.
+    let (code, out) = run_cli(&config, &["gc"]);
+    assert_eq!(code, 1, "gc refused: {out}");
     assert!(
         out.contains("in use by another cachette process"),
         "clear refusal message: {out}"
