@@ -550,6 +550,13 @@ async fn doctor(config: &Config) -> Result<i32, Box<dyn Error>> {
     }
 
     for instance in &config.storage.instances {
+        if !config.data_path.exists() {
+            println!(
+                "instance {}: not initialized (created on first boot)",
+                instance.name
+            );
+            continue;
+        }
         match open_named_storage(config, Some(&instance.name), true) {
             Ok(storage) => {
                 let used = storage.instance_used_bytes().await.unwrap_or(0);
@@ -702,8 +709,7 @@ async fn cluster_command(action: &ClusterCommand, config: &Config) -> Result<i32
     match action {
         ClusterCommand::Status => match fetch_cluster(config).await {
             Ok(body) => {
-                print_member_table(&body);
-                print_cluster_summary(&body);
+                print_duf_status(&body);
                 Ok(0)
             }
             Err(err) => {
@@ -767,24 +773,163 @@ async fn cluster_peer(
     }
 }
 
-fn print_cluster_summary(body: &str) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+fn usage_bar(percent: f64) -> String {
+    const WIDTH: usize = 20;
+    let filled = (percent / 100.0 * WIDTH as f64).round() as usize;
+    let filled = filled.min(WIDTH);
+    format!(
+        "[{}{}] {:>5.1}%",
+        "#".repeat(filled),
+        ".".repeat(WIDTH - filled),
+        percent
+    )
+}
+
+fn print_duf_table(title: &str, headers: &[&str], rows: &[Vec<String>], right: &[bool]) {
+    if rows.is_empty() {
         return;
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let border = |left: &str, mid: &str, right_edge: &str| {
+        let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        format!("{}{}{}", left, parts.join(mid), right_edge)
     };
-    let Some(dedup) = value.get("dedup") else {
-        return;
+    let render = |cells: &[String]| {
+        let parts: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                if right[i] {
+                    format!("{:>width$}", cell, width = widths[i])
+                } else {
+                    format!("{:<width$}", cell, width = widths[i])
+                }
+            })
+            .collect();
+        format!("│ {} │", parts.join(" │ "))
     };
-    let number = |key: &str| {
-        dedup
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-    };
+    println!("{}", border("╭", "┬", "╮"));
+    let title_width: usize = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
+    println!("│ {:<width$} │", title, width = title_width);
+    println!("{}", border("├", "┼", "┤"));
     println!(
-        "dedup: {} logical chunk bytes, {} unique, {} saved",
-        number("logical"),
-        number("unique"),
-        number("saved")
+        "{}",
+        render(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+    );
+    println!("{}", border("├", "┼", "┤"));
+    for row in rows {
+        println!("{}", render(row));
+    }
+    println!("{}", border("╰", "┴", "╯"));
+}
+
+fn print_duf_status(body: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        println!("{body}");
+        return;
+    };
+    let peers = value
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut peer_rows = Vec::new();
+    for peer in &peers {
+        let num = |key: &str| {
+            peer.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let total = num("total_bytes");
+        let used = num("used_bytes");
+        let percent = if total == 0 {
+            0.0
+        } else {
+            used as f64 / total as f64 * 100.0
+        };
+        let name = peer
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| peer.get("node_id").and_then(|v| v.as_str()).unwrap_or(""));
+        let fingerprint = peer
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let short_id: String = fingerprint.chars().take(8).collect();
+        let source = peer.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+        let stored = if source == "self" {
+            value
+                .get("dedup")
+                .and_then(|d| d.get("unique"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(used)
+        } else {
+            used
+        };
+        let used_cell = if stored == used {
+            human_bytes(used)
+        } else {
+            format!("{}({})", human_bytes(stored), human_bytes(used))
+        };
+        peer_rows.push(vec![
+            name.to_owned(),
+            short_id,
+            source.to_owned(),
+            human_bytes(total),
+            used_cell,
+            human_bytes(total.saturating_sub(used)),
+            usage_bar(percent),
+        ]);
+    }
+    print_duf_table(
+        &format!("{} cluster peers", peer_rows.len()),
+        &["NODE", "ID", "TYPE", "SIZE", "USED", "AVAIL", "USE%"],
+        &peer_rows,
+        &[false, false, false, true, true, true, false],
+    );
+
+    let instances = value
+        .get("instances")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut storage_rows = Vec::new();
+    for instance in &instances {
+        let num = |key: &str| {
+            instance
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let (logical, unique, saved) = (num("logical"), num("unique"), num("saved"));
+        let percent = if logical == 0 {
+            0.0
+        } else {
+            saved as f64 / logical as f64 * 100.0
+        };
+        storage_rows.push(vec![
+            instance
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            human_bytes(num("used")),
+            human_bytes(logical),
+            human_bytes(unique),
+            human_bytes(saved),
+            usage_bar(percent),
+        ]);
+    }
+    print_duf_table(
+        &format!("{} storage instances", storage_rows.len()),
+        &["INSTANCE", "USED", "LOGICAL", "UNIQUE", "SAVED", "DEDUP%"],
+        &storage_rows,
+        &[false, true, true, true, true, false],
     );
 }
 
@@ -845,10 +990,10 @@ async fn admin_request(
         );
     }
     request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
     if let Some(body) = &body {
         stream.write_all(body.as_bytes()).await?;
     }
-    stream.write_all(request.as_bytes()).await?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
     parse_http(&raw)

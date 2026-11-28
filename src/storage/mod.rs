@@ -420,6 +420,11 @@ pub trait StorageBackend: Send + Sync {
         ordered_block_ids: &'a [String],
     ) -> BoxFuture<'a, io::Result<u64>>;
 
+    /// Synchronous accounted bytes, for admin/status snapshots.
+    fn used_bytes_sync(&self) -> u64 {
+        0
+    }
+
     /// `(logical chunk bytes, unique bytes, saved bytes)` for CDC payloads.
     fn dedup_stats(&self) -> (u64, u64, u64) {
         (0, 0, 0)

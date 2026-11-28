@@ -397,10 +397,9 @@ fn cluster_status_reads_the_running_server() {
 
     let (code, out) = run_cli(&config, &["cluster", "status"]);
     assert_eq!(code, 0, "cluster status ok: {out}");
-    assert!(out.contains("node: "), "{out}");
-    // The table always renders a summary; the exact membership is cluster state,
-    // not this subcommand's contract.
-    assert!(out.contains("peer"), "{out}");
+    // The rich status renders a duf-style peer table plus a storage table.
+    assert!(out.contains("cluster peers"), "{out}");
+    assert!(out.contains("storage instances"), "{out}");
     drop(server);
 }
 

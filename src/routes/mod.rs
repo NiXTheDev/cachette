@@ -376,6 +376,11 @@ async fn peer_list(State(state): State<AppState>) -> Json<serde_json::Value> {
         .map(|peer| {
             serde_json::json!({
                 "node_id": peer.node_id,
+                "name": if peer.node_id.is_empty() {
+                    peer.fingerprint.clone()
+                } else {
+                    peer.node_id.clone()
+                },
                 "fingerprint": peer.fingerprint,
                 "addr": peer.addr,
                 "used_bytes": peer.used_bytes,
@@ -566,8 +571,20 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
         .snapshot()
         .into_iter()
         .map(|peer| {
+            let source = if peer.node_id == state.node_id || peer.fingerprint == state.node_id {
+                "self"
+            } else {
+                peer.source.as_str()
+            };
             serde_json::json!({
                 "node_id": peer.node_id,
+                "name": if source == "self" {
+                    state.node_id.clone()
+                } else if peer.node_id.is_empty() {
+                    peer.fingerprint.clone()
+                } else {
+                    peer.node_id.clone()
+                },
                 "fingerprint": peer.fingerprint,
                 "addr": peer.addr,
                 "healthy": peer.healthy,
@@ -575,7 +592,7 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
                 "used_bytes": peer.used_bytes,
                 "total_bytes": peer.total_bytes,
                 "draining": peer.draining,
-                "source": peer.source.as_str(),
+                "source": source,
             })
         })
         .collect();
@@ -583,10 +600,31 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
         .storage
         .as_ref()
         .map_or((0, 0, 0), |storage| storage.dedup_stats());
+    let instances = {
+        let registry = state
+            .instances
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows = Vec::new();
+        for name in registry.names() {
+            let backend = registry.get(&name);
+            let used = backend.as_ref().map_or(0, |b| b.used_bytes_sync());
+            let (logical, unique, saved) = backend.as_ref().map_or((0, 0, 0), |b| b.dedup_stats());
+            rows.push(serde_json::json!({
+                "name": name,
+                "used": used,
+                "logical": logical,
+                "unique": unique,
+                "saved": saved,
+            }));
+        }
+        rows
+    };
     let cluster_enabled = state.auth().cluster_enabled;
     Json(serde_json::json!({
         "node_id": state.node_id,
         "dedup": { "logical": logical, "unique": unique, "saved": saved },
+        "instances": instances,
         "cluster_enabled": cluster_enabled,
         "peers": peers,
     }))

@@ -1203,6 +1203,11 @@ impl StorageBackend for FsStorage {
         self.blob.capabilities()
     }
 
+    fn used_bytes_sync(&self) -> u64 {
+        let conn = lock(&self.conn).expect("storage index poisoned");
+        total_used_bytes(&conn).unwrap_or(0).max(0) as u64
+    }
+
     fn dedup_stats(&self) -> (u64, u64, u64) {
         let conn = lock(&self.conn).expect("storage index poisoned");
         let row: (i64, i64) = conn
@@ -1213,8 +1218,8 @@ impl StorageBackend for FsStorage {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("dedup stats query");
-        let unique = row.0.max(0) as u64;
-        let logical = row.1.max(0) as u64;
+        let logical = row.0.max(0) as u64;
+        let unique = row.1.max(0) as u64;
         (logical, unique, logical.saturating_sub(unique))
     }
 
