@@ -773,16 +773,39 @@ async fn cluster_peer(
     }
 }
 
-fn usage_bar(percent: f64) -> String {
-    const WIDTH: usize = 20;
-    let filled = (percent / 100.0 * WIDTH as f64).round() as usize;
-    let filled = filled.min(WIDTH);
-    format!(
-        "[{}{}] {:>5.1}%",
+fn usage_bar(percent: f64, width: usize) -> String {
+    // duf's ASCII bar: whole '#', a half block for >=0.5 of a cell, then '.'.
+    let width = width.max(1);
+    let value = percent.clamp(0.0, 100.0) / 100.0 * width as f64;
+    let filled = value.floor() as usize;
+    let half = value - filled as f64 >= 0.5 && filled < width;
+    let empty = width - filled - usize::from(half);
+    let bar = format!(
+        "{}{}{}",
         "#".repeat(filled),
-        ".".repeat(WIDTH - filled),
-        percent
-    )
+        if half { "#" } else { "" },
+        ".".repeat(empty)
+    );
+    format!("[{bar}] {percent:>5.1}%")
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(100)
+        .max(60)
+}
+
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return vec![text.to_owned()];
+    }
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
 }
 
 fn print_duf_table(title: &str, headers: &[&str], rows: &[Vec<String>], right: &[bool]) {
@@ -795,11 +818,22 @@ fn print_duf_table(title: &str, headers: &[&str], rows: &[Vec<String>], right: &
             widths[index] = widths[index].max(cell.chars().count());
         }
     }
+    // duf keeps the table inside the terminal by squeezing the free-form
+    // columns first; numeric columns and bars keep their natural width.
+    let dynamic = [0usize, 2, widths.len() - 1];
+    let total = |widths: &[usize]| widths.iter().sum::<usize>() + 3 * widths.len() + 1;
+    let max_width = terminal_width();
+    while total(&widths) > max_width {
+        let Some(index) = dynamic.iter().copied().find(|index| widths[*index] > 6) else {
+            break;
+        };
+        widths[index] -= 1;
+    }
     let border = |left: &str, mid: &str, right_edge: &str| {
         let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
         format!("{}{}{}", left, parts.join(mid), right_edge)
     };
-    let render = |cells: &[String]| {
+    let render_line = |cells: &[String]| {
         let parts: Vec<String> = cells
             .iter()
             .enumerate()
@@ -813,17 +847,29 @@ fn print_duf_table(title: &str, headers: &[&str], rows: &[Vec<String>], right: &
             .collect();
         format!("│ {} │", parts.join(" │ "))
     };
+    let render_row = |cells: &[String]| {
+        let wrapped: Vec<Vec<String>> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| wrap_cell(cell, widths[i]))
+            .collect();
+        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for line in 0..lines {
+            let parts: Vec<String> = wrapped
+                .iter()
+                .map(|cell| cell.get(line).cloned().unwrap_or_default())
+                .collect();
+            println!("{}", render_line(&parts));
+        }
+    };
     println!("{}", border("╭", "┬", "╮"));
     let title_width: usize = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
     println!("│ {:<width$} │", title, width = title_width);
     println!("{}", border("├", "┼", "┤"));
-    println!(
-        "{}",
-        render(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>())
-    );
+    render_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
     println!("{}", border("├", "┼", "┤"));
     for row in rows {
-        println!("{}", render(row));
+        render_row(row);
     }
     println!("{}", border("╰", "┴", "╯"));
 }
@@ -883,7 +929,7 @@ fn print_duf_status(body: &str) {
             human_bytes(total),
             used_cell,
             human_bytes(total.saturating_sub(used)),
-            usage_bar(percent),
+            usage_bar(percent, 20),
         ]);
     }
     print_duf_table(
@@ -922,7 +968,7 @@ fn print_duf_status(body: &str) {
             human_bytes(logical),
             human_bytes(unique),
             human_bytes(saved),
-            usage_bar(percent),
+            usage_bar(percent, 20),
         ]);
     }
     print_duf_table(
