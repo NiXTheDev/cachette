@@ -33,6 +33,7 @@ use crate::cli::{
     Scope, StateCommand, TokenCommand,
 };
 use crate::config::{Config, split_host_port};
+use crate::duf::{self, Cell, Row, SortKey, Table};
 use crate::identity::Identity;
 use crate::storage::StorageBackend;
 use crate::storage::eviction::{Capacity, Reaper};
@@ -707,9 +708,15 @@ fn mint_buildx_jwt(secret: &str, ttl_seconds: u64, now_unix: i64) -> Result<Stri
 /// subcommand that requires a live server.
 async fn cluster_command(action: &ClusterCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
     match action {
-        ClusterCommand::Status => match fetch_cluster(config).await {
+        ClusterCommand::Status { sort, theme } => match fetch_cluster(config).await {
             Ok(body) => {
-                print_duf_status(&body);
+                print_duf_status(
+                    &body,
+                    &duf::Options {
+                        theme: theme.clone(),
+                        sort: sort.clone(),
+                    },
+                );
                 Ok(0)
             }
             Err(err) => {
@@ -773,112 +780,27 @@ async fn cluster_peer(
     }
 }
 
-fn usage_bar(percent: f64, width: usize) -> String {
-    // duf's ASCII bar: whole '#', a half block for >=0.5 of a cell, then '.'.
-    let width = width.max(1);
-    let value = percent.clamp(0.0, 100.0) / 100.0 * width as f64;
-    let filled = value.floor() as usize;
-    let half = value - filled as f64 >= 0.5 && filled < width;
-    let empty = width - filled - usize::from(half);
-    let bar = format!(
-        "{}{}{}",
-        "#".repeat(filled),
-        if half { "#" } else { "" },
-        ".".repeat(empty)
-    );
-    format!("[{bar}] {percent:>5.1}%")
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
-fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(100)
-        .max(60)
+fn share_percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
 }
 
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
-        return vec![text.to_owned()];
-    }
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect()
-}
-
-fn print_duf_table(title: &str, headers: &[&str], rows: &[Vec<String>], right: &[bool]) {
-    if rows.is_empty() {
-        return;
-    }
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.chars().count());
-        }
-    }
-    // duf keeps the table inside the terminal by squeezing the free-form
-    // columns first; numeric columns and bars keep their natural width.
-    let dynamic = [0usize, 2, widths.len() - 1];
-    let total = |widths: &[usize]| widths.iter().sum::<usize>() + 3 * widths.len() + 1;
-    let max_width = terminal_width();
-    while total(&widths) > max_width {
-        let Some(index) = dynamic.iter().copied().find(|index| widths[*index] > 6) else {
-            break;
-        };
-        widths[index] -= 1;
-    }
-    let border = |left: &str, mid: &str, right_edge: &str| {
-        let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
-        format!("{}{}{}", left, parts.join(mid), right_edge)
-    };
-    let render_line = |cells: &[String]| {
-        let parts: Vec<String> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, cell)| {
-                if right[i] {
-                    format!("{:>width$}", cell, width = widths[i])
-                } else {
-                    format!("{:<width$}", cell, width = widths[i])
-                }
-            })
-            .collect();
-        format!("│ {} │", parts.join(" │ "))
-    };
-    let render_row = |cells: &[String]| {
-        let wrapped: Vec<Vec<String>> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, cell)| wrap_cell(cell, widths[i]))
-            .collect();
-        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
-        for line in 0..lines {
-            let parts: Vec<String> = wrapped
-                .iter()
-                .map(|cell| cell.get(line).cloned().unwrap_or_default())
-                .collect();
-            println!("{}", render_line(&parts));
-        }
-    };
-    println!("{}", border("╭", "┬", "╮"));
-    let title_width: usize = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
-    println!("│ {:<width$} │", title, width = title_width);
-    println!("{}", border("├", "┼", "┤"));
-    render_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
-    println!("{}", border("├", "┼", "┤"));
-    for row in rows {
-        render_row(row);
-    }
-    println!("{}", border("╰", "┴", "╯"));
-}
-
-fn print_duf_status(body: &str) {
+fn print_duf_status(body: &str, opts: &duf::Options) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         println!("{body}");
         return;
     };
+
     let peers = value
         .get("peers")
         .and_then(|v| v.as_array())
@@ -886,18 +808,10 @@ fn print_duf_status(body: &str) {
         .unwrap_or_default();
     let mut peer_rows = Vec::new();
     for peer in &peers {
-        let num = |key: &str| {
-            peer.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-        };
-        let total = num("total_bytes");
-        let used = num("used_bytes");
-        let percent = if total == 0 {
-            0.0
-        } else {
-            used as f64 / total as f64 * 100.0
-        };
+        let total = json_u64(peer, "total_bytes");
+        let used = json_u64(peer, "used_bytes");
+        let avail = total.saturating_sub(used);
+        let use_percent = share_percent(used, total);
         let name = peer
             .get("name")
             .and_then(|v| v.as_str())
@@ -908,6 +822,7 @@ fn print_duf_status(body: &str) {
             .unwrap_or("");
         let short_id: String = fingerprint.chars().take(8).collect();
         let source = peer.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+        // For self, show physical bytes with the logical count in brackets.
         let stored = if source == "self" {
             value
                 .get("dedup")
@@ -917,26 +832,51 @@ fn print_duf_status(body: &str) {
         } else {
             used
         };
-        let used_cell = if stored == used {
+        let used_text = if stored == used {
             human_bytes(used)
         } else {
             format!("{}({})", human_bytes(stored), human_bytes(used))
         };
-        peer_rows.push(vec![
-            name.to_owned(),
-            short_id,
-            source.to_owned(),
-            human_bytes(total),
-            used_cell,
-            human_bytes(total.saturating_sub(used)),
-            usage_bar(percent, 20),
-        ]);
+        peer_rows.push(Row::new(
+            vec![
+                Cell::plain(name.to_owned()),
+                Cell::plain(short_id.clone()),
+                Cell::plain(source.to_owned()),
+                Cell::plain(human_bytes(total)),
+                Cell::plain(used_text),
+                Cell::colored(human_bytes(avail), duf::Theme::avail_color(avail)),
+                Cell::colored(
+                    duf::usage_bar(use_percent, 20),
+                    duf::Theme::usage_color(use_percent),
+                ),
+            ],
+            vec![
+                SortKey::Text(name.to_ascii_lowercase()),
+                SortKey::Text(short_id),
+                SortKey::Text(source.to_owned()),
+                SortKey::Num(total as f64),
+                SortKey::Num(used as f64),
+                SortKey::Num(avail as f64),
+                SortKey::Num(use_percent),
+            ],
+        ));
     }
-    print_duf_table(
-        &format!("{} cluster peers", peer_rows.len()),
-        &["NODE", "ID", "TYPE", "SIZE", "USED", "AVAIL", "USE%"],
-        &peer_rows,
-        &[false, false, false, true, true, true, false],
+    duf::print_table(
+        Table {
+            title: format!("{} cluster peers", peer_rows.len()),
+            headers: vec!["NODE", "ID", "TYPE", "SIZE", "USED", "AVAIL", "USE%"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ids: vec!["node", "id", "type", "size", "used", "avail", "use%"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            rows: peer_rows,
+            right: vec![false, false, false, true, true, true, false],
+            dynamic: vec![0, 2],
+        },
+        opts,
     );
 
     let instances = value
@@ -946,36 +886,47 @@ fn print_duf_status(body: &str) {
         .unwrap_or_default();
     let mut storage_rows = Vec::new();
     for instance in &instances {
-        let num = |key: &str| {
-            instance
-                .get(key)
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-        };
-        let (logical, unique, saved) = (num("logical"), num("unique"), num("saved"));
-        let percent = if logical == 0 {
-            0.0
-        } else {
-            saved as f64 / logical as f64 * 100.0
-        };
-        storage_rows.push(vec![
-            instance
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned(),
-            human_bytes(num("used")),
-            human_bytes(logical),
-            human_bytes(unique),
-            human_bytes(saved),
-            usage_bar(percent, 20),
-        ]);
+        let used = json_u64(instance, "used");
+        let logical = json_u64(instance, "logical");
+        let unique = json_u64(instance, "unique");
+        let saved = json_u64(instance, "saved");
+        let dedup_percent = share_percent(saved, logical);
+        let name = instance.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        storage_rows.push(Row::new(
+            vec![
+                Cell::plain(name.to_owned()),
+                Cell::plain(human_bytes(used)),
+                Cell::plain(human_bytes(logical)),
+                Cell::plain(human_bytes(unique)),
+                Cell::plain(human_bytes(saved)),
+                Cell::colored(duf::usage_bar(dedup_percent, 20), duf::Color::Green),
+            ],
+            vec![
+                SortKey::Text(name.to_ascii_lowercase()),
+                SortKey::Num(used as f64),
+                SortKey::Num(logical as f64),
+                SortKey::Num(unique as f64),
+                SortKey::Num(saved as f64),
+                SortKey::Num(dedup_percent),
+            ],
+        ));
     }
-    print_duf_table(
-        &format!("{} storage instances", storage_rows.len()),
-        &["INSTANCE", "USED", "LOGICAL", "UNIQUE", "SAVED", "DEDUP%"],
-        &storage_rows,
-        &[false, true, true, true, true, false],
+    duf::print_table(
+        Table {
+            title: format!("{} storage instances", storage_rows.len()),
+            headers: vec!["INSTANCE", "USED", "LOGICAL", "UNIQUE", "SAVED", "DEDUP%"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ids: vec!["instance", "used", "logical", "unique", "saved", "dedup%"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            rows: storage_rows,
+            right: vec![false, true, true, true, true, false],
+            dynamic: vec![0],
+        },
+        opts,
     );
 }
 

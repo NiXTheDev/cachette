@@ -250,7 +250,20 @@ pub enum MintKind {
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ClusterCommand {
     /// Rich cluster overview: peers, storage, and dedup savings.
-    Status,
+    Status {
+        /// Comma-separated sort keys (optional leading `-` for descending),
+        /// e.g. `used,-node`. Applied to both tables.
+        #[arg(long, value_name = "KEYS")]
+        sort: Option<String>,
+        /// Table colours: auto, none, dark, light, or ansi.
+        #[arg(
+            long,
+            value_name = "THEME",
+            value_parser = ["auto", "none", "dark", "light", "ansi"],
+            default_value = "auto"
+        )]
+        theme: String,
+    },
     /// Inspect or edit the live peer table.
     Peer {
         #[command(subcommand)]
@@ -381,7 +394,29 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Cluster {
-                action: ClusterCommand::Status
+                action: ClusterCommand::Status {
+                    sort: None,
+                    theme: String::from("auto"),
+                }
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from([
+                "cachette",
+                "cluster",
+                "status",
+                "--sort",
+                "used,-node",
+                "--theme",
+                "light"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Cluster {
+                action: ClusterCommand::Status {
+                    sort: Some(String::from("used,-node")),
+                    theme: String::from("light"),
+                }
             })
         );
         assert_eq!(

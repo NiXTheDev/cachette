@@ -400,6 +400,20 @@ fn cluster_status_reads_the_running_server() {
     // The rich status renders a duf-style peer table plus a storage table.
     assert!(out.contains("cluster peers"), "{out}");
     assert!(out.contains("storage instances"), "{out}");
+    // Sorting and themes are CLI options on the same render path.
+    let (code, out) = run_cli(
+        &config,
+        &[
+            "cluster",
+            "status",
+            "--sort",
+            "used,-node",
+            "--theme",
+            "light",
+        ],
+    );
+    assert_eq!(code, 0, "sorted cluster status ok: {out}");
+    assert!(out.contains("\x1b[38;2;"), "light theme colours: {out}");
     drop(server);
 }
 

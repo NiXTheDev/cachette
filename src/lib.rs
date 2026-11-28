@@ -8,6 +8,7 @@ pub mod auth;
 pub mod cli;
 pub mod cluster;
 pub mod config;
+pub mod duf;
 pub mod error;
 pub mod identity;
 pub mod logging;

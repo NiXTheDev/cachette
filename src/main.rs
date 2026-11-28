@@ -110,6 +110,9 @@ async fn serve(config: Config, cli: Cli) -> Result<(), Box<dyn Error>> {
         "node identity ready"
     );
     state.node_id = identity.fingerprint().to_owned();
+    if let Some(name) = config.cluster.node_id.as_deref() {
+        state.node_name = name.to_owned();
+    }
     // Peer pin store (plan task 14 / B2): seeded fingerprints are always
     // trusted; TOFU admission follows `[cluster] enabled`.
     state.peers = Arc::new(PeerPins::new(

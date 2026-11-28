@@ -1205,18 +1205,38 @@ impl StorageBackend for FsStorage {
 
     fn used_bytes_sync(&self) -> u64 {
         let conn = lock(&self.conn).expect("storage index poisoned");
-        total_used_bytes(&conn).unwrap_or(0).max(0) as u64
+        accounting_for_instance(&conn, &self.instance)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, used)| used.max(0) as u64)
+            .sum()
     }
 
     fn dedup_stats(&self) -> (u64, u64, u64) {
         let conn = lock(&self.conn).expect("storage index poisoned");
-        let row: (i64, i64) = conn
-            .query_row(
+        let (query, values): (&str, Vec<String>) = if self.instance == "default" {
+            (
                 "SELECT COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
-                 FROM chunks WHERE refs > 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                 FROM chunks WHERE refs > 0 AND instr(hex(namespace), '00') = 0",
+                Vec::new(),
             )
+        } else {
+            let prefix = format!("{}\u{0}", self.instance);
+            let hex = prefix
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            (
+                "SELECT COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
+                 FROM chunks WHERE refs > 0 AND substr(hex(namespace), 1, length(?1)) = ?1",
+                vec![hex],
+            )
+        };
+        let row: (i64, i64) = conn
+            .query_row(query, params_from_iter(values), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .expect("dedup stats query");
         let logical = row.0.max(0) as u64;
         let unique = row.1.max(0) as u64;
@@ -6753,6 +6773,50 @@ mod storage_fs {
                 .await
                 .expect("b reservation")
         );
+    }
+
+    /// v1.3: `cluster status` reads these through `used_bytes_sync` and
+    /// `dedup_stats`, so a shared control DB must not make two instances show
+    /// the same (global) numbers.
+    #[tokio::test]
+    async fn instance_status_stats_are_scoped_to_their_owner() {
+        use crate::storage::blob::FsBlobStore;
+
+        let dir = TestDir::new();
+        let db = dir.path().join("control.db");
+        let params = Some(CdcParams::new(4096));
+        let a = FsStorage::open_instance_with_store(
+            dir.path().join("payload-a"),
+            &db,
+            params,
+            Arc::new(FsBlobStore),
+            String::from("a"),
+        )
+        .expect("instance a");
+        let b = FsStorage::open_instance_with_store(
+            dir.path().join("payload-b"),
+            &db,
+            params,
+            Arc::new(FsBlobStore),
+            String::from("b"),
+        )
+        .expect("instance b");
+
+        let payload_a: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..4_000).map(|i| (i % 239) as u8).collect();
+        a.put_stream("k", bytes(&payload_a)).await.expect("put a");
+        a.finalize("k").await.expect("finalize a");
+        b.put_stream("k", bytes(&payload_b)).await.expect("put b");
+        b.finalize("k").await.expect("finalize b");
+
+        assert_eq!(StorageBackend::used_bytes_sync(&a), 20_000);
+        assert_eq!(StorageBackend::used_bytes_sync(&b), 4_000);
+        let (logical_a, unique_a, saved_a) = StorageBackend::dedup_stats(&a);
+        let (logical_b, unique_b, saved_b) = StorageBackend::dedup_stats(&b);
+        assert_eq!(logical_a, 20_000, "instance a's logical bytes only");
+        assert_eq!(logical_b, 4_000, "instance b's logical bytes only");
+        assert!(unique_a > 0 && saved_a == logical_a - unique_a);
+        assert!(unique_b > 0 && saved_b == logical_b - unique_b);
     }
 
     /// v1.3: a remote blob store publishes after the index commit, fetches

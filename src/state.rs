@@ -156,7 +156,12 @@ pub struct AppState {
     pub version: &'static str,
     /// Node identity — replaced with the Ed25519 fingerprint during startup
     /// (plan task 13); the hostname placeholder applies only before then.
+    /// This is an identity key, never a display name.
     pub node_id: String,
+    /// Human node label (`[cluster] node_id`, falling back to the hostname).
+    /// Kept separate from `node_id` so status output can show a readable name
+    /// while identity comparisons use the fingerprint.
+    pub node_name: String,
     /// `--config <path>` placeholder; config loading lands in plan task 5.
     pub config_path: Option<PathBuf>,
     /// Storage handle; `None` until a backend is constructed (plan tasks 8-9).
@@ -248,6 +253,7 @@ impl AppState {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             node_id: default_node_id(),
+            node_name: default_node_id(),
             config_path: None,
             storage: None,
             instances: Arc::new(RwLock::new(InstanceRegistry::default())),

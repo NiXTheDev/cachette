@@ -571,15 +571,19 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
         .snapshot()
         .into_iter()
         .map(|peer| {
-            let source = if peer.node_id == state.node_id || peer.fingerprint == state.node_id {
+            // `state.node_id` is this node's SPKI fingerprint (set at boot), so
+            // the fingerprint is the authoritative self check. Node labels are
+            // client-supplied and can collide; never let one claim `self`.
+            let is_self = !peer.fingerprint.is_empty() && peer.fingerprint == state.node_id;
+            let source = if is_self {
                 "self"
             } else {
                 peer.source.as_str()
             };
             serde_json::json!({
                 "node_id": peer.node_id,
-                "name": if source == "self" {
-                    state.node_id.clone()
+                "name": if is_self {
+                    state.node_name.clone()
                 } else if peer.node_id.is_empty() {
                     peer.fingerprint.clone()
                 } else {
@@ -596,10 +600,10 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
             })
         })
         .collect();
-    let (logical, unique, saved) = state
-        .storage
-        .as_ref()
-        .map_or((0, 0, 0), |storage| storage.dedup_stats());
+    // Aggregate the cluster-wide dedup figures from the per-instance rows.
+    // Taking them from `state.storage` (the default instance) made the top-level
+    // numbers disagree with the table and silently ignore named instances.
+    let (mut logical, mut unique, mut saved) = (0u64, 0u64, 0u64);
     let instances = {
         let registry = state
             .instances
@@ -609,13 +613,17 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
         for name in registry.names() {
             let backend = registry.get(&name);
             let used = backend.as_ref().map_or(0, |b| b.used_bytes_sync());
-            let (logical, unique, saved) = backend.as_ref().map_or((0, 0, 0), |b| b.dedup_stats());
+            let (instance_logical, instance_unique, instance_saved) =
+                backend.as_ref().map_or((0, 0, 0), |b| b.dedup_stats());
+            logical = logical.saturating_add(instance_logical);
+            unique = unique.saturating_add(instance_unique);
+            saved = saved.saturating_add(instance_saved);
             rows.push(serde_json::json!({
                 "name": name,
                 "used": used,
-                "logical": logical,
-                "unique": unique,
-                "saved": saved,
+                "logical": instance_logical,
+                "unique": instance_unique,
+                "saved": instance_saved,
             }));
         }
         rows
