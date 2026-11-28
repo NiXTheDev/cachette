@@ -801,6 +801,14 @@ fn print_duf_status(body: &str, opts: &duf::Options) {
         return;
     };
 
+    // Spend the terminal budget on identity first, then on the usage bar:
+    // 33 chars of fixed peer columns + 22 of borders/separators + 9 around
+    // the bar. This keeps the table inside COLUMNS while showing as much of
+    // the fingerprint as fits (16..32) and a readable bar (10..20 cells).
+    let width = duf::terminal_width();
+    let id_chars = width.saturating_sub(76).clamp(16, 32);
+    let bar_width = width.saturating_sub(64 + id_chars).clamp(10, 20);
+
     let peers = value
         .get("peers")
         .and_then(|v| v.as_array())
@@ -820,7 +828,7 @@ fn print_duf_status(body: &str, opts: &duf::Options) {
             .get("fingerprint")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let short_id: String = fingerprint.chars().take(8).collect();
+        let short_id: String = fingerprint.chars().take(id_chars).collect();
         let source = peer.get("source").and_then(|v| v.as_str()).unwrap_or("?");
         // For self, show physical bytes with the logical count in brackets.
         let stored = if source == "self" {
@@ -846,7 +854,7 @@ fn print_duf_status(body: &str, opts: &duf::Options) {
                 Cell::plain(used_text),
                 Cell::colored(human_bytes(avail), duf::Theme::avail_color(avail)),
                 Cell::colored(
-                    duf::usage_bar(use_percent, 20),
+                    duf::usage_bar(use_percent, bar_width),
                     duf::Theme::usage_color(use_percent),
                 ),
             ],
@@ -899,7 +907,7 @@ fn print_duf_status(body: &str, opts: &duf::Options) {
                 Cell::plain(human_bytes(logical)),
                 Cell::plain(human_bytes(unique)),
                 Cell::plain(human_bytes(saved)),
-                Cell::colored(duf::usage_bar(dedup_percent, 20), duf::Color::Green),
+                Cell::colored(duf::usage_bar(dedup_percent, bar_width), duf::Color::Green),
             ],
             vec![
                 SortKey::Text(name.to_ascii_lowercase()),

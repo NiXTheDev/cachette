@@ -224,7 +224,8 @@ pub fn usage_bar(percent: f64, width: usize) -> String {
     )
 }
 
-fn terminal_width() -> usize {
+#[must_use]
+pub fn terminal_width() -> usize {
     std::env::var("COLUMNS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -232,16 +233,20 @@ fn terminal_width() -> usize {
         .max(60)
 }
 
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+/// Keep every row on one line: truncate with an ellipsis rather than wrapping
+/// a long node name or fingerprint into a second row.
+fn fit_cell(text: &str, width: usize) -> String {
     let width = width.max(1);
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= width {
-        return vec![text.to_owned()];
+        return text.to_owned();
     }
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect()
+    if width == 1 {
+        return String::from("…");
+    }
+    let mut fitted: String = chars.into_iter().take(width - 1).collect();
+    fitted.push('…');
+    fitted
 }
 
 /// Parse `--sort node,-used` into `(column index, descending)` pairs.
@@ -312,6 +317,35 @@ pub fn print_table(mut table: Table, opts: &Options) {
         };
         widths[index] -= 1;
     }
+    // duf also grows the free-form columns into spare width, so the table
+    // fills the terminal instead of hugging its content. The first dynamic
+    // column (node/instance name) gets twice the share of the others.
+    let spare = max_width.saturating_sub(line_width(&widths));
+    if spare > 0 {
+        let weights: Vec<f64> = match table.dynamic.len() {
+            0 => Vec::new(),
+            1 => vec![1.0],
+            _ => table
+                .dynamic
+                .iter()
+                .enumerate()
+                .map(|(position, _)| if position == 0 { 2.0 } else { 1.0 })
+                .collect(),
+        };
+        let total: f64 = weights.iter().sum();
+        let mut used = 0;
+        for (position, &index) in table.dynamic.iter().enumerate() {
+            let share = if position + 1 == weights.len() {
+                spare - used
+            } else {
+                ((spare as f64 * weights[position] / total).floor() as usize).min(spare - used)
+            };
+            if let Some(width) = widths.get_mut(index) {
+                *width = width.saturating_add(share);
+            }
+            used += share;
+        }
+    }
 
     let border = |left: &str, mid: &str, right: &str| {
         let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
@@ -334,23 +368,15 @@ pub fn print_table(mut table: Table, opts: &Options) {
         format!("│ {} │", parts.join(" │ "))
     };
     let render_row = |cells: &[Cell]| {
-        let wrapped: Vec<Vec<String>> = cells
+        let parts: Vec<Cell> = cells
             .iter()
             .enumerate()
-            .map(|(index, cell)| wrap_cell(&cell.text, widths.get(index).copied().unwrap_or(1)))
+            .map(|(index, cell)| Cell {
+                text: fit_cell(&cell.text, widths.get(index).copied().unwrap_or(1)),
+                color: cell.color,
+            })
             .collect();
-        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
-        for line in 0..lines {
-            let parts: Vec<Cell> = wrapped
-                .iter()
-                .enumerate()
-                .map(|(index, cell)| Cell {
-                    text: cell.get(line).cloned().unwrap_or_default(),
-                    color: cells.get(index).and_then(|cell| cell.color),
-                })
-                .collect();
-            println!("{}", render_line(&parts));
-        }
+        println!("{}", render_line(&parts));
     };
 
     println!("{}", border("╭", "┬", "╮"));
@@ -358,7 +384,9 @@ pub fn print_table(mut table: Table, opts: &Options) {
     let title_width = line_width(&widths).saturating_sub(4);
     let title: String = table.title.chars().take(title_width).collect();
     println!("│ {title:<title_width$} │");
-    println!("{}", border("├", "┼", "┤"));
+    // duf separates the title with top-tees, not crosses: `┼` reads as a row
+    // of plus signs crowding the heading. Crosses stay below the header.
+    println!("{}", border("├", "┬", "┤"));
     let headers: Vec<Cell> = table
         .headers
         .iter()
@@ -396,6 +424,13 @@ mod tests {
             vec![(1, true), (0, false)]
         );
         assert!(parse_sort(Some("bogus"), &ids).is_empty());
+    }
+
+    #[test]
+    fn cells_are_truncated_not_wrapped() {
+        assert_eq!(fit_cell("abcdef", 6), "abcdef");
+        assert_eq!(fit_cell("abcdef", 3), "ab…");
+        assert_eq!(fit_cell("abcdef", 1), "…");
     }
 
     #[test]
