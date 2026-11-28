@@ -51,7 +51,7 @@ The node fingerprint is the uppercase hex SHA-256 of the certificate's public ke
 # cert_path: /var/lib/cachette/identity
 ```
 
-Use `cachette identity` on each node to collect the fingerprints you put in `cluster.seed_fingerprints`. `cachette cluster status` lists the live peer table with a `source` column: `seed` (configured address, no identity yet), `mdns` (resolved through service discovery), or `direct` (identity learned from a hello/heartbeat). `--watch` alone refreshes every 2 seconds; `--watch 2m`, `--watch 1h` and bare integers are also accepted.
+Use `cachette identity` on each node to collect the fingerprints you put in `cluster.seed_fingerprints`. `cachette cluster peer list` lists the live peer table with a `source` column: `seed` (configured address, no identity yet), `mdns` (resolved through service discovery), or `direct` (identity learned from a hello/heartbeat). `--watch` alone refreshes every 2 seconds; `--watch 2m`, `--watch 1h` and bare integers are also accepted. `cachette cluster peer add/remove/edit` mutate the live peer table through the admin endpoint; they require the server to be running. `cachette cluster status` is the richer overview: peer table plus per-instance usage and CDC dedup savings.
 
 ### Certificate rotation
 

@@ -27,7 +27,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::HttpBody;
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header, request::Parts};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
@@ -72,7 +72,10 @@ pub fn router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/_internal/register", post(register_token))
         .route("/_internal/revoke", post(revoke_token))
-        .route("/_internal/cluster", get(cluster_status));
+        .route("/_internal/cluster", get(cluster_status))
+        .route("/_internal/cluster/peers/add", post(peer_add))
+        .route("/_internal/cluster/peers/remove", post(peer_remove))
+        .route("/_internal/cluster/peers/edit", post(peer_edit));
     let v1_routes = Router::new()
         .route("/_apis/artifactcache/cache", get(v1::find))
         .route("/_apis/artifactcache/caches", post(v1::reserve))
@@ -479,6 +482,81 @@ async fn revoke_token(
 /// status` (plan task 46). Admin-gated exactly like the token routes (Bearer
 /// `auth.secret`, or loopback-only when `[cluster] enabled` is false). It reads
 /// the in-memory peer table, so it never touches the (locked) data directory.
+fn admin_bearer(state: &AppState, headers: &HeaderMap) -> bool {
+    let policy = state.auth();
+    match (policy.secret.as_deref(), auth::bearer_token(headers)) {
+        (Some(secret), Some(token)) => auth::constant_time_eq(token.as_bytes(), secret.as_bytes()),
+        _ => false,
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+}
+
+async fn peer_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !admin_bearer(&state, &headers) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let Some(addr) = json_string(&body, "addr") else {
+        return ApiError::BadRequest(String::from("addr is required")).into_response();
+    };
+    let node_id = json_string(&body, "node_id").unwrap_or_default();
+    let fingerprint = json_string(&body, "fingerprint").unwrap_or_default();
+    let now = u64::try_from(crate::auth::now_secs()).unwrap_or(0);
+    if node_id.is_empty() || fingerprint.is_empty() {
+        state.peer_table.observe_addr(&addr);
+    } else {
+        state
+            .peer_table
+            .observe_discovered(&node_id, &fingerprint, &addr, now);
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn peer_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !admin_bearer(&state, &headers) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let Some(key) = json_string(&body, "peer") else {
+        return ApiError::BadRequest(String::from("peer is required")).into_response();
+    };
+    let removed = state.peer_table.remove(&key);
+    Json(serde_json::json!({ "ok": removed })).into_response()
+}
+
+async fn peer_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !admin_bearer(&state, &headers) {
+        return ApiError::Unauthorized(String::from("authentication required")).into_response();
+    }
+    let Some(key) = json_string(&body, "peer") else {
+        return ApiError::BadRequest(String::from("peer is required")).into_response();
+    };
+    let ok = state.peer_table.edit(
+        &key,
+        json_string(&body, "addr"),
+        json_string(&body, "node_id"),
+        json_string(&body, "fingerprint"),
+    );
+    Json(serde_json::json!({ "ok": ok })).into_response()
+}
+
 async fn cluster_status(State(state): State<AppState>, request: Request) -> Response {
     if !admin_authorized(&state, &request) {
         return ApiError::Unauthorized(String::from("authentication required")).into_response();
@@ -501,9 +579,14 @@ async fn cluster_status(State(state): State<AppState>, request: Request) -> Resp
             })
         })
         .collect();
+    let (logical, unique, saved) = state
+        .storage
+        .as_ref()
+        .map_or((0, 0, 0), |storage| storage.dedup_stats());
     let cluster_enabled = state.auth().cluster_enabled;
     Json(serde_json::json!({
         "node_id": state.node_id,
+        "dedup": { "logical": logical, "unique": unique, "saved": saved },
         "cluster_enabled": cluster_enabled,
         "peers": peers,
     }))

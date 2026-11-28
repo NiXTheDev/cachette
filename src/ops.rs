@@ -16,6 +16,7 @@ pub mod migrate;
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -183,7 +184,7 @@ pub fn run(command: &Command, config: &Config) -> Result<i32, Box<dyn Error>> {
             }
         },
         Command::Token { action } => token(action, config),
-        Command::Cluster { action } => block_on(cluster_status(action, config)),
+        Command::Cluster { action } => block_on(cluster_command(action, config)),
     }
 }
 
@@ -548,6 +549,27 @@ async fn doctor(config: &Config) -> Result<i32, Box<dyn Error>> {
         }
     }
 
+    for instance in &config.storage.instances {
+        match open_named_storage(config, Some(&instance.name), true) {
+            Ok(storage) => {
+                let used = storage.instance_used_bytes().await.unwrap_or(0);
+                let (logical, unique, saved) = storage.dedup_stats();
+                println!(
+                    "instance {}: {} used, CDC {} logical / {} unique / {} saved",
+                    instance.name,
+                    human_bytes(used),
+                    human_bytes(logical),
+                    human_bytes(unique),
+                    human_bytes(saved)
+                );
+            }
+            Err(err) => {
+                failures += 1;
+                println!("instance {}: cannot open index: {err}", instance.name);
+            }
+        }
+    }
+
     Ok(if failures == 0 { 0 } else { FAILED })
 }
 
@@ -676,33 +698,104 @@ fn mint_buildx_jwt(secret: &str, ttl_seconds: u64, now_unix: i64) -> Result<Stri
 /// `cachette cluster status [--watch]` — fetch the live member table from the
 /// running server's loopback admin endpoint (plan task 46). This is the one
 /// subcommand that requires a live server.
-async fn cluster_status(action: &ClusterCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
-    let ClusterCommand::Status { watch } = action;
-    let interval = match watch {
-        None => None,
-        Some(raw) => {
-            let seconds = parse_duration(raw).map_err(invalid_input)?;
-            Some(Duration::from_secs(seconds.max(1)))
-        }
-    };
-    loop {
-        match fetch_cluster(config).await {
-            Ok(body) => print_member_table(&body),
+async fn cluster_command(action: &ClusterCommand, config: &Config) -> Result<i32, Box<dyn Error>> {
+    match action {
+        ClusterCommand::Status => match fetch_cluster(config).await {
+            Ok(body) => {
+                print_member_table(&body);
+                print_cluster_summary(&body);
+                Ok(0)
+            }
             Err(err) => {
                 eprintln!("cachette: {err}");
-                return Ok(FAILED);
+                Ok(FAILED)
+            }
+        },
+        ClusterCommand::Peer { action } => cluster_peer(action, config).await,
+    }
+}
+
+async fn cluster_peer(
+    action: &crate::cli::PeerCommand,
+    config: &Config,
+) -> Result<i32, Box<dyn Error>> {
+    use crate::cli::PeerCommand;
+    let (path, body) = match action {
+        PeerCommand::List { watch } => {
+            let interval = match watch {
+                None => None,
+                Some(raw) => Some(Duration::from_secs(
+                    parse_duration(raw).map_err(invalid_input)?.max(1),
+                )),
+            };
+            loop {
+                match fetch_cluster(config).await {
+                    Ok(body) => print_member_table(&body),
+                    Err(err) => {
+                        eprintln!("cachette: {err}");
+                        return Ok(FAILED);
+                    }
+                }
+                let Some(interval) = interval else {
+                    return Ok(0);
+                };
+                tokio::time::sleep(interval).await;
             }
         }
-        let Some(interval) = interval else {
-            return Ok(0);
-        };
-        tokio::time::sleep(interval).await;
+        PeerCommand::Add { addr, node_id, fingerprint } => (
+            "/_internal/cluster/peers/add",
+            serde_json::json!({ "addr": addr, "node_id": node_id, "fingerprint": fingerprint }).to_string(),
+        ),
+        PeerCommand::Remove { peer } => (
+            "/_internal/cluster/peers/remove",
+            serde_json::json!({ "peer": peer }).to_string(),
+        ),
+        PeerCommand::Edit { peer, addr, node_id, fingerprint } => (
+            "/_internal/cluster/peers/edit",
+            serde_json::json!({ "peer": peer, "addr": addr, "node_id": node_id, "fingerprint": fingerprint }).to_string(),
+        ),
+    };
+    match admin_request(config, "POST", path, Some(body)).await {
+        Ok(body) => {
+            println!("{body}");
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("cachette: {err}");
+            Ok(FAILED)
+        }
     }
+}
+
+fn print_cluster_summary(body: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return;
+    };
+    let Some(dedup) = value.get("dedup") else {
+        return;
+    };
+    let number = |key: &str| {
+        dedup
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    println!(
+        "dedup: {} logical chunk bytes, {} unique, {} saved",
+        number("logical"),
+        number("unique"),
+        number("saved")
+    );
 }
 
 /// Dial the local server over mTLS (pinning the node's own SPKI fingerprint)
 /// and `GET /_internal/cluster`, returning the JSON body.
-async fn fetch_cluster(config: &Config) -> Result<String, Box<dyn Error>> {
+async fn admin_request(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<String, Box<dyn Error>> {
     let secret = config
         .auth
         .secret
@@ -741,13 +834,28 @@ async fn fetch_cluster(config: &Config) -> Result<String, Box<dyn Error>> {
         .connect(server_name, tcp)
         .await
         .map_err(|err| io::Error::other(format!("TLS handshake failed: {err}")))?;
-    let request = format!(
-        "GET /_internal/cluster HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\n\r\n"
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\n"
     );
+    if let Some(body) = &body {
+        let _ = write!(
+            request,
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+    }
+    request.push_str("\r\n");
+    if let Some(body) = &body {
+        stream.write_all(body.as_bytes()).await?;
+    }
     stream.write_all(request.as_bytes()).await?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
     parse_http(&raw)
+}
+
+async fn fetch_cluster(config: &Config) -> Result<String, Box<dyn Error>> {
+    admin_request(config, "GET", "/_internal/cluster", None).await
 }
 
 /// The address to dial the local server: the advertise address (which defaults
@@ -871,6 +979,17 @@ fn parse_duration(raw: &str) -> Result<u64, String> {
     value
         .checked_mul(multiplier)
         .ok_or_else(|| format!("duration {raw:?} overflows"))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1}{}", UNITS[unit])
 }
 
 /// Pluralization helper for the `entry`/`entries` summary lines.

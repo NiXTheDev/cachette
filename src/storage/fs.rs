@@ -1203,6 +1203,21 @@ impl StorageBackend for FsStorage {
         self.blob.capabilities()
     }
 
+    fn dedup_stats(&self) -> (u64, u64, u64) {
+        let conn = lock(&self.conn).expect("storage index poisoned");
+        let row: (i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
+                 FROM chunks WHERE refs > 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("dedup stats query");
+        let unique = row.0.max(0) as u64;
+        let logical = row.1.max(0) as u64;
+        (logical, unique, logical.saturating_sub(unique))
+    }
+
     fn scoped(&self, namespace: &str) -> Arc<dyn StorageBackend> {
         // The inherent `FsStorage::scoped` builds a cheap namespaced view
         // (shared connection/gate/locks); boxing it satisfies the trait's

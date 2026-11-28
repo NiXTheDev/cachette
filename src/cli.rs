@@ -249,12 +249,43 @@ pub enum MintKind {
 /// `cachette cluster <action>`.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ClusterCommand {
-    /// Print the member table once, or follow it with `--watch[=INTERVAL]`.
-    Status {
-        /// Refresh until interrupted; accepts `2`, `2s`, `2m`, `1h`, `7d`.
-        /// `--watch` alone refreshes every 2 seconds.
+    /// Rich cluster overview: peers, storage, and dedup savings.
+    Status,
+    /// Inspect or edit the live peer table.
+    Peer {
+        #[command(subcommand)]
+        action: PeerCommand,
+    },
+}
+
+/// `cachette cluster peer <action>`.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum PeerCommand {
+    /// Print the peer table once, or follow it with `--watch[=INTERVAL]`.
+    List {
         #[arg(long, num_args = 0..=1, default_missing_value = "2s", value_name = "INTERVAL")]
         watch: Option<String>,
+    },
+    /// Add a peer address (identity optional; use `--node-id` and
+    /// `--fingerprint` to seed it already identified).
+    Add {
+        addr: String,
+        #[arg(long)]
+        node_id: Option<String>,
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
+    /// Remove a peer by node id, fingerprint, or address.
+    Remove { peer: String },
+    /// Edit a peer's address or identity in place.
+    Edit {
+        peer: String,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        node_id: Option<String>,
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
 }
 
@@ -346,22 +377,22 @@ mod tests {
             })
         );
         assert_eq!(
-            Cli::try_parse_from(["cachette", "cluster", "status", "--watch"])
+            Cli::try_parse_from(["cachette", "cluster", "status"])
                 .unwrap()
                 .command,
             Some(Command::Cluster {
-                action: ClusterCommand::Status {
-                    watch: Some(String::from("2s")),
-                }
+                action: ClusterCommand::Status
             })
         );
         assert_eq!(
-            Cli::try_parse_from(["cachette", "cluster", "status", "--watch", "2m"])
+            Cli::try_parse_from(["cachette", "cluster", "peer", "list", "--watch", "2m"])
                 .unwrap()
                 .command,
             Some(Command::Cluster {
-                action: ClusterCommand::Status {
-                    watch: Some(String::from("2m")),
+                action: ClusterCommand::Peer {
+                    action: PeerCommand::List {
+                        watch: Some(String::from("2m")),
+                    }
                 }
             })
         );

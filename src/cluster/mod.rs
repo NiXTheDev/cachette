@@ -200,6 +200,51 @@ impl PeerTable {
         true
     }
 
+    /// Remove a peer by node id, fingerprint, or dial address.
+    pub fn remove(&self, key: &str) -> bool {
+        let mut peers = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = peers
+            .iter()
+            .find(|(_, peer)| peer.node_id == key || peer.fingerprint == key || peer.addr == key)
+            .map(|(key, _)| key.clone());
+        found.is_some_and(|key| peers.remove(&key).is_some())
+    }
+
+    /// Edit a peer's identity/address in place. Empty fields are left alone.
+    pub fn edit(
+        &self,
+        key: &str,
+        addr: Option<String>,
+        node_id: Option<String>,
+        fingerprint: Option<String>,
+    ) -> bool {
+        let mut peers = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = peers
+            .iter()
+            .find(|(_, peer)| peer.node_id == key || peer.fingerprint == key || peer.addr == key)
+            .map(|(key, _)| key.clone());
+        let Some(found) = found else {
+            return false;
+        };
+        let peer = peers.get_mut(&found).expect("key just found");
+        if let Some(addr) = addr {
+            peer.addr = addr;
+        }
+        if let Some(node_id) = node_id {
+            peer.node_id = node_id;
+        }
+        if let Some(fingerprint) = fingerprint {
+            peer.fingerprint = fingerprint;
+        }
+        true
+    }
+
     /// Timeout sweep (plan task 29 / M15): mark every fresh peer whose
     /// `last_hello` is at least `timeout_seconds` old unhealthy. Records with
     /// `last_hello == 0` are pre-hello seeds with no freshness yet and are
