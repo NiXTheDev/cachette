@@ -6,6 +6,32 @@ use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
 
+/// Sort keys accepted by `cluster status --sort`, across both tables.
+const SORT_KEYS: &[&str] = &[
+    "node", "id", "type", "size", "used", "avail", "use%", "instance", "logical", "unique",
+    "saved", "dedup%",
+];
+
+/// Validate the comma-separated `--sort` spec so a typo is a usage error
+/// instead of silently unsorted output. A key absent from one table is still
+/// ignored there, since the two tables expose different columns.
+fn parse_sort_keys(raw: &str) -> Result<String, String> {
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let key = part.strip_prefix('-').unwrap_or(part).to_ascii_lowercase();
+        if !SORT_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown sort key `{key}` (valid: {})",
+                SORT_KEYS.join(", ")
+            ));
+        }
+    }
+    Ok(raw.to_owned())
+}
+
 /// Cachette - GitHub Actions cache server (v1 artifactcache + Twirp v2).
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -253,7 +279,7 @@ pub enum ClusterCommand {
     Status {
         /// Comma-separated sort keys (optional leading `-` for descending),
         /// e.g. `used,-node`. Applied to both tables.
-        #[arg(long, value_name = "KEYS")]
+        #[arg(long, value_name = "KEYS", value_parser = parse_sort_keys)]
         sort: Option<String>,
         /// Table colours: auto, none, dark, light, or ansi.
         #[arg(
@@ -418,6 +444,10 @@ mod tests {
                     theme: String::from("light"),
                 }
             })
+        );
+        assert!(
+            Cli::try_parse_from(["cachette", "cluster", "status", "--sort", "use"])
+                .is_err_and(|err| err.to_string().contains("unknown sort key `use`"))
         );
         assert_eq!(
             Cli::try_parse_from(["cachette", "cluster", "peer", "list", "--watch", "2m"])

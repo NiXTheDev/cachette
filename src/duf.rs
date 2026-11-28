@@ -137,8 +137,11 @@ impl SortKey {
         match (self, other) {
             (Self::Num(a), Self::Num(b)) => a.total_cmp(b),
             (Self::Text(a), Self::Text(b)) => a.cmp(b),
-            (Self::Num(a), Self::Text(b)) => a.to_string().cmp(b),
-            (Self::Text(a), Self::Num(b)) => a.cmp(&b.to_string()),
+            // Every current table uses one key type per column; if a typo in
+            // the caller ever mixes them, use a stable rule instead of
+            // comparing a formatted float to arbitrary text.
+            (Self::Text(_), Self::Num(_)) => Ordering::Less,
+            (Self::Num(_), Self::Text(_)) => Ordering::Greater,
         }
     }
 }
@@ -393,6 +396,18 @@ mod tests {
             vec![(1, true), (0, false)]
         );
         assert!(parse_sort(Some("bogus"), &ids).is_empty());
+    }
+
+    #[test]
+    fn mixed_keys_have_a_stable_order() {
+        assert_eq!(
+            SortKey::Text(String::from("x")).compare(&SortKey::Num(1.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            SortKey::Num(1.0).compare(&SortKey::Text(String::from("x"))),
+            Ordering::Greater
+        );
     }
 
     #[test]

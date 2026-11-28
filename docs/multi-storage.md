@@ -132,7 +132,7 @@ go through a payload store, chosen by `type`:
 | `copyparty` | `url/prefix/{id}` via up2k | no | optional `username` + `password_file` (the `PW` header) |
 | `azure` | one container, blobs under `prefix/{id}` | no | `AZURE_STORAGE_ACCOUNT`/`AZURE_STORAGE_KEY`, config fallback |
 | `ftp` | `ftp://host/base/prefix/{id}`, passive mode | no | optional `username` + `password_file` |
-| `sftp` | `sftp://host/base/prefix/{id}` via the system `sftp` client | no | SSH key or agent (`private_key_file`) |
+| `sftp` | `sftp://host/base/prefix/{id}` over SSH/SFTP | no | SSH key (`private_key_file`), host key via `known_hosts_file` |
 
 **fs** needs nothing beyond a writable root. Mounted network filesystems are
 ordinary `fs` instances: `mount_url` records what is mounted at `path` so
@@ -171,11 +171,16 @@ addressing.
 reported rather than silently downloading the wrong bytes. FTPS is not
 implemented — mount an FTPS endpoint through rclone and use an `fs` instance.
 
-**SFTP** uses the system `sftp` client in batch mode with `BatchMode=yes`, so
-only key/agent authentication is supported (`private_key_file` is passed as
-`-i`). Each operation is one short-lived process, and a ranged read downloads
-the object to a temporary file before slicing it. For high-traffic caches,
-mount the remote filesystem (sshfs/rclone) and use an `fs` instance instead.
+**SFTP** uses the native russh client when `private_key_file` is a readable
+OpenSSH key, and the system `sftp` client in batch mode (`BatchMode=yes`) as a
+fallback when it is not; only key authentication is supported either way. A
+ranged read downloads the object to a temporary file before slicing it. Set
+`known_hosts_file` to an OpenSSH known_hosts file to pin the server host key:
+the native client refuses a host whose key is absent or changed, and refuses
+to connect at all when the file cannot be read. Without it the native client
+accepts any host key (TOFU), while the system `sftp` fallback checks its own
+known_hosts. For high-traffic caches, mount the remote filesystem
+(sshfs/rclone) and use an `fs` instance instead.
 
 All remote stores require `ca_pem` for `https` endpoints (and Azure's default
 public endpoint is https): the same explicit-trust posture as OIDC's

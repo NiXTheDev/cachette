@@ -25,6 +25,9 @@ pub struct SftpConfig {
     pub url: String,
     pub username: Option<String>,
     pub private_key_file: Option<std::path::PathBuf>,
+    /// OpenSSH known_hosts file used by the native client to verify the
+    /// server host key. `None` keeps the old TOFU behaviour.
+    pub known_hosts_file: Option<std::path::PathBuf>,
 }
 
 /// SFTP remote operations.
@@ -147,17 +150,47 @@ fn quote(path: &str) -> String {
     )
 }
 
-struct SshHandler;
+struct SshHandler {
+    host: String,
+    port: u16,
+    known_hosts: Option<std::path::PathBuf>,
+}
 
 impl russh::client::Handler for SshHandler {
     type Error = russh::Error;
 
-    // TOFU, matching the cluster peer model; host-key pinning is a follow-up.
+    /// Verify the server host key against the configured known_hosts file.
+    /// Without one this is TOFU, matching the old behaviour; the system
+    /// `sftp` fallback always checks its own known_hosts instead.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let offered = server_public_key.public_key();
+        // russh's known_hosts comparison includes the OpenSSH comment, which
+        // a host key from the wire never has. Compare key material only.
+        let key = russh::keys::PublicKey::new(offered.key_data().clone(), "");
+        match self.known_hosts.as_deref() {
+            Some(path) => {
+                match russh::keys::check_known_hosts_path(self.host.as_str(), self.port, &key, path)
+                {
+                    Ok(verified) => {
+                        if !verified {
+                            tracing::warn!(host = %self.host, port = self.port, "SFTP host key not in known_hosts; refusing connection");
+                        }
+                        Ok(verified)
+                    }
+                    Err(err) => {
+                        tracing::warn!(host = %self.host, error = %err, "cannot read SFTP known_hosts; refusing connection");
+                        Ok(false)
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(host = %self.host, "SFTP host key unverified (TOFU); set known_hosts_file to pin it");
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -169,7 +202,12 @@ impl SftpOps {
             .as_ref()
             .ok_or_else(|| io::Error::other("native SFTP needs a private key"))?;
         let config = Arc::new(russh::client::Config::default());
-        let mut session = russh::client::connect(config, (host.as_str(), port), SshHandler)
+        let handler = SshHandler {
+            host: host.clone(),
+            port,
+            known_hosts: self.config.known_hosts_file.clone(),
+        };
+        let mut session = russh::client::connect(config, (host.as_str(), port), handler)
             .await
             .map_err(io::Error::other)?;
         let user = user.unwrap_or_default();
@@ -355,12 +393,66 @@ mod tests {
         assert!(!quote("/a\nrm /b").contains('\n'));
     }
 
+    /// The native client must refuse a host key that is not in the configured
+    /// known_hosts file; an unconfigured file stays TOFU (the old behaviour).
+    #[tokio::test]
+    async fn known_hosts_file_pins_the_server_key() {
+        use russh::client::Handler;
+        use russh::keys::{PrivateKey, PublicKeyOrCertificate};
+
+        const TEST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+            b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+            QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+            XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+            AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+            ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+            -----END OPENSSH PRIVATE KEY-----\n";
+        let key = PrivateKey::from_openssh(TEST_KEY).expect("test key");
+        let public = key.public_key();
+        let offered: PublicKeyOrCertificate = public.clone().into();
+
+        let dir = std::env::temp_dir().join(format!("cachette-sftp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("known_hosts");
+        let line = format!(
+            "[sftp.example.org]:2222 {}\n",
+            public.to_openssh().expect("openssh")
+        );
+        std::fs::write(&path, &line).expect("write known_hosts");
+        let mut handler = SshHandler {
+            host: String::from("sftp.example.org"),
+            port: 2222,
+            known_hosts: Some(path.clone()),
+        };
+        assert!(
+            handler
+                .check_server_key(&offered)
+                .await
+                .expect("pinned key")
+        );
+        handler.host = String::from("other.example.org");
+        assert!(
+            !handler
+                .check_server_key(&offered)
+                .await
+                .expect("unpinned host"),
+            "a key for a different host must be refused"
+        );
+        handler.known_hosts = None;
+        assert!(
+            handler.check_server_key(&offered).await.expect("tofu"),
+            "without a known_hosts file the old TOFU behaviour stays"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn endpoint_uses_url_user_and_default_port() {
         let ops = SftpOps::new(SftpConfig {
             url: String::from("sftp://ci@host.example.org/cachette/"),
             username: None,
             private_key_file: None,
+            known_hosts_file: None,
         });
         let (host, port, base, user) = ops.endpoint().expect("endpoint");
         assert_eq!(host, "host.example.org");

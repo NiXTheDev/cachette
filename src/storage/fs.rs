@@ -620,6 +620,10 @@ impl FsStorage {
         let conn = Arc::clone(&self.conn);
         let blobs = self.root.join("blobs");
         blocking(move || {
+            // The known set is deliberately global: entry ids are already
+            // instance-scoped hashes, so rows from other instances can only
+            // protect a same-named rowless file (a harmless leak), while a
+            // per-instance filter would risk sweeping a live blob.
             let known: std::collections::HashSet<String> = {
                 let conn = lock(&conn)?;
                 let mut stmt = conn
@@ -717,6 +721,12 @@ impl FsStorage {
                         .map_err(sql)?;
                 }
                 swept.rows = u64::try_from(stale.len()).unwrap_or(u64::MAX);
+                // This set must stay global. Chunk ids are content hashes and
+                // one shared row can serve entries in several instances; its
+                // namespace records only the first owner. Filtering by this
+                // instance would delete a chunk file another instance needs.
+                // The zero-ref purge above is global for the same reason: it
+                // only removes rows with no live referrer in ANY namespace.
                 let mut stmt = conn.prepare("SELECT id FROM chunks").map_err(sql)?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))
@@ -1214,32 +1224,41 @@ impl StorageBackend for FsStorage {
 
     fn dedup_stats(&self) -> (u64, u64, u64) {
         let conn = lock(&self.conn).expect("storage index poisoned");
-        let (query, values): (&str, Vec<String>) = if self.instance == "default" {
-            (
-                "SELECT COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
-                 FROM chunks WHERE refs > 0 AND instr(hex(namespace), '00') = 0",
-                Vec::new(),
+        // Filter in Rust, not on `hex(namespace)`: a hex '00' substring can
+        // straddle two non-NUL bytes (0xF0 0x0F -> "F00F"), which would drop
+        // an otherwise valid default-instance namespace.
+        let mut stmt = conn
+            .prepare(
+                "SELECT namespace, COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
+                 FROM chunks WHERE refs > 0 GROUP BY namespace",
             )
-        } else {
-            let prefix = format!("{}\u{0}", self.instance);
-            let hex = prefix
-                .as_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<String>();
-            (
-                "SELECT COALESCE(SUM(size * refs), 0), COALESCE(SUM(size), 0) \
-                 FROM chunks WHERE refs > 0 AND substr(hex(namespace), 1, length(?1)) = ?1",
-                vec![hex],
-            )
-        };
-        let row: (i64, i64) = conn
-            .query_row(query, params_from_iter(values), |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
             .expect("dedup stats query");
-        let logical = row.0.max(0) as u64;
-        let unique = row.1.max(0) as u64;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("dedup stats rows");
+        let prefix = format!("{}\u{0}", self.instance);
+        let mut logical = 0_i64;
+        let mut unique = 0_i64;
+        for row in rows {
+            let (namespace, row_logical, row_unique) = row.expect("dedup stats row");
+            let owned = if self.instance == "default" {
+                !namespace.contains('\u{0}')
+            } else {
+                namespace.starts_with(&prefix)
+            };
+            if owned {
+                logical += row_logical;
+                unique += row_unique;
+            }
+        }
+        let logical = logical.max(0) as u64;
+        let unique = unique.max(0) as u64;
         (logical, unique, logical.saturating_sub(unique))
     }
 
@@ -6817,6 +6836,74 @@ mod storage_fs {
         assert_eq!(logical_b, 4_000, "instance b's logical bytes only");
         assert!(unique_a > 0 && saved_a == logical_a - unique_a);
         assert!(unique_b > 0 && saved_b == logical_b - unique_b);
+    }
+
+    /// A chunk row is shared by content hash across instances even though it
+    /// records only its first owner's namespace. A sweep from either instance
+    /// must keep the other's chunk file: the known set cannot be scoped.
+    #[tokio::test]
+    async fn a_shared_chunk_row_keeps_both_instances_chunk_files() {
+        use crate::storage::blob::FsBlobStore;
+
+        let dir = TestDir::new();
+        let db = dir.path().join("control.db");
+        let open = |name: &str, root: &str| {
+            FsStorage::open_instance_with_store(
+                dir.path().join(root),
+                &db,
+                Some(CdcParams::new(4096)),
+                Arc::new(FsBlobStore),
+                String::from(name),
+            )
+            .expect("instance")
+        };
+        let b = open("b", "payload-b");
+        let a = open("a", "payload-a");
+        let payload: Vec<u8> = (0..8_000).map(|i| (i % 251) as u8).collect();
+
+        // b owns the row (its namespace is recorded first); a adds a ref.
+        b.put_stream("k", bytes(&payload)).await.expect("put b");
+        b.finalize("k").await.expect("finalize b");
+        a.put_stream("k", bytes(&payload)).await.expect("put a");
+        a.finalize("k").await.expect("finalize a");
+
+        let rows = chunk_rows(&a);
+        assert!(!rows.is_empty(), "shared content-addressed chunk rows");
+        assert!(
+            rows.iter().all(|row| row.2 >= 2),
+            "each chunk gains one ref per entry: {rows:?}"
+        );
+        let id = &rows[0].0;
+        assert!(
+            dir.path()
+                .join("payload-a/chunks")
+                .join(format!("{id}.chunk"))
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join("payload-b/chunks")
+                .join(format!("{id}.chunk"))
+                .is_file()
+        );
+
+        a.sweep_orphan_chunks(u64::MAX).await.expect("sweep a");
+        assert!(
+            dir.path()
+                .join("payload-a/chunks")
+                .join(format!("{id}.chunk"))
+                .is_file(),
+            "a must keep its chunk file while the shared row is live"
+        );
+        assert_eq!(
+            read_all(a.get_range("k", 0..8_000).await.expect("read a")).await,
+            payload
+        );
+        b.sweep_orphan_chunks(u64::MAX).await.expect("sweep b");
+        assert_eq!(
+            read_all(b.get_range("k", 0..8_000).await.expect("read b")).await,
+            payload
+        );
     }
 
     /// v1.3: a remote blob store publishes after the index commit, fetches

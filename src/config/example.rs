@@ -404,6 +404,12 @@ pub static SECTIONS: &[Section] = &[
                 comment: "SSH key for type = \"sftp\" (agent/key auth only)",
             },
             Field {
+                key: "known_hosts_file",
+                default: "\"/etc/cachette/sftp_known_hosts\"",
+                form: Form::Optional,
+                comment: "pin the SFTP host key; native client trusts any key without it",
+            },
+            Field {
                 key: "cdc",
                 default: "true",
                 form: Form::Optional,

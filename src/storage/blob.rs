@@ -423,6 +423,7 @@ pub fn from_config(instance: &StorageInstanceConfig) -> io::Result<Arc<dyn BlobS
             url: remote_url(instance.url.as_deref().unwrap_or_default()),
             username: instance.username.clone(),
             private_key_file: instance.private_key_file.clone(),
+            known_hosts_file: instance.known_hosts_file.clone(),
         })),
     };
     Ok(Arc::new(CachedRemoteStore::new(remote)))
